@@ -362,6 +362,44 @@ def _run_scrape(environment, guard, task_config, monkeypatch, *, retry_limit=1):
     return asyncio.run(scraper.scrape_xianyu(task_config))
 
 
+def test_failure_reason_sanitizer_redacts_known_secret_shapes():
+    reason = (
+        "FAIL_SYS_USER_VALIDATE baxia-dialog J_MIDDLEWARE_FRAME_WIDGET "
+        "https://url-user:url-password@passport.goofish.com/login.htm"
+        "?access_token=url-token#url-fragment\n"
+        "Cookie: sid=cookie-secret; preference=private\n"
+        "Authorization: Bearer bearer-secret\n"
+        "token=plain-token session=session-secret password=form-secret "
+        "proxy_password=proxy-secret "
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature123"
+    )
+
+    sanitized = scraper.sanitize_failure_reason(reason)
+
+    assert "https://passport.goofish.com/login.htm" in sanitized
+    for marker in (
+        "FAIL_SYS_USER_VALIDATE",
+        "baxia-dialog",
+        "J_MIDDLEWARE_FRAME_WIDGET",
+    ):
+        assert marker in sanitized
+    for sensitive_value in (
+        "url-user",
+        "url-password",
+        "url-token",
+        "url-fragment",
+        "cookie-secret",
+        "private",
+        "bearer-secret",
+        "plain-token",
+        "session-secret",
+        "form-secret",
+        "proxy-secret",
+        "eyJhbGciOiJIUzI1NiJ9",
+    ):
+        assert sensitive_value not in sanitized
+
+
 def test_first_detail_risk_control_stops_items_pages_and_analysis(
     tmp_path, monkeypatch
 ):
@@ -455,6 +493,85 @@ def test_login_redirect_terminates_without_item_requests(
     assert environment.dispatchers[0].jobs == []
     assert len(guard.failure_calls) == 1
     assert len(environment.notifications) == 1
+
+
+def test_login_redirect_redacts_sensitive_url_from_all_failure_outputs(
+    tmp_path, monkeypatch, capsys
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    token = "login-token-must-not-leak"
+    session = "login-session-must-not-leak"
+    environment = ScrapeEnvironment(
+        items=[_item("first")],
+        login_url=(
+            "https://url-user:url-password@passport.goofish.com/login.htm"
+            f"?access_token={token}&session={session}#callback-fragment"
+        ),
+    )
+    guard = FakeFailureGuard()
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        _run_scrape(environment, guard, _task_config(state_path), monkeypatch)
+
+    failure = exc_info.value
+    assert failure.failure_kind == "login_required"
+    assert failure.reason == (
+        "Login required: redirected to "
+        "https://passport.goofish.com/login.htm during search navigation"
+    )
+
+    failure_guard_reason = guard.failure_calls[0][1]
+    notification_reason = environment.notifications[0]
+    log_output = capsys.readouterr().out
+    all_outputs = "\n".join(
+        (failure.reason, failure_guard_reason, notification_reason, log_output)
+    )
+    assert "passport.goofish.com/login.htm" in all_outputs
+    for sensitive_value in (
+        token,
+        session,
+        "url-user",
+        "url-password",
+        "callback-fragment",
+    ):
+        assert sensitive_value not in all_outputs
+
+
+def test_runtime_failure_redacts_proxy_credentials_from_all_outputs(
+    tmp_path, monkeypatch, capsys
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment(
+        launch_errors=[
+            RuntimeError(
+                "proxy connection failed: "
+                "http://username:password@proxy.example:8080"
+            )
+        ],
+    )
+    guard = FakeFailureGuard()
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        _run_scrape(
+            environment,
+            guard,
+            _task_config(state_path, max_pages=1),
+            monkeypatch,
+        )
+
+    failure = exc_info.value
+    assert failure.failure_kind == "runtime_error"
+    failure_guard_reason = guard.failure_calls[0][1]
+    notification_reason = environment.notifications[0]
+    log_output = capsys.readouterr().out
+    all_outputs = "\n".join(
+        (failure.reason, failure_guard_reason, notification_reason, log_output)
+    )
+    assert "http://proxy.example:8080" in all_outputs
+    assert "username" not in all_outputs
+    assert "password" not in all_outputs
 
 
 def test_detail_login_redirect_stops_before_second_item(tmp_path, monkeypatch):

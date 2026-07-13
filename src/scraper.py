@@ -1,10 +1,11 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import (
     Response,
@@ -88,7 +89,7 @@ class ScrapeTaskFailed(Exception):
             raise ValueError(f"Unsupported failure kind: {failure_kind}")
         self.task_name = task_name
         self.failure_kind = failure_kind
-        self.reason = _format_failure_reason(reason)
+        self.reason = sanitize_failure_reason(reason)
         self.processed_item_count = max(0, int(processed_item_count))
         super().__init__(
             f"{self.task_name} [{self.failure_kind}]: {self.reason} "
@@ -98,6 +99,81 @@ class ScrapeTaskFailed(Exception):
 
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
+URL_PATTERN = re.compile(
+    r"\b(?:https?|socks[45]h?|wss?)://[^\s<>\"']+",
+    re.IGNORECASE,
+)
+SENSITIVE_HEADER_PATTERN = re.compile(
+    r"(\b(?:cookie|set-cookie|authorization|proxy-authorization)\s*:\s*)[^\r\n]+",
+    re.IGNORECASE,
+)
+SENSITIVE_FIELD_PATTERN = re.compile(
+    r"""
+    (?P<prefix>
+        \b(?:
+            access[_-]?token|refresh[_-]?token|id[_-]?token|token|
+            session(?:[_-]?(?:id|token))?|password|passwd|pwd|
+            cookie|set[_-]?cookie|authorization|
+            proxy[_-]?(?:username|user|password|pass)|
+            api[_-]?key|client[_-]?secret|secret
+        )\b\s*(?:=|:)\s*
+    )
+    (?:"[^"]*"|'[^']*'|[^\s,;]+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+AUTH_CREDENTIAL_PATTERN = re.compile(
+    r"\b(Bearer|Basic)\s+[^\s,;]+",
+    re.IGNORECASE,
+)
+JWT_PATTERN = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+
+
+def _sanitize_url_for_display(url: str) -> str:
+    try:
+        parsed = urlsplit(str(url).strip())
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return "[REDACTED_URL]"
+
+    if not parsed.scheme or not hostname:
+        return "[REDACTED_URL]"
+
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{display_host}:{port}" if port is not None else display_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _sanitize_url_match(match: re.Match) -> str:
+    raw_url = match.group(0)
+    trailing = ""
+    while raw_url and raw_url[-1] in ".,;!?)]}":
+        trailing = raw_url[-1] + trailing
+        raw_url = raw_url[:-1]
+    return _sanitize_url_for_display(raw_url) + trailing
+
+
+def sanitize_failure_reason(reason: object, limit: int = 500) -> str:
+    """Remove credentials and request secrets before a failure leaves the scraper."""
+    if not reason:
+        return "未知错误"
+
+    cleaned = str(reason)
+    cleaned = URL_PATTERN.sub(_sanitize_url_match, cleaned)
+    cleaned = SENSITIVE_HEADER_PATTERN.sub(r"\1[REDACTED]", cleaned)
+    cleaned = AUTH_CREDENTIAL_PATTERN.sub(r"\1 [REDACTED]", cleaned)
+    cleaned = SENSITIVE_FIELD_PATTERN.sub(r"\g<prefix>[REDACTED]", cleaned)
+    cleaned = JWT_PATTERN.sub("[REDACTED]", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
 
 
 def _is_login_url(url: str) -> bool:
@@ -107,12 +183,16 @@ def _is_login_url(url: str) -> bool:
     return "passport.goofish.com" in lowered or "mini_login" in lowered
 
 
+def _login_redirect_error(url: str, context: str) -> LoginRequiredError:
+    safe_url = _sanitize_url_for_display(url)
+    return LoginRequiredError(
+        f"Login required: redirected to {safe_url} during {context}"
+    )
+
+
 def _raise_if_login_redirect(url: str, context: str) -> None:
     if _is_login_url(url):
-        raise LoginRequiredError(
-            f"Login required: redirected to {url} during {context} "
-            "(cookies/state likely expired)"
-        )
+        raise _login_redirect_error(url, context)
 
 
 async def _close_playwright_resource(resource, label: str) -> BaseException | None:
@@ -121,7 +201,7 @@ async def _close_playwright_resource(resource, label: str) -> BaseException | No
     try:
         await resource.close()
     except BaseException as exc:
-        print(f"清理 {label} 时发生错误: {exc}")
+        print(f"清理 {label} 时发生错误: {sanitize_failure_reason(exc)}")
         return exc
     return None
 
@@ -153,7 +233,10 @@ async def _finalize_scrape_resources(
                 await analysis_dispatcher.join()
         except BaseException as exc:
             secondary_error = exc
-            print(f"等待后台分析任务收尾时发生错误: {exc}")
+            print(
+                "等待后台分析任务收尾时发生错误: "
+                f"{sanitize_failure_reason(exc)}"
+            )
 
     if primary_error is None and secondary_error is None:
         try:
@@ -183,7 +266,10 @@ def _cleanup_task_images_safely(task_name: str) -> None:
     try:
         cleanup_task_images(task_name)
     except Exception as exc:
-        print(f"清理任务 '{task_name}' 的临时图片时发生错误: {exc}")
+        print(
+            f"清理任务 '{task_name}' 的临时图片时发生错误: "
+            f"{sanitize_failure_reason(exc)}"
+        )
 
 
 def _resolve_browser_channel() -> str:
@@ -206,21 +292,12 @@ def _should_analyze_images(task_config: dict) -> bool:
     return str(raw_value).strip().lower() not in {"false", "0", "no", "off"}
 
 
-def _format_failure_reason(reason: str, limit: int = 500) -> str:
-    if not reason:
-        return "未知错误"
-    cleaned = " ".join(str(reason).split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 3] + "..."
-
-
 async def _notify_task_failure(
     task_config: dict, reason: str, *, cookie_path: Optional[str]
 ) -> None:
     task_name = task_config.get("task_name", "未命名任务")
     keyword = task_config.get("keyword", "")
-    formatted_reason = _format_failure_reason(reason)
+    formatted_reason = sanitize_failure_reason(reason)
 
     # Some failures are deterministic misconfiguration and should pause/notify immediately.
     pause_immediately = any(
@@ -265,7 +342,7 @@ async def _notify_task_failure(
     try:
         await send_ntfy_notification(product_data, notify_reason)
     except Exception as e:
-        print(f"发送任务异常通知失败: {e}")
+        print(f"发送任务异常通知失败: {sanitize_failure_reason(e)}")
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -537,7 +614,10 @@ async def scrape_user_profile(context, user_id: str) -> dict:
             print("      [警告] 未找到评价选项卡，跳过评价采集。")
 
     except Exception as e:
-        print(f"   [错误] 采集用户 {user_id} 信息时发生错误: {e}")
+        print(
+            f"   [错误] 采集用户 {user_id} 信息时发生错误: "
+            f"{sanitize_failure_reason(e)}"
+        )
     finally:
         page.remove_listener("response", handle_response)
         await page.close()
@@ -654,7 +734,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             with open(state_file, "r", encoding="utf-8") as f:
                 snapshot_data = json.load(f)
         except Exception as e:
-            print(f"警告：读取登录状态文件失败，将直接按路径使用: {e}")
+            print(
+                "警告：读取登录状态文件失败，将直接按路径使用: "
+                f"{sanitize_failure_reason(e)}"
+            )
 
         async with async_playwright() as p:
             # 反检测启动参数
@@ -792,8 +875,8 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     await page.wait_for_selector("text=新发布", timeout=15000)
                 except PlaywrightTimeoutError as e:
                     if _is_login_url(page.url):
-                        raise LoginRequiredError(
-                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                        raise _login_redirect_error(
+                            page.url, "search results wait"
                         ) from e
                     raise
 
@@ -876,7 +959,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     except (RiskControlError, LoginRequiredError):
                         raise
                     except Exception as e:
-                        print(f"LOG: 应用新发布筛选失败: {e}")
+                        print(
+                            "LOG: 应用新发布筛选失败: "
+                            f"{sanitize_failure_reason(e)}"
+                        )
 
                 if personal_only:
                     async with page.expect_response(
@@ -900,7 +986,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     except (RiskControlError, LoginRequiredError):
                         raise
                     except Exception as e:
-                        print(f"LOG: 应用包邮筛选失败: {e}")
+                        print(
+                            "LOG: 应用包邮筛选失败: "
+                            f"{sanitize_failure_reason(e)}"
+                        )
 
                 if region_filter:
                     try:
@@ -1003,7 +1092,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     except (RiskControlError, LoginRequiredError):
                         raise
                     except Exception as e:
-                        print(f"LOG: 应用区域筛选 '{region_filter}' 失败: {e}")
+                        print(
+                            f"LOG: 应用区域筛选 '{region_filter}' 失败: "
+                            f"{sanitize_failure_reason(e)}"
+                        )
 
                 if min_price or max_price:
                     price_container = page.locator(
@@ -1249,9 +1341,16 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                         f"--- [DETAIL DEBUG] FAILED RESPONSE from {item_data['商品链接']} ---"
                                     )
                                     try:
-                                        print(await detail_response.text())
+                                        print(
+                                            sanitize_failure_reason(
+                                                await detail_response.text()
+                                            )
+                                        )
                                     except Exception as e:
-                                        print(f"无法读取响应内容: {e}")
+                                        print(
+                                            "无法读取响应内容: "
+                                            f"{sanitize_failure_reason(e)}"
+                                        )
                                     print(
                                         "----------------------------------------------------"
                                     )
@@ -1260,14 +1359,15 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             raise
                         except PlaywrightTimeoutError as e:
                             if _is_login_url(detail_page.url):
-                                raise LoginRequiredError(
-                                    "Login required: redirected to "
-                                    f"{detail_page.url} during item detail navigation "
-                                    "(cookies/state likely expired)"
+                                raise _login_redirect_error(
+                                    detail_page.url, "item detail navigation"
                                 ) from e
                             print(f"   错误: 访问商品详情页或等待API响应超时。")
                         except Exception as e:
-                            print(f"   错误: 处理商品详情时发生未知错误: {e}")
+                            print(
+                                "   错误: 处理商品详情时发生未知错误: "
+                                f"{sanitize_failure_reason(e)}"
+                            )
                         finally:
                             detail_error = sys.exc_info()[1]
                             close_error = await _close_playwright_resource(
@@ -1297,10 +1397,13 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 raise
             except PlaywrightTimeoutError as e:
                 if _is_login_url(page.url):
-                    raise LoginRequiredError(
-                        f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                    raise _login_redirect_error(
+                        page.url, "page operation"
                     ) from e
-                print(f"\n操作超时错误: 页面元素或网络响应未在规定时间内出现。\n{e}")
+                print(
+                    "\n操作超时错误: 页面元素或网络响应未在规定时间内出现。\n"
+                    f"{sanitize_failure_reason(e)}"
+                )
                 raise
             except asyncio.CancelledError:
                 log_time("收到取消信号，正在终止当前爬虫任务...")
@@ -1311,9 +1414,15 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     raise
                 if _is_login_url(str(e)):
                     raise LoginRequiredError(
-                        f"Login required: redirected to passport flow ({e})"
+                        sanitize_failure_reason(
+                            "Login required: passport flow detected during "
+                            f"crawler execution ({e})"
+                        )
                     ) from e
-                print(f"\n爬取过程中发生未知错误: {e}")
+                print(
+                    "\n爬取过程中发生未知错误: "
+                    f"{sanitize_failure_reason(e)}"
+                )
                 raise
             finally:
                 await _finalize_scrape_resources(
@@ -1355,6 +1464,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             task_name_for_guard, cookie_path=pause_cookie_path
         )
         if decision.skip:
+            paused_reason = sanitize_failure_reason(decision.reason)
             print(
                 f"[FailureGuard] 任务 '{task_name_for_guard}' 已暂停重试 "
                 f"(连续失败 {decision.consecutive_failures}/{FAILURE_GUARD.threshold})"
@@ -1368,18 +1478,21 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             "商品链接": "#",
                         },
                         "任务处于暂停状态，将跳过执行。\n"
-                        f"原因: {decision.reason}\n"
+                        f"原因: {paused_reason}\n"
                         f"连续失败: {decision.consecutive_failures}/{FAILURE_GUARD.threshold}\n"
                         "暂停到: "
                         f"{decision.paused_until.strftime('%Y-%m-%d %H:%M:%S') if decision.paused_until else 'N/A'}\n"
                         "修复方法: 更新登录态/cookies文件后会自动恢复。",
                     )
                 except Exception as exc:
-                    print(f"发送任务暂停通知失败: {exc}")
+                    print(
+                        "发送任务暂停通知失败: "
+                        f"{sanitize_failure_reason(exc)}"
+                    )
             raise ScrapeTaskFailed(
                 task_name=task_name_for_guard,
                 failure_kind="runtime_error",
-                reason=f"FailureGuard paused task: {decision.reason}",
+                reason=f"FailureGuard paused task: {paused_reason}",
                 processed_item_count=0,
             )
 
@@ -1416,7 +1529,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             if rotation_settings["account_enabled"]:
                 print(f"账号轮换：使用登录状态 {state_path}")
             if rotation_settings["proxy_enabled"] and proxy_server:
-                print(f"IP 轮换：使用代理 {proxy_server}")
+                print(
+                    "IP 轮换：使用代理 "
+                    f"{_sanitize_url_for_display(proxy_server)}"
+                )
 
             try:
                 completed_count = await _run_scrape_attempt(state_path, proxy_server)
@@ -1431,21 +1547,23 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 processed_item_count += attempt_processed_item_count
                 attempt_processed_item_count = 0
                 failure_kind = "login_required"
-                last_error = str(exc)
-                print(f"检测到登录失效/重定向: {exc}")
+                last_error = sanitize_failure_reason(exc)
+                print(f"检测到登录失效/重定向: {last_error}")
                 break
             except RiskControlError as exc:
                 processed_item_count += attempt_processed_item_count
                 attempt_processed_item_count = 0
                 failure_kind = "risk_control"
-                last_error = str(exc)
-                print(f"检测到风控或验证触发: {exc}")
+                last_error = sanitize_failure_reason(exc)
+                print(f"检测到风控或验证触发: {last_error}")
                 break
             except Exception as exc:
                 processed_item_count += attempt_processed_item_count
                 attempt_processed_item_count = 0
                 failure_kind = "runtime_error"
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = sanitize_failure_reason(
+                    f"{type(exc).__name__}: {exc}"
+                )
                 print(f"本次尝试失败: {last_error}")
                 if attempt < attempt_limit:
                     print("将尝试轮换账号/IP 后重试...")
@@ -1464,7 +1582,10 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 task_config, last_error, cookie_path=last_state_path
             )
         except Exception as exc:
-            print(f"记录或通知任务失败时发生错误: {exc}")
+            print(
+                "记录或通知任务失败时发生错误: "
+                f"{sanitize_failure_reason(exc)}"
+            )
         raise terminal_failure
 
     try:
