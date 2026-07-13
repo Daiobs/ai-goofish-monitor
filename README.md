@@ -44,6 +44,7 @@ docker compose up -d
 ```
 
 - 默认 Web UI 地址：`http://127.0.0.1:8000`
+- 默认 Compose 端口只绑定宿主机 `127.0.0.1`，局域网中的其他设备无法直接访问。
 - Docker 镜像已内置 Chromium，无需宿主机额外安装浏览器。
 - 官方镜像地址：`ghcr.io/usagi-org/ai-goofish:latest`
 - 更新镜像：`docker compose pull && docker compose up -d`
@@ -56,6 +57,8 @@ docker compose up -d
     - `logs/`  运行日志
     - `images/`  商品图片与任务临时图片目录
     - `config.json`、`jsonl/`、`price_history/`  首次升级到 SQLite 时用于兼容导入的旧数据源
+
+> 安全提示：暴露到局域网或公网前，必须修改 `WEB_USERNAME` / `WEB_PASSWORD`，设置高强度 `SESSION_SECRET` 和 `APP_ENV=production`，通过 HTTPS 反向代理提供服务，并设置 `SESSION_COOKIE_SECURE=true`。不要直接把应用端口暴露到公网。
 
 ### 数据存储与迁移
 
@@ -74,6 +77,7 @@ docker compose up -d
 | `OPENAI_BASE_URL` | OpenAI 兼容接口地址 | 是 |
 | `OPENAI_MODEL_NAME` | 支持图片输入的模型名称 | 是 |
 | `WEB_USERNAME` / `WEB_PASSWORD` | Web UI 登录账号密码，默认 `admin/admin123` | 否 |
+| `SESSION_SECRET` | Session 签名密钥；生产环境必须设置高强度随机值 | 生产必填 |
 
 其余配置见下方“配置说明”。
 
@@ -184,7 +188,9 @@ cd web-ui && npm run build
   - `decision_mode=ai`：返回 `202` 和 `job`，需要继续轮询进度。
   - `decision_mode=keyword`：直接返回已创建任务。
 - `GET /api/tasks/generate-jobs/{job_id}`：查询 AI 任务生成进度。
-- `POST /auth/status`：校验 Web UI 登录凭据。
+- `POST /auth/login`：校验凭据并设置签名 Session Cookie。
+- `POST /auth/logout`：清除 Session Cookie。
+- `GET /auth/session`：查询当前浏览器 Session。
 
 </details>
 
@@ -199,6 +205,10 @@ cd web-ui && npm run build
 - `PROXY_URL`：为 AI 请求单独指定 HTTP/SOCKS5 代理。
 - `RUN_HEADLESS`：是否以无头模式运行爬虫；Docker 中应保持 `true`。
 - `SERVER_PORT`：后端监听端口，默认 `8000`。
+- `APP_ENV`：运行环境，默认 `development`；设为 `production` 后弱密钥或缺失密钥会导致启动失败。
+- `SESSION_SECRET`：Session 签名密钥，生产环境使用至少 32 字节的高强度随机值。
+- `SESSION_MAX_AGE_SECONDS`：Session 有效期，默认 `86400` 秒。
+- `SESSION_COOKIE_SECURE`：是否只允许浏览器通过 HTTPS 发送 Session Cookie；本地 HTTP 默认 `false`，HTTPS 部署必须设为 `true`。
 - `LOGIN_IS_EDGE`：本地环境可切换为 Edge 内核；Docker 镜像未内置 Edge，容器内会固定使用 Chromium。
 - `PCURL_TO_MOBILE`：是否将 PC 商品链接转换为移动端链接。
 
@@ -231,9 +241,11 @@ cd web-ui && npm run build
 <details>
 <summary>点击展开认证说明</summary>
 
-- Web UI 当前使用登录页收集账号密码，并通过 `POST /auth/status` 校验。
-- 登录成功后，前端会在浏览器本地保存登录状态，用于路由守卫和 WebSocket 初始化。
-- 默认账号密码为 `admin/admin123`，生产环境请务必修改。
+- Web UI 通过 `POST /auth/login` 登录，后端设置 `HttpOnly`、`SameSite=Strict`、`Path=/` 的签名 Session Cookie；Cookie 的 `Secure` 属性由 `SESSION_COOKIE_SECURE` 控制。
+- 前端启动时调用 `GET /auth/session` 恢复认证状态，退出时调用 `POST /auth/logout`；密码、Session Token 和可信登录标记不会写入 `localStorage` 或 `sessionStorage`。
+- `/health` 允许匿名访问；任务、账号、结果、日志、Prompt、设置等 `/api/*` 接口及 `/ws` 均要求有效 Session。
+- 开发环境未配置高强度 `SESSION_SECRET` 时会生成临时密钥并告警，重启后已有 Session 失效；生产模式会拒绝以弱密钥或空密钥启动。
+- 默认凭据仅供本机首次启动。对局域网或公网开放前，必须设置正式凭据、固定高强度密钥、HTTPS 反向代理和 Secure Cookie。
 
 </details>
 
