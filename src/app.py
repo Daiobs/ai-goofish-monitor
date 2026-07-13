@@ -3,11 +3,12 @@
 整合所有路由和服务
 """
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 from src.api.routes import (
+    auth,
     dashboard,
     tasks,
     logs,
@@ -18,6 +19,7 @@ from src.api.routes import (
     websocket,
     accounts,
 )
+from src.api.auth import initialize_session_security, require_authenticated_session
 from src.api.dependencies import (
     set_process_service,
     set_scheduler_service,
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     print("正在启动应用...")
+    initialize_session_security()
     bootstrap_sqlite_storage()
     cleanup_task_logs(keep_days=app_settings.task_log_retention_days)
 
@@ -103,15 +106,18 @@ app = FastAPI(
 )
 
 # 注册路由
-app.include_router(tasks.router)
-app.include_router(dashboard.router)
-app.include_router(logs.router)
-app.include_router(settings.router)
-app.include_router(prompts.router)
-app.include_router(results.router)
-app.include_router(login_state.router)
+app.include_router(auth.router)
+
+protected_api_dependencies = [Depends(require_authenticated_session)]
+app.include_router(tasks.router, dependencies=protected_api_dependencies)
+app.include_router(dashboard.router, dependencies=protected_api_dependencies)
+app.include_router(logs.router, dependencies=protected_api_dependencies)
+app.include_router(settings.router, dependencies=protected_api_dependencies)
+app.include_router(prompts.router, dependencies=protected_api_dependencies)
+app.include_router(results.router, dependencies=protected_api_dependencies)
+app.include_router(login_state.router, dependencies=protected_api_dependencies)
+app.include_router(accounts.router, dependencies=protected_api_dependencies)
 app.include_router(websocket.router)
-app.include_router(accounts.router)
 
 # 挂载静态文件
 # 旧的静态文件目录（用于截图等）
@@ -131,27 +137,7 @@ async def health_check():
     return {"status": "healthy", "message": "服务正常运行"}
 
 
-# 认证状态检查端点
-from fastapi import Request, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-@app.post("/auth/status")
-async def auth_status(payload: LoginRequest):
-    """检查认证状态"""
-    if payload.username == app_settings.web_username and payload.password == app_settings.web_password:
-        return {"authenticated": True, "username": payload.username}
-    raise HTTPException(status_code=401, detail="认证失败")
-
-
 # 主页路由 - 服务 Vue 3 SPA
-from fastapi.responses import JSONResponse
-
 @app.get("/")
 async def read_root(request: Request):
     """提供 Vue 3 SPA 的主页面"""
