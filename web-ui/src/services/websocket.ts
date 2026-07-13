@@ -6,17 +6,9 @@ class WebSocketService {
   private listeners: Map<string, WebSocketEventHandler[]> = new Map();
   public isConnected = false;
   private shouldConnect = false;
-
-  constructor() {
-    // 延迟连接，等待认证完成
-    // 只有在已登录时才尝试连接
-    if (localStorage.getItem('auth_logged_in') === 'true') {
-      this.connect();
-    }
-  }
+  private reconnectTimer: number | null = null;
 
   public start() {
-    // 手动启动 WebSocket 连接
     this.shouldConnect = true;
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
       this.connect();
@@ -24,8 +16,11 @@ class WebSocketService {
   }
 
   public stop() {
-    // 停止 WebSocket 连接
     this.shouldConnect = false;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -60,15 +55,21 @@ class WebSocketService {
       }
     };
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
+      this.ws = null;
       if (this.isConnected) {
         console.log('WebSocket disconnected');
         this.isConnected = false;
         this.emit('disconnected', { isConnected: false });
       }
-      // 只有在 shouldConnect 为 true 或已登录时才重连
-      if (this.shouldConnect || localStorage.getItem('auth_logged_in') === 'true') {
-        setTimeout(() => this.connect(), this.reconnectInterval);
+      if (event.code === 1008) {
+        this.shouldConnect = false;
+      }
+      if (this.shouldConnect) {
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = null;
+          this.connect();
+        }, this.reconnectInterval);
       }
     };
 

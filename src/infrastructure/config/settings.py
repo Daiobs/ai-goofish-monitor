@@ -97,9 +97,18 @@ class ScraperSettings(_EnvSettings):
 
 class AppSettings(_EnvSettings):
     """应用主配置"""
+    app_env: str = _env_field("development", "APP_ENV")
     server_port: int = _env_field(8000, "SERVER_PORT")
     web_username: str = _env_field("admin", "WEB_USERNAME")
     web_password: str = _env_field("admin123", "WEB_PASSWORD")
+    session_secret: Optional[str] = _env_field(None, "SESSION_SECRET")
+    session_max_age_seconds: int = _env_field(
+        86400,
+        "SESSION_MAX_AGE_SECONDS",
+        ge=300,
+        le=2592000,
+    )
+    session_cookie_secure: bool = _env_field(False, "SESSION_COOKIE_SECURE")
     task_log_retention_days: int = _env_field(7, "TASK_LOG_RETENTION_DAYS", ge=1)
 
     # 文件路径配置

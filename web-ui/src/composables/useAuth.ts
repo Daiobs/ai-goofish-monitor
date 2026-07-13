@@ -1,48 +1,64 @@
 import { ref, computed } from 'vue'
-import { useRouter } from 'vue-router'
 import { wsService } from '@/services/websocket'
 
 // Global State
-const username = ref<string | null>(localStorage.getItem('auth_username'))
-const isLoggedIn = ref(localStorage.getItem('auth_logged_in') === 'true')
+const username = ref<string | null>(null)
+const isLoggedIn = ref(false)
+const isInitialized = ref(false)
+let restorePromise: Promise<void> | null = null
 
 export function useAuth() {
-  const router = useRouter()
-
   const isAuthenticated = computed(() => isLoggedIn.value)
 
   function setAuthenticated(user: string) {
     username.value = user
     isLoggedIn.value = true
-
-    localStorage.setItem('auth_username', user)
-    localStorage.setItem('auth_logged_in', 'true')
-
-    // 启动 WebSocket 连接
     wsService.start()
   }
 
-  function logout() {
+  function clearAuthentication() {
     username.value = null
     isLoggedIn.value = false
-    localStorage.removeItem('auth_username')
-    localStorage.removeItem('auth_logged_in')
-
-    // 停止 WebSocket 连接
     wsService.stop()
+  }
 
-    // Redirect to login if using router
-    if (router) {
-      router.push('/login')
-    } else {
-      window.location.href = '/login'
+  async function restoreSession(): Promise<void> {
+    if (isInitialized.value) {
+      return
     }
+    if (restorePromise) {
+      return restorePromise
+    }
+
+    restorePromise = (async () => {
+      try {
+        const response = await fetch('/auth/session', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+        })
+        const session = response.ok ? await response.json() : null
+        if (session?.authenticated === true && typeof session.username === 'string') {
+          setAuthenticated(session.username)
+        } else {
+          clearAuthentication()
+        }
+      } catch (e) {
+        console.error('Session restore error', e)
+        clearAuthentication()
+      } finally {
+        isInitialized.value = true
+        restorePromise = null
+      }
+    })()
+
+    return restorePromise
   }
 
   async function login(user: string, pass: string): Promise<boolean> {
     try {
-      const response = await fetch('/auth/status', {
+      const response = await fetch('/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -50,20 +66,40 @@ export function useAuth() {
       })
 
       if (response.ok) {
-        setAuthenticated(user)
+        const session = await response.json()
+        setAuthenticated(session.username)
+        isInitialized.value = true
         return true
-      } else {
-        return false
       }
+      clearAuthentication()
+      return false
     } catch (e) {
       console.error('Login error', e)
+      clearAuthentication()
       return false
+    }
+  }
+
+  async function logout(): Promise<void> {
+    try {
+      await fetch('/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+    } catch (e) {
+      console.error('Logout error', e)
+    } finally {
+      clearAuthentication()
+      isInitialized.value = true
+      window.location.assign('/login')
     }
   }
 
   return {
     username,
     isAuthenticated,
+    isInitialized,
+    restoreSession,
     login,
     logout
   }

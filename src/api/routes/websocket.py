@@ -5,6 +5,8 @@ WebSocket 路由
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Set
 
+from src.api.auth import read_websocket_session
+
 
 router = APIRouter()
 
@@ -17,7 +19,10 @@ async def websocket_endpoint(
     websocket: WebSocket,
 ):
     """WebSocket 端点"""
-    # 接受连接
+    if read_websocket_session(websocket) is None:
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     active_connections.add(websocket)
 
@@ -29,11 +34,9 @@ async def websocket_endpoint(
             # 这里可以处理客户端发送的消息
             # 目前我们主要用于服务端推送，所以暂时不处理
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
-    except Exception as e:
-        print(f"WebSocket 错误: {e}")
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        active_connections.discard(websocket)
+    except Exception:
+        active_connections.discard(websocket)
 
 
 async def broadcast_message(message_type: str, data: dict):

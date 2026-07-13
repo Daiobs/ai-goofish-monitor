@@ -97,6 +97,14 @@ SCHEMA_STATEMENTS = (
         updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+        session_id TEXT PRIMARY KEY,
+        credential_fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks(task_name)",
     """
     CREATE INDEX IF NOT EXISTS idx_results_filename_crawl
@@ -122,6 +130,10 @@ SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_snapshots_keyword_item_time
     ON price_snapshots(keyword_slug, item_id, snapshot_time DESC)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires
+    ON auth_sessions(expires_at)
+    """,
 )
 
 
@@ -137,6 +149,11 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+
+
+def _apply_read_only_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA query_only=ON")
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -170,13 +187,22 @@ def _migrate_result_items_status(conn: sqlite3.Connection) -> None:
 @contextmanager
 def sqlite_connection(
     db_path: str | None = None,
+    *,
+    read_only: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     path = db_path or get_database_path()
-    _prepare_database_file(path)
-    conn = sqlite3.connect(path)
+    if read_only:
+        database_uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(database_uri, uri=True)
+    else:
+        _prepare_database_file(path)
+        conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
-        _apply_pragmas(conn)
+        if read_only:
+            _apply_read_only_pragmas(conn)
+        else:
+            _apply_pragmas(conn)
         yield conn
     finally:
         conn.close()
