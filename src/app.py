@@ -77,6 +77,7 @@ async def lifespan(app: FastAPI):
     task_repo = SqliteTaskRepository()
     task_service = TaskService(task_repo)
     tasks_list = await task_service.get_all_tasks()
+    process_service.failure_guard.migrate_legacy_task_keys(tasks_list)
 
     for task in tasks_list:
         if task.is_running:

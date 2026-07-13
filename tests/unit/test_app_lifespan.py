@@ -33,9 +33,18 @@ class _FakeSchedulerService:
 class _FakeProcessService:
     def __init__(self):
         self.stop_all_called = False
+        self.failure_guard = _FakeFailureGuard()
 
     async def stop_all(self):
         self.stop_all_called = True
+
+
+class _FakeFailureGuard:
+    def __init__(self):
+        self.migration_payload = None
+
+    def migrate_legacy_task_keys(self, tasks):
+        self.migration_payload = list(tasks)
 
 
 def test_lifespan_cleans_task_logs_on_startup(monkeypatch):

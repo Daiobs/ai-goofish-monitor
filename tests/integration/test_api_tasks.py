@@ -202,7 +202,6 @@ def test_delete_task_stops_only_deleted_runtime(
     assert response.status_code == 200
     process_service = api_context["process_service"]
     assert process_service.stopped == [first_id]
-    assert process_service.reindexed == []
 
     remaining = api_client.get(f"/api/tasks/{second_id}")
     assert remaining.status_code == 200

@@ -24,14 +24,24 @@ def _row_to_task(row) -> Task:
     return Task(**payload)
 
 
-def find_task_by_name_sync(task_name: str) -> Task | None:
+def find_task_by_id_sync(task_id: int) -> Task | None:
     bootstrap_sqlite_storage()
     with sqlite_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM tasks WHERE task_name = ? ORDER BY id ASC LIMIT 1",
-            (task_name,),
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
     return _row_to_task(row) if row else None
+
+
+def find_tasks_by_name_sync(task_name: str) -> list[Task]:
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE task_name = ? ORDER BY id ASC",
+            (task_name,),
+        ).fetchall()
+    return [_row_to_task(row) for row in rows]
 
 
 class SqliteTaskRepository(TaskRepository):

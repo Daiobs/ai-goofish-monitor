@@ -58,7 +58,6 @@ class FakeProcessService:
     def __init__(self):
         self.started = []
         self.stopped = []
-        self.reindexed = []
         self._on_started = None
         self._on_stopped = None
 
@@ -76,10 +75,6 @@ class FakeProcessService:
         self.stopped.append(task_id)
         if self._on_stopped:
             await self._on_stopped(task_id)
-
-    def reindex_after_delete(self, deleted_task_id: int):
-        self.reindexed.append(deleted_task_id)
-
 
 class FakeSchedulerService:
     def __init__(self):
