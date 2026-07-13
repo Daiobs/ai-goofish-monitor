@@ -31,6 +31,7 @@ class TaskService:
     async def create_task(self, task_create: TaskCreate) -> Task:
         """创建新任务"""
         payload = task_create.model_dump()
+        legacy_criteria_source = payload.get("ai_prompt_criteria_file", "")
         payload["ai_prompt_criteria_file"] = ""
         task = Task(**payload, is_running=False)
         created = await self.repository.save(task)
@@ -38,14 +39,22 @@ class TaskService:
             return created
 
         canonical_path = self.prompt_store.criteria_path_string(created.id)
-        if created.ai_prompt_criteria_file == canonical_path:
-            return created
         try:
-            return await self.repository.save(
-                created.model_copy(update={"ai_prompt_criteria_file": canonical_path})
+            if created.ai_prompt_criteria_file != canonical_path:
+                created = await self.repository.save(
+                    created.model_copy(
+                        update={"ai_prompt_criteria_file": canonical_path}
+                    )
+                )
+            await asyncio.to_thread(
+                self.prompt_store.copy_legacy_criteria,
+                created.id,
+                legacy_criteria_source,
             )
+            return created
         except BaseException:
             await self.repository.delete(created.id)
+            await asyncio.to_thread(self.prompt_store.delete_task_prompt, created.id)
             raise
 
     async def create_ai_task_with_criteria(

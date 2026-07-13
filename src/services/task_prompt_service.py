@@ -27,6 +27,26 @@ class TaskPromptStore:
         except FileNotFoundError:
             return None
 
+    def copy_legacy_criteria(self, task_id: int, source_value: str) -> bool:
+        """Copy a compatible source under prompts/ into an ID-scoped target."""
+        if not isinstance(source_value, str) or not source_value.strip():
+            return False
+        source = Path(source_value.strip())
+        try:
+            resolved_source = source.resolve(strict=True)
+            resolved_root = self.root_dir.resolve(strict=True)
+        except FileNotFoundError:
+            return False
+        if not resolved_source.is_file() or not resolved_source.is_relative_to(
+            resolved_root
+        ):
+            return False
+        self.write_criteria(
+            task_id,
+            resolved_source.read_text(encoding="utf-8"),
+        )
+        return True
+
     def write_criteria(self, task_id: int, content: str) -> Path:
         if not content or not content.strip():
             raise RuntimeError("AI 未能生成分析标准，返回内容为空。")

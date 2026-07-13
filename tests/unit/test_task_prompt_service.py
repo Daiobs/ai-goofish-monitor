@@ -82,6 +82,36 @@ def test_same_name_and_keyword_tasks_have_isolated_prompt_lifecycles(
     ) == "shared base"
 
 
+def test_direct_create_copies_only_prompt_root_legacy_source(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    source = prompts_dir / "legacy.txt"
+    source.write_text("legacy criteria", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    repository = SqliteTaskRepository(
+        db_path=str(tmp_path / "app.sqlite3"),
+        legacy_config_file=None,
+    )
+    service = TaskService(repository)
+
+    compatible_payload = _task_create().model_copy(
+        update={"ai_prompt_criteria_file": "prompts/legacy.txt"}
+    )
+    compatible = asyncio.run(service.create_task(compatible_payload))
+    outside_payload = _task_create(name="outside").model_copy(
+        update={"ai_prompt_criteria_file": str(outside)}
+    )
+    outside_task = asyncio.run(service.create_task(outside_payload))
+
+    assert TaskPromptStore().read_criteria(compatible.id) == "legacy criteria"
+    assert TaskPromptStore().read_criteria(outside_task.id) is None
+    assert outside.read_text(encoding="utf-8") == "outside secret"
+
+
 def test_atomic_prompt_write_failure_leaves_no_partial_file(
     tmp_path, monkeypatch
 ):
