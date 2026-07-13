@@ -9,10 +9,10 @@ import re
 
 from src.config import STATE_FILE
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
-from src.scraper import scrape_xianyu
+from src.scraper import ScrapeTaskFailed, sanitize_failure_reason, scrape_xianyu
 
 
-async def main():
+async def main() -> int:
     parser = argparse.ArgumentParser(
         description="闲鱼商品监控脚本，支持多任务配置和实时AI分析。",
         epilog="""
@@ -40,7 +40,10 @@ async def main():
             with open(args.config, 'r', encoding='utf-8') as f:
                 tasks_config = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            sys.exit(f"错误: 读取或解析配置文件 '{args.config}' 失败: {e}")
+            sys.exit(
+                f"错误: 读取或解析配置文件 '{args.config}' 失败: "
+                f"{sanitize_failure_reason(e)}"
+            )
     else:
         repository = SqliteTaskRepository()
         tasks = await repository.find_all()
@@ -131,10 +134,16 @@ async def main():
                     print(f"✅ 任务 '{task['task_name']}' 的prompt生成成功，长度: {len(task['ai_prompt_text'])} 字符")
 
             except FileNotFoundError as e:
-                print(f"警告: 任务 '{task['task_name']}' 的prompt文件缺失: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"警告: 任务 '{task['task_name']}' 的prompt文件缺失: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
             except Exception as e:
-                print(f"错误: 任务 '{task['task_name']}' 处理prompt文件时发生异常: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"错误: 任务 '{task['task_name']}' 处理prompt文件时发生异常: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
         elif task.get("enabled", False) and task.get("ai_prompt_file"):
             try:
@@ -145,7 +154,10 @@ async def main():
                 print(f"警告: 任务 '{task['task_name']}' 的prompt文件 '{task['ai_prompt_file']}' 未找到，该任务的AI分析将被跳过。")
                 task['ai_prompt_text'] = ""
             except Exception as e:
-                print(f"错误: 任务 '{task['task_name']}' 读取prompt文件时发生异常: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"错误: 任务 '{task['task_name']}' 读取prompt文件时发生异常: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
 
     print("\n--- 开始执行监控任务 ---")
@@ -168,14 +180,14 @@ async def main():
                 print(f"任务 '{args.task_name}' 已被禁用，跳过执行。")
         else:
             print(f"错误：在配置文件中未找到名为 '{args.task_name}' 的任务。")
-            return
+            return 1
     else:
         # 否则，按原计划加载所有启用的任务
         active_task_configs = [task for task in tasks_config if task.get("enabled", False)]
 
     if not active_task_configs:
         print("没有需要执行的任务，程序退出。")
-        return
+        return 0
 
     # 为每个启用的任务创建一个异步执行协程
     stop_event = asyncio.Event()
@@ -209,12 +221,35 @@ async def main():
             await shutdown_task
 
     print("\n--- 所有任务执行完毕 ---")
+    has_failure = False
     for i, result in enumerate(results):
         task_name = active_task_configs[i]['task_name']
-        if isinstance(result, Exception):
-            print(f"任务 '{task_name}' 因异常而终止: {result}")
-        else:
-            print(f"任务 '{task_name}' 正常结束，本次运行共处理了 {result} 个新商品。")
+        if isinstance(result, asyncio.CancelledError):
+            print(f"任务 '{task_name}' 已由用户取消。")
+            continue
+        if isinstance(result, ScrapeTaskFailed):
+            has_failure = True
+            if result.failure_kind == "risk_control":
+                status = "风控终止"
+            elif result.failure_kind == "login_required":
+                status = "登录失效"
+            else:
+                status = "运行异常"
+            print(
+                f"任务 '{task_name}' {status}: {result.reason} "
+                f"(已处理 {result.processed_item_count} 个新商品)"
+            )
+            continue
+        if isinstance(result, BaseException):
+            has_failure = True
+            print(
+                f"任务 '{task_name}' 运行异常: "
+                f"{sanitize_failure_reason(result)}"
+            )
+            continue
+        print(f"任务 '{task_name}' 正常结束，本次运行共处理了 {result} 个新商品。")
+
+    return 1 if has_failure else 0
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))
