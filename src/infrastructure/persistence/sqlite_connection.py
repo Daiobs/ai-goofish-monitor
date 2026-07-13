@@ -151,6 +151,11 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
 
 
+def _apply_read_only_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA query_only=ON")
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
@@ -182,13 +187,22 @@ def _migrate_result_items_status(conn: sqlite3.Connection) -> None:
 @contextmanager
 def sqlite_connection(
     db_path: str | None = None,
+    *,
+    read_only: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     path = db_path or get_database_path()
-    _prepare_database_file(path)
-    conn = sqlite3.connect(path)
+    if read_only:
+        database_uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(database_uri, uri=True)
+    else:
+        _prepare_database_file(path)
+        conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
-        _apply_pragmas(conn)
+        if read_only:
+            _apply_read_only_pragmas(conn)
+        else:
+            _apply_pragmas(conn)
         yield conn
     finally:
         conn.close()

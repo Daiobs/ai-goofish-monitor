@@ -129,6 +129,7 @@ class SqliteSessionStore:
         self._db_path = db_path
         self._initialized = False
         self._init_lock = threading.Lock()
+        self._ensure_schema()
 
     def _ensure_schema(self) -> None:
         if self._initialized:
@@ -167,8 +168,7 @@ class SqliteSessionStore:
         now: int,
     ) -> bool:
         self._ensure_schema()
-        with sqlite_connection(self._db_path) as conn:
-            conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
+        with sqlite_connection(self._db_path, read_only=True) as conn:
             row = conn.execute(
                 """
                 SELECT credential_fingerprint
@@ -177,7 +177,6 @@ class SqliteSessionStore:
                 """,
                 (session_id, now),
             ).fetchone()
-            conn.commit()
         return row is not None and hmac.compare_digest(
             row["credential_fingerprint"],
             credential_fingerprint,
@@ -227,6 +226,11 @@ class SessionManager:
                 "SECURITY WARNING: SESSION_SECRET is missing or too weak. "
                 "A temporary secret was generated; all sessions will become invalid "
                 "when this process restarts."
+            )
+
+        if is_production and not config.session_cookie_secure:
+            raise RuntimeError(
+                "SESSION_COOKIE_SECURE must be true in production"
             )
 
         return cls(

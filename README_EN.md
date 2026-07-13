@@ -33,7 +33,7 @@ A Playwright and AI-powered multi-task real-time monitoring tool for Xianyu (闲
 - Chrome or Edge on desktop systems. On Linux, Chromium also works. `start.sh` checks this prerequisite before continuing
 
 ```bash
-git clone https://github.com/Usagi-org/ai-goofish-monitor
+git clone https://github.com/Daiobs/ai-goofish-monitor
 cd ai-goofish-monitor
 cp .env.example .env
 ```
@@ -75,18 +75,20 @@ chmod +x start.sh
 ## 🐳 Docker Deployment (Recommended)
 
 ```bash
-git clone https://github.com/Usagi-org/ai-goofish-monitor && cd ai-goofish-monitor
+git clone https://github.com/Daiobs/ai-goofish-monitor && cd ai-goofish-monitor
 cp .env.example .env
 vim .env # fill in the required values
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f app
 docker compose down
 ```
 
 - Default Web UI: `http://127.0.0.1:8000`
 - The default Compose mapping binds only to host `127.0.0.1`, so other LAN devices cannot connect directly.
-- The published Docker image already includes Chromium, so no extra browser install is required on the host.
-- Update image: `docker compose pull && docker compose up -d`
+- Compose builds `ai-goofish-monitor:local` from the currently checked-out source by default, keeping the running code aligned with the current branch.
+- `APP_IMAGE` can override the built image name and can reference a self-published image when using `--no-build`. This fork does not yet include an image publishing workflow.
+- The source-built Docker image includes Chromium, so no extra browser install is required on the host.
+- After updating the source, run `docker compose up -d --build` again to rebuild and start it.
 - If you change `SERVER_PORT` in `.env`, update the `ports` mapping in `docker-compose.yaml` as well.
 - `docker-compose.yaml` now mounts the primary SQLite database directory as `./data:/app/data`, with the default database file at `data/app.sqlite3`
 - These paths are persisted by default:
@@ -192,7 +194,7 @@ cd web-ui && npm run build
 - `PROXY_URL`: dedicated HTTP/SOCKS5 proxy for AI requests.
 - `RUN_HEADLESS`: whether the scraper runs headless; keep it `true` in Docker.
 - `SERVER_PORT`: backend port, default `8000`.
-- `APP_ENV`: runtime mode, default `development`; `production` refuses to start with a missing or weak session secret.
+- `APP_ENV`: runtime mode, default `development`; `production` refuses to start with a missing or weak session secret or with `SESSION_COOKIE_SECURE=false`.
 - `SESSION_SECRET`: session signing secret; use a strong random value of at least 32 bytes in production.
 - `SESSION_MAX_AGE_SECONDS`: session lifetime, default `86400` seconds.
 - `SESSION_COOKIE_SECURE`: restricts the session cookie to HTTPS; keep `false` for local HTTP and set `true` behind HTTPS.
@@ -231,7 +233,7 @@ See `.env.example` for the full list.
 - The Web UI signs in through `POST /auth/login`. The backend sets a signed `HttpOnly`, `SameSite=Strict`, `Path=/` cookie; `SESSION_COOKIE_SECURE` controls its `Secure` attribute.
 - On startup the frontend calls `GET /auth/session`, and logout calls `POST /auth/logout`. Passwords, session tokens, and trusted login flags are never stored in `localStorage` or `sessionStorage`.
 - `/health` remains anonymous. All task, account, result, log, prompt, and settings routes under `/api/*`, plus `/ws`, require a valid session.
-- Development generates a temporary secret with a warning when `SESSION_SECRET` is absent or weak, invalidating sessions after restart. Production refuses to start in that state.
+- Development generates a temporary secret with a warning when `SESSION_SECRET` is absent or weak, invalidating sessions after restart. Production requires a fixed strong secret and `SESSION_COOKIE_SECURE=true`, otherwise startup is refused.
 - Default credentials are for first-time localhost use only. LAN or public exposure requires real credentials, a fixed strong secret, an HTTPS reverse proxy, and a Secure cookie.
 
 </details>

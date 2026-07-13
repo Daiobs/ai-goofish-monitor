@@ -26,28 +26,20 @@
 ## 🐳 Docker 部署（推荐）
 
 ```bash
-git clone https://github.com/Usagi-org/ai-goofish-monitor && cd ai-goofish-monitor
+git clone https://github.com/Daiobs/ai-goofish-monitor && cd ai-goofish-monitor
 cp .env.example .env
 vim .env # 填写相关配置项
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f app
 docker compose down
 ```
 
-如果镜像无法访问或下载速度慢，可尝试使用加速：
-```bash
-
-docker pull ghcr.nju.edu.cn/usagi-org/ai-goofish:latest
-docker tag ghcr.nju.edu.cn/usagi-org/ai-goofish:latest ghcr.io/usagi-org/ai-goofish:latest
-docker compose up -d
-
-```
-
 - 默认 Web UI 地址：`http://127.0.0.1:8000`
 - 默认 Compose 端口只绑定宿主机 `127.0.0.1`，局域网中的其他设备无法直接访问。
+- 默认从当前仓库 checkout 的源码构建本地镜像 `ai-goofish-monitor:local`，确保运行内容与当前分支一致。
+- 可通过 `APP_IMAGE` 覆盖构建产物的本地镜像名称；未来自行发布镜像后，也可在 `--no-build` 模式下使用该变量。Fork 当前不提供自动镜像发布工作流。
 - Docker 镜像已内置 Chromium，无需宿主机额外安装浏览器。
-- 官方镜像地址：`ghcr.io/usagi-org/ai-goofish:latest`
-- 更新镜像：`docker compose pull && docker compose up -d`
+- 更新源码后重新运行 `docker compose up -d --build` 即可重建并启动。
 - 如果你修改了 `.env` 中的 `SERVER_PORT`，请同步更新 `docker-compose.yaml` 里的端口映射。
 - `docker-compose.yaml` 默认会把 SQLite 主库挂载到 `./data:/app/data`，数据库文件默认为 `data/app.sqlite3`
 - 目前默认持久化这些目录：
@@ -205,7 +197,7 @@ cd web-ui && npm run build
 - `PROXY_URL`：为 AI 请求单独指定 HTTP/SOCKS5 代理。
 - `RUN_HEADLESS`：是否以无头模式运行爬虫；Docker 中应保持 `true`。
 - `SERVER_PORT`：后端监听端口，默认 `8000`。
-- `APP_ENV`：运行环境，默认 `development`；设为 `production` 后弱密钥或缺失密钥会导致启动失败。
+- `APP_ENV`：运行环境，默认 `development`；设为 `production` 后，弱密钥、缺失密钥或 `SESSION_COOKIE_SECURE=false` 都会导致启动失败。
 - `SESSION_SECRET`：Session 签名密钥，生产环境使用至少 32 字节的高强度随机值。
 - `SESSION_MAX_AGE_SECONDS`：Session 有效期，默认 `86400` 秒。
 - `SESSION_COOKIE_SECURE`：是否只允许浏览器通过 HTTPS 发送 Session Cookie；本地 HTTP 默认 `false`，HTTPS 部署必须设为 `true`。
@@ -244,7 +236,7 @@ cd web-ui && npm run build
 - Web UI 通过 `POST /auth/login` 登录，后端设置 `HttpOnly`、`SameSite=Strict`、`Path=/` 的签名 Session Cookie；Cookie 的 `Secure` 属性由 `SESSION_COOKIE_SECURE` 控制。
 - 前端启动时调用 `GET /auth/session` 恢复认证状态，退出时调用 `POST /auth/logout`；密码、Session Token 和可信登录标记不会写入 `localStorage` 或 `sessionStorage`。
 - `/health` 允许匿名访问；任务、账号、结果、日志、Prompt、设置等 `/api/*` 接口及 `/ws` 均要求有效 Session。
-- 开发环境未配置高强度 `SESSION_SECRET` 时会生成临时密钥并告警，重启后已有 Session 失效；生产模式会拒绝以弱密钥或空密钥启动。
+- 开发环境未配置高强度 `SESSION_SECRET` 时会生成临时密钥并告警，重启后已有 Session 失效；生产模式要求固定高强度密钥，并强制 `SESSION_COOKIE_SECURE=true`，否则拒绝启动。
 - 默认凭据仅供本机首次启动。对局域网或公网开放前，必须设置正式凭据、固定高强度密钥、HTTPS 反向代理和 Secure Cookie。
 
 </details>

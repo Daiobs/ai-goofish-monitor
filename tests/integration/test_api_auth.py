@@ -235,10 +235,11 @@ def test_secure_cookie_attribute_follows_configuration():
     assert "Secure" in response.headers["set-cookie"]
 
 
-def test_production_rejects_missing_or_weak_session_secret():
+@pytest.mark.parametrize("session_secret", [None, "too-short"])
+def test_production_rejects_missing_or_weak_session_secret(session_secret):
     config = SimpleNamespace(
         app_env="production",
-        session_secret="too-short",
+        session_secret=session_secret,
         web_username=TEST_USERNAME,
         web_password=TEST_PASSWORD,
         session_max_age_seconds=3600,
@@ -247,6 +248,36 @@ def test_production_rejects_missing_or_weak_session_secret():
 
     with pytest.raises(RuntimeError, match="SESSION_SECRET"):
         SessionManager.from_settings(config)
+
+
+def test_production_rejects_insecure_session_cookie():
+    config = SimpleNamespace(
+        app_env="production",
+        session_secret=TEST_SESSION_SECRET,
+        web_username=TEST_USERNAME,
+        web_password=TEST_PASSWORD,
+        session_max_age_seconds=3600,
+        session_cookie_secure=False,
+    )
+
+    with pytest.raises(RuntimeError, match="SESSION_COOKIE_SECURE"):
+        SessionManager.from_settings(config)
+
+
+def test_development_allows_insecure_session_cookie(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_DATABASE_FILE", str(tmp_path / "app.sqlite3"))
+    config = SimpleNamespace(
+        app_env="development",
+        session_secret=TEST_SESSION_SECRET,
+        web_username=TEST_USERNAME,
+        web_password=TEST_PASSWORD,
+        session_max_age_seconds=3600,
+        session_cookie_secure=False,
+    )
+
+    manager = SessionManager.from_settings(config)
+
+    assert manager.cookie_secure is False
 
 
 def test_development_generates_temporary_secret_and_warns(
