@@ -6,6 +6,7 @@ import pytest
 
 from src.domain.models.task import Task, TaskCreate
 from src.infrastructure.persistence import sqlite_connection as connection_module
+from src.infrastructure.persistence.json_task_repository import JsonTaskRepository
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import (
     SCHEMA_STATEMENTS,
@@ -200,3 +201,22 @@ def test_legacy_config_preserves_explicit_ids_and_advances_sequence(tmp_path):
     assert [task.id for task in asyncio.run(service.get_all_tasks())] == [0, 12]
     created = _create_task(service, "after-import")
     assert created.id == 13
+
+
+def test_legacy_json_repository_is_read_only_and_never_reindexes(tmp_path):
+    config_path = tmp_path / "config.json"
+    first = _task_create("first").model_dump()
+    first["id"] = 0
+    second = _task_create("second").model_dump()
+    second["id"] = 9
+    config_path.write_text(json.dumps([first, second]), encoding="utf-8")
+    repository = JsonTaskRepository(str(config_path))
+
+    assert asyncio.run(repository.find_by_id(9)).task_name == "second"
+    assert asyncio.run(repository.find_by_id(1)) is None
+    assert asyncio.run(repository.find_by_id(0)).task_name == "first"
+    with pytest.raises(RuntimeError, match="JSON 任务删除已禁用"):
+        asyncio.run(repository.delete(0))
+    with pytest.raises(RuntimeError, match="JSON 任务写入已禁用"):
+        asyncio.run(repository.save(_task("new")))
+    assert json.loads(config_path.read_text(encoding="utf-8")) == [first, second]

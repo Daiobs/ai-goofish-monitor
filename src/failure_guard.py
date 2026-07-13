@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -88,6 +89,7 @@ def _cookie_changed(
 
 
 TASK_KEY_PREFIX = "task-id:"
+TASK_KEY_PATTERN = re.compile(r"^task-id:\d+$")
 
 
 def canonical_task_key(task_id: int) -> str:
@@ -254,9 +256,10 @@ class FailureGuard:
                 fh.seek(0)
                 data = self._load()
                 stored_tasks = data.setdefault("tasks", {})
+                source_version = _as_int(data.get("version"), 1)
                 changed = False
                 for legacy_key in list(stored_tasks):
-                    if legacy_key.startswith(TASK_KEY_PREFIX):
+                    if source_version >= 2 and TASK_KEY_PATTERN.fullmatch(legacy_key):
                         continue
                     matching_ids = ids_by_name.get(legacy_key, [])
                     if len(matching_ids) > 1:

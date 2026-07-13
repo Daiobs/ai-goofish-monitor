@@ -121,6 +121,34 @@ def test_unique_legacy_name_state_migrates_once_without_recounting(tmp_path):
     assert stored["tasks"][canonical_task_key(21)] == legacy_entry
 
 
+def test_version_one_name_that_looks_canonical_still_migrates(tmp_path):
+    guard_path = tmp_path / "guard.json"
+    guard_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tasks": {
+                    "task-id:42": {
+                        "consecutive_failures": 1,
+                        "last_failure_reason": "legacy display name",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    guard = FailureGuard(path=str(guard_path))
+
+    result = guard.migrate_legacy_task_keys(
+        [{"id": 73, "task_name": "task-id:42"}]
+    )
+    stored = json.loads(guard_path.read_text(encoding="utf-8"))
+
+    assert result == {"migrated": 1, "ambiguous": 0}
+    assert "task-id:42" not in stored["tasks"]
+    assert stored["tasks"][canonical_task_key(73)]["consecutive_failures"] == 1
+
+
 def test_ambiguous_legacy_name_state_is_retained_but_not_applied(tmp_path):
     guard_path = tmp_path / "guard.json"
     guard_path.write_text(
