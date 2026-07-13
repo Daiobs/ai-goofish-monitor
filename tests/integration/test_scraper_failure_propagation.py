@@ -400,6 +400,194 @@ def test_failure_reason_sanitizer_redacts_known_secret_shapes():
         assert sensitive_value not in sanitized
 
 
+@pytest.mark.parametrize(
+    ("reason", "secret", "expected"),
+    [
+        (
+            '{"api_key":"sk-test-secret"}',
+            "sk-test-secret",
+            '"api_key":"[REDACTED]"',
+        ),
+        (
+            "{'access_token': 'test-secret'}",
+            "test-secret",
+            "'access_token': '[REDACTED]'",
+        ),
+        (
+            '{"PASSWORD" = "password-secret"}',
+            "password-secret",
+            '"PASSWORD" = "[REDACTED]"',
+        ),
+        (
+            "API-KEY: api-key-secret client_secret='client-secret'",
+            "api-key-secret",
+            "API-KEY: [REDACTED]",
+        ),
+        (
+            "{'session_id': 'session-secret'}",
+            "session-secret",
+            "'session_id': '[REDACTED]'",
+        ),
+    ],
+)
+def test_failure_reason_sanitizer_redacts_quoted_and_variant_fields(
+    reason, secret, expected
+):
+    sanitized = scraper.sanitize_failure_reason(reason)
+
+    assert secret not in sanitized
+    assert expected in sanitized
+
+
+@pytest.mark.parametrize(
+    ("url", "secret"),
+    [
+        (
+            "https://api.day.app/FAKE-BARK-KEY/message",
+            "FAKE-BARK-KEY",
+        ),
+        (
+            "https://api.telegram.org/botFAKE-TELEGRAM-TOKEN/sendMessage",
+            "FAKE-TELEGRAM-TOKEN",
+        ),
+        (
+            "https://hooks.example.com/services/FAKE-WEBHOOK-SECRET",
+            "FAKE-WEBHOOK-SECRET",
+        ),
+    ],
+)
+def test_failure_reason_sanitizer_redacts_external_url_paths(url, secret):
+    sanitized = scraper.sanitize_failure_reason(f"notification failed at {url}")
+
+    assert secret not in sanitized
+    assert "/[REDACTED_PATH]" in sanitized
+
+
+def test_failure_reason_sanitizer_keeps_goofish_path_only():
+    sanitized = scraper.sanitize_failure_reason(
+        "https://url-user:url-password@passport.goofish.com/login.htm"
+        "?access_token=fake-token#fake-fragment"
+    )
+
+    assert sanitized == "https://passport.goofish.com/login.htm"
+
+
+def test_preflight_failure_is_terminal_notified_once_and_cleaned(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment()
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+
+    def fail_preflight(_keyword):
+        raise RuntimeError('{"api_key":"preflight-secret"}')
+
+    monkeypatch.setattr(scraper, "load_price_snapshots", fail_preflight)
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
+
+    failure = exc_info.value
+    assert failure.failure_kind == "runtime_error"
+    assert failure.processed_item_count == 0
+    assert "preflight-secret" not in failure.reason
+    assert '"api_key":"[REDACTED]"' in failure.reason
+    assert len(guard.failure_calls) == 1
+    assert guard.failure_calls[0][2]["cookie_path"] == str(state_path)
+    assert len(environment.notifications) == 1
+    assert "preflight-secret" not in environment.notifications[0]
+    assert environment.cleanup_calls == ["risk-control-task"]
+
+
+def test_preflight_proxy_failure_redacts_credentials_everywhere(
+    tmp_path, monkeypatch, capsys
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment()
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+
+    def fail_proxy_parse(_value):
+        raise RuntimeError(
+            "proxy setup failed: "
+            "http://preflight-user:preflight-password@proxy.example:8080"
+        )
+
+    monkeypatch.setattr(scraper, "parse_proxy_pool", fail_proxy_parse)
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
+
+    outputs = "\n".join(
+        (
+            exc_info.value.reason,
+            guard.failure_calls[0][1],
+            environment.notifications[0],
+            capsys.readouterr().out,
+        )
+    )
+    assert "http://proxy.example:8080" in outputs
+    assert "preflight-user" not in outputs
+    assert "preflight-password" not in outputs
+    assert len(guard.failure_calls) == 1
+    assert len(environment.notifications) == 1
+    assert environment.cleanup_calls == ["risk-control-task"]
+
+
+def test_prebuilt_terminal_failure_is_not_reported_twice(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment()
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+    terminal_failure = scraper.ScrapeTaskFailed(
+        task_name="risk-control-task",
+        failure_kind="runtime_error",
+        reason="already reported",
+        processed_item_count=3,
+    )
+
+    def raise_terminal_failure(_keyword):
+        raise terminal_failure
+
+    monkeypatch.setattr(
+        scraper, "load_price_snapshots", raise_terminal_failure
+    )
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
+
+    assert exc_info.value is terminal_failure
+    assert guard.failure_calls == []
+    assert environment.notifications == []
+    assert environment.cleanup_calls == ["risk-control-task"]
+
+
+def test_preflight_cancellation_propagates_without_failure_reporting(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment()
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+
+    def cancel_preflight(_keyword):
+        raise asyncio.CancelledError("preflight cancellation")
+
+    monkeypatch.setattr(scraper, "load_price_snapshots", cancel_preflight)
+
+    with pytest.raises(asyncio.CancelledError, match="preflight cancellation"):
+        asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
+
+    assert guard.failure_calls == []
+    assert environment.notifications == []
+    assert environment.cleanup_calls == ["risk-control-task"]
+
+
 def test_first_detail_risk_control_stops_items_pages_and_analysis(
     tmp_path, monkeypatch
 ):

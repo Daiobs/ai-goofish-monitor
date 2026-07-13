@@ -110,15 +110,18 @@ SENSITIVE_HEADER_PATTERN = re.compile(
 SENSITIVE_FIELD_PATTERN = re.compile(
     r"""
     (?P<prefix>
+        (?P<key_quote>["']?)
         \b(?:
             access[_-]?token|refresh[_-]?token|id[_-]?token|token|
             session(?:[_-]?(?:id|token))?|password|passwd|pwd|
             cookie|set[_-]?cookie|authorization|
             proxy[_-]?(?:username|user|password|pass)|
             api[_-]?key|client[_-]?secret|secret
-        )\b\s*(?:=|:)\s*
+        )\b
+        (?P=key_quote)
+        \s*(?:=|:)\s*
     )
-    (?:"[^"]*"|'[^']*'|[^\s,;]+)
+    (?P<value>"[^"]*"|'[^']*'|[^\s,;}\]]+)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -129,6 +132,11 @@ AUTH_CREDENTIAL_PATTERN = re.compile(
 JWT_PATTERN = re.compile(
     r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
 )
+
+
+def _is_goofish_hostname(hostname: str) -> bool:
+    normalized = hostname.rstrip(".").lower()
+    return normalized == "goofish.com" or normalized.endswith(".goofish.com")
 
 
 def _sanitize_url_for_display(url: str) -> str:
@@ -147,7 +155,10 @@ def _sanitize_url_for_display(url: str) -> str:
     except ValueError:
         port = None
     netloc = f"{display_host}:{port}" if port is not None else display_host
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    path = parsed.path
+    if path not in {"", "/"} and not _is_goofish_hostname(hostname):
+        path = "/[REDACTED_PATH]"
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 def _sanitize_url_match(match: re.Match) -> str:
@@ -159,6 +170,12 @@ def _sanitize_url_match(match: re.Match) -> str:
     return _sanitize_url_for_display(raw_url) + trailing
 
 
+def _redact_sensitive_field(match: re.Match) -> str:
+    value = match.group("value")
+    value_quote = value[0] if value[:1] in {"\"", "'"} else ""
+    return f"{match.group('prefix')}{value_quote}[REDACTED]{value_quote}"
+
+
 def sanitize_failure_reason(reason: object, limit: int = 500) -> str:
     """Remove credentials and request secrets before a failure leaves the scraper."""
     if not reason:
@@ -168,7 +185,7 @@ def sanitize_failure_reason(reason: object, limit: int = 500) -> str:
     cleaned = URL_PATTERN.sub(_sanitize_url_match, cleaned)
     cleaned = SENSITIVE_HEADER_PATTERN.sub(r"\1[REDACTED]", cleaned)
     cleaned = AUTH_CREDENTIAL_PATTERN.sub(r"\1 [REDACTED]", cleaned)
-    cleaned = SENSITIVE_FIELD_PATTERN.sub(r"\g<prefix>[REDACTED]", cleaned)
+    cleaned = SENSITIVE_FIELD_PATTERN.sub(_redact_sensitive_field, cleaned)
     cleaned = JWT_PATTERN.sub("[REDACTED]", cleaned)
     cleaned = " ".join(cleaned.split())
     if len(cleaned) <= limit:
@@ -265,11 +282,20 @@ async def _finalize_scrape_resources(
 def _cleanup_task_images_safely(task_name: str) -> None:
     try:
         cleanup_task_images(task_name)
-    except Exception as exc:
+    except BaseException as exc:
         print(
             f"清理任务 '{task_name}' 的临时图片时发生错误: "
             f"{sanitize_failure_reason(exc)}"
         )
+
+
+def _best_effort_cookie_path(task_config: dict) -> Optional[str]:
+    configured_path = task_config.get("account_state_file")
+    if isinstance(configured_path, str) and configured_path.strip():
+        return configured_path.strip()
+    if os.path.exists(STATE_FILE):
+        return STATE_FILE
+    return None
 
 
 def _resolve_browser_channel() -> str:
@@ -626,7 +652,11 @@ async def scrape_user_profile(context, user_id: str) -> dict:
     return profile_data
 
 
-async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
+async def _scrape_xianyu_core(
+    task_config: dict,
+    debug_limit: int,
+    lifecycle_progress: dict[str, int],
+):
     """
     【核心执行器】
     根据单个任务配置，异步爬取闲鱼商品数据，并对每个新发现的商品进行实时的、独立的AI分析和通知。
@@ -1322,6 +1352,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
                                 processed_links.add(unique_key)
                                 attempt_processed_item_count += 1
+                                lifecycle_progress["processed_item_count"] += 1
                                 log_time(
                                     "商品已提交后台分析。累计处理 "
                                     f"{attempt_processed_item_count} 个新商品。"
@@ -1451,14 +1482,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
         failure_kind = "runtime_error"
         last_state_path: Optional[str] = None
 
-        pause_cookie_path = None
-        if (
-            isinstance(task_config.get("account_state_file"), str)
-            and task_config.get("account_state_file").strip()
-        ):
-            pause_cookie_path = task_config.get("account_state_file").strip()
-        elif os.path.exists(STATE_FILE):
-            pause_cookie_path = STATE_FILE
+        pause_cookie_path = _best_effort_cookie_path(task_config)
 
         decision = FAILURE_GUARD.should_skip_start(
             task_name_for_guard, cookie_path=pause_cookie_path
@@ -1579,16 +1603,62 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
         )
         try:
             await _notify_task_failure(
-                task_config, last_error, cookie_path=last_state_path
+                task_config,
+                last_error,
+                cookie_path=last_state_path or pause_cookie_path,
             )
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
             print(
                 "记录或通知任务失败时发生错误: "
                 f"{sanitize_failure_reason(exc)}"
             )
         raise terminal_failure
 
+    return await _run_with_rotation()
+
+
+async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
+    """Run one task inside the terminal failure and cleanup boundary."""
+    task_name = "未命名任务"
+    cookie_path: Optional[str] = None
+    lifecycle_progress = {"processed_item_count": 0}
+
     try:
-        return await _run_with_rotation()
+        task_name = task_config.get("task_name", task_name)
+        cookie_path = _best_effort_cookie_path(task_config)
+        return await _scrape_xianyu_core(
+            task_config,
+            debug_limit,
+            lifecycle_progress,
+        )
+    except asyncio.CancelledError:
+        raise
+    except ScrapeTaskFailed:
+        raise
+    except BaseException as exc:
+        reason = sanitize_failure_reason(f"{type(exc).__name__}: {exc}")
+        terminal_failure = ScrapeTaskFailed(
+            task_name=task_name,
+            failure_kind="runtime_error",
+            reason=reason,
+            processed_item_count=lifecycle_progress["processed_item_count"],
+        )
+        print(f"任务 '{task_name}' 运行异常: {reason}")
+        try:
+            await _notify_task_failure(
+                task_config,
+                reason,
+                cookie_path=cookie_path,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as notify_error:
+            print(
+                "记录或通知任务失败时发生错误: "
+                f"{sanitize_failure_reason(notify_error)}"
+            )
+        raise terminal_failure from exc
     finally:
-        _cleanup_task_images_safely(task_name_for_guard)
+        _cleanup_task_images_safely(task_name)

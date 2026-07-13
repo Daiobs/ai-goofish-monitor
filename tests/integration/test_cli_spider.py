@@ -31,6 +31,9 @@ def _load_spider(monkeypatch):
         return 0
 
     fake_scraper.ScrapeTaskFailed = FakeScrapeTaskFailed
+    fake_scraper.sanitize_failure_reason = lambda reason: str(reason).replace(
+        "cli-secret", "[REDACTED]"
+    )
     fake_scraper.scrape_xianyu = placeholder_scrape
     monkeypatch.setitem(sys.modules, "src.scraper", fake_scraper)
     sys.modules.pop("spider_v2", None)
@@ -222,6 +225,37 @@ def test_cli_keeps_multi_task_concurrency_and_returns_nonzero_if_any_task_fails(
     }
     assert f"任务 '{config_data[0]['task_name']}' 正常结束" in output
     assert f"任务 '{config_data[1]['task_name']}' 风控终止" in output
+
+
+def test_cli_redacts_unknown_exception_before_logging(
+    tmp_path, load_json_fixture, monkeypatch, capsys
+):
+    spider_v2 = _load_spider(monkeypatch)
+    task_name, config_path = _write_keyword_task_config(
+        tmp_path, load_json_fixture
+    )
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(spider_v2, "STATE_FILE", str(state_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["spider_v2.py", "--config", str(config_path), "--task-name", task_name],
+    )
+
+    async def fail_with_unknown_exception(task_config, debug_limit):
+        raise RuntimeError("api_key=cli-secret")
+
+    monkeypatch.setattr(
+        spider_v2, "scrape_xianyu", fail_with_unknown_exception
+    )
+
+    exit_code = asyncio.run(spider_v2.main())
+    output = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "cli-secret" not in output
+    assert "api_key=[REDACTED]" in output
 
 
 @pytest.mark.parametrize("cancel_signal", [signal.SIGTERM, signal.SIGINT])

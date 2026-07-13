@@ -9,7 +9,7 @@ import re
 
 from src.config import STATE_FILE
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
-from src.scraper import ScrapeTaskFailed, scrape_xianyu
+from src.scraper import ScrapeTaskFailed, sanitize_failure_reason, scrape_xianyu
 
 
 async def main() -> int:
@@ -40,7 +40,10 @@ async def main() -> int:
             with open(args.config, 'r', encoding='utf-8') as f:
                 tasks_config = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            sys.exit(f"错误: 读取或解析配置文件 '{args.config}' 失败: {e}")
+            sys.exit(
+                f"错误: 读取或解析配置文件 '{args.config}' 失败: "
+                f"{sanitize_failure_reason(e)}"
+            )
     else:
         repository = SqliteTaskRepository()
         tasks = await repository.find_all()
@@ -131,10 +134,16 @@ async def main() -> int:
                     print(f"✅ 任务 '{task['task_name']}' 的prompt生成成功，长度: {len(task['ai_prompt_text'])} 字符")
 
             except FileNotFoundError as e:
-                print(f"警告: 任务 '{task['task_name']}' 的prompt文件缺失: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"警告: 任务 '{task['task_name']}' 的prompt文件缺失: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
             except Exception as e:
-                print(f"错误: 任务 '{task['task_name']}' 处理prompt文件时发生异常: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"错误: 任务 '{task['task_name']}' 处理prompt文件时发生异常: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
         elif task.get("enabled", False) and task.get("ai_prompt_file"):
             try:
@@ -145,7 +154,10 @@ async def main() -> int:
                 print(f"警告: 任务 '{task['task_name']}' 的prompt文件 '{task['ai_prompt_file']}' 未找到，该任务的AI分析将被跳过。")
                 task['ai_prompt_text'] = ""
             except Exception as e:
-                print(f"错误: 任务 '{task['task_name']}' 读取prompt文件时发生异常: {e}，该任务的AI分析将被跳过。")
+                print(
+                    f"错误: 任务 '{task['task_name']}' 读取prompt文件时发生异常: "
+                    f"{sanitize_failure_reason(e)}，该任务的AI分析将被跳过。"
+                )
                 task['ai_prompt_text'] = ""
 
     print("\n--- 开始执行监控任务 ---")
@@ -230,7 +242,10 @@ async def main() -> int:
             continue
         if isinstance(result, BaseException):
             has_failure = True
-            print(f"任务 '{task_name}' 运行异常: {result}")
+            print(
+                f"任务 '{task_name}' 运行异常: "
+                f"{sanitize_failure_reason(result)}"
+            )
             continue
         print(f"任务 '{task_name}' 正常结束，本次运行共处理了 {result} 个新商品。")
 
