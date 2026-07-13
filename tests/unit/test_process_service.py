@@ -2,6 +2,8 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from src.services.process_service import ProcessService
 
 
@@ -26,7 +28,10 @@ class FakeProcess:
         self.finish(-9)
 
 
-def test_process_service_marks_task_stopped_when_process_exits(monkeypatch, tmp_path):
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_process_service_marks_task_stopped_when_process_exits(
+    monkeypatch, tmp_path, returncode
+):
     fake_process = FakeProcess(pid=4321)
     events = []
 
@@ -64,12 +69,14 @@ def test_process_service_marks_task_stopped_when_process_exits(monkeypatch, tmp_
         assert started is True
         assert events == [("started", 0)]
         assert service.is_running(0) is True
+        log_handle = service.log_handles[0]
 
-        fake_process.finish(0)
+        fake_process.finish(returncode)
         await asyncio.wait_for(stopped.wait(), timeout=1)
 
         assert ("stopped", 0) in events
         assert service.is_running(0) is False
+        assert log_handle.closed is True
 
     asyncio.run(run_scenario())
 

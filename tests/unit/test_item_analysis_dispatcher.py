@@ -129,3 +129,65 @@ def test_item_analysis_dispatcher_supports_keyword_mode_without_ai():
     asyncio.run(run())
     assert saved_records[0]["ai_analysis"]["analysis_source"] == "keyword"
     assert saved_records[0]["ai_analysis"]["is_recommended"] is True
+
+
+def test_item_analysis_dispatcher_can_cancel_submitted_work():
+    seller_started = asyncio.Event()
+    seller_cancelled = asyncio.Event()
+    saved_records = []
+
+    async def seller_loader(_user_id: str):
+        seller_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            seller_cancelled.set()
+
+    async def image_downloader(_product_id, _image_urls, _task_name):
+        return []
+
+    async def ai_analyzer(_record, _image_paths, _prompt_text):
+        return None
+
+    async def notifier(_item_data, _reason):
+        return None
+
+    async def saver(record, _keyword):
+        saved_records.append(record)
+        return True
+
+    async def run():
+        dispatcher = ItemAnalysisDispatcher(
+            concurrency=1,
+            skip_ai_analysis=False,
+            seller_loader=seller_loader,
+            image_downloader=image_downloader,
+            ai_analyzer=ai_analyzer,
+            notifier=notifier,
+            saver=saver,
+        )
+        dispatcher.submit(
+            ItemAnalysisJob(
+                keyword="demo",
+                task_name="Demo",
+                decision_mode="keyword",
+                analyze_images=False,
+                prompt_text="",
+                keyword_rules=(),
+                final_record={
+                    "商品信息": {"商品ID": "1", "商品标题": "演示商品"},
+                    "卖家信息": {},
+                },
+                seller_id="seller-1",
+                zhima_credit_text="优秀",
+                registration_duration_text="来闲鱼1年",
+            )
+        )
+        await seller_started.wait()
+        await dispatcher.cancel_and_join()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert seller_cancelled.is_set()
+    assert saved_records == []

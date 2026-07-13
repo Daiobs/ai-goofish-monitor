@@ -65,6 +65,14 @@ class ItemAnalysisDispatcher:
         while self._tasks:
             await asyncio.gather(*tuple(self._tasks))
 
+    async def cancel_and_join(self) -> None:
+        """Cancel submitted work when crawler access must stop immediately."""
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _process_with_limit(self, job: ItemAnalysisJob) -> None:
         async with self._semaphore:
             await self._process_job(job)
