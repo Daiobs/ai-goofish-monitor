@@ -8,7 +8,11 @@ import json
 import threading
 from pathlib import Path
 
-from src.infrastructure.persistence.sqlite_connection import init_schema, sqlite_connection
+from src.infrastructure.persistence.sqlite_connection import (
+    init_schema,
+    sqlite_connection,
+    sync_tasks_autoincrement_sequence,
+)
 from src.infrastructure.persistence.storage_names import (
     build_result_filename,
     normalize_keyword_from_filename,
@@ -72,6 +76,7 @@ def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> None:
         conn.commit()
         return
 
+    task_ids = _resolve_legacy_task_ids(tasks)
     for index, raw_task in enumerate(tasks):
         if not isinstance(raw_task, dict):
             continue
@@ -86,7 +91,7 @@ def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> None:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                index,
+                task_ids[index],
                 raw_task.get("task_name", ""),
                 _as_int(raw_task.get("enabled", True)),
                 raw_task.get("keyword", ""),
@@ -109,8 +114,45 @@ def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> None:
                 _as_int(raw_task.get("is_running", False)),
             ),
         )
+    sync_tasks_autoincrement_sequence(conn)
     _mark_bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY)
     conn.commit()
+
+
+def _resolve_legacy_task_ids(tasks: list) -> dict[int, int]:
+    """Preserve valid explicit IDs and fill legacy omissions deterministically."""
+    assignments: dict[int, int] = {}
+    reserved: set[int] = set()
+
+    for index, raw_task in enumerate(tasks):
+        if not isinstance(raw_task, dict):
+            continue
+        explicit_id = _parse_task_id(raw_task.get("id"))
+        if explicit_id is None or explicit_id in reserved:
+            continue
+        assignments[index] = explicit_id
+        reserved.add(explicit_id)
+
+    candidate = 0
+    for index, raw_task in enumerate(tasks):
+        if not isinstance(raw_task, dict) or index in assignments:
+            continue
+        while candidate in reserved:
+            candidate += 1
+        assignments[index] = candidate
+        reserved.add(candidate)
+        candidate += 1
+    return assignments
+
+
+def _parse_task_id(value) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        task_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return task_id if task_id >= 0 else None
 
 
 def _import_results_if_needed(conn, legacy_result_dir: str) -> None:

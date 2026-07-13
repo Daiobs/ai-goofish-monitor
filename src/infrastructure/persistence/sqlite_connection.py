@@ -23,7 +23,7 @@ SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_name TEXT NOT NULL,
         enabled INTEGER NOT NULL,
         keyword TEXT NOT NULL,
@@ -136,6 +136,31 @@ SCHEMA_STATEMENTS = (
     """,
 )
 
+TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
+TASK_COLUMNS = (
+    "id",
+    "task_name",
+    "enabled",
+    "keyword",
+    "description",
+    "analyze_images",
+    "max_pages",
+    "personal_only",
+    "min_price",
+    "max_price",
+    "cron",
+    "ai_prompt_base_file",
+    "ai_prompt_criteria_file",
+    "account_state_file",
+    "account_strategy",
+    "free_shipping",
+    "new_publish_option",
+    "region",
+    "decision_mode",
+    "keyword_rules_json",
+    "is_running",
+)
+
 
 def get_database_path() -> str:
     return os.getenv("APP_DATABASE_FILE", DEFAULT_DATABASE_PATH)
@@ -157,10 +182,89 @@ def _apply_read_only_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    for statement in SCHEMA_STATEMENTS:
-        conn.execute(statement)
-    _migrate_result_items_status(conn)
-    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        _migrate_tasks_autoincrement(conn)
+        _migrate_result_items_status(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_tasks_autoincrement(conn: sqlite3.Connection) -> None:
+    """Upgrade tasks.id without changing any existing task identity."""
+    migration_done = conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = ?",
+        (TASK_IDENTITY_MIGRATION_KEY,),
+    ).fetchone()
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+    ).fetchone()
+    table_sql = str(table_row["sql"] if table_row else "")
+    has_autoincrement = "AUTOINCREMENT" in table_sql.upper()
+    if has_autoincrement and migration_done is not None:
+        return
+
+    if not has_autoincrement:
+        conn.execute("DROP TABLE IF EXISTS tasks__task_id_migration")
+        conn.execute(
+            """
+            CREATE TABLE tasks__task_id_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                keyword TEXT NOT NULL,
+                description TEXT,
+                analyze_images INTEGER NOT NULL,
+                max_pages INTEGER NOT NULL,
+                personal_only INTEGER NOT NULL,
+                min_price TEXT,
+                max_price TEXT,
+                cron TEXT,
+                ai_prompt_base_file TEXT NOT NULL,
+                ai_prompt_criteria_file TEXT NOT NULL,
+                account_state_file TEXT,
+                account_strategy TEXT NOT NULL,
+                free_shipping INTEGER NOT NULL,
+                new_publish_option TEXT,
+                region TEXT,
+                decision_mode TEXT NOT NULL,
+                keyword_rules_json TEXT NOT NULL,
+                is_running INTEGER NOT NULL
+            )
+            """
+        )
+        _copy_tasks_to_autoincrement_table(conn)
+        conn.execute("DROP TABLE tasks")
+        conn.execute("ALTER TABLE tasks__task_id_migration RENAME TO tasks")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks(task_name)")
+
+    sync_tasks_autoincrement_sequence(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, 'done')",
+        (TASK_IDENTITY_MIGRATION_KEY,),
+    )
+
+
+def _copy_tasks_to_autoincrement_table(conn: sqlite3.Connection) -> None:
+    columns = ", ".join(TASK_COLUMNS)
+    conn.execute(
+        f"INSERT INTO tasks__task_id_migration ({columns}) SELECT {columns} FROM tasks"
+    )
+
+
+def sync_tasks_autoincrement_sequence(conn: sqlite3.Connection) -> None:
+    """Advance SQLite's durable task sequence past every preserved explicit ID."""
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'tasks'")
+    row = conn.execute("SELECT MAX(id) AS max_id FROM tasks").fetchone()
+    if row is not None and row["max_id"] is not None:
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('tasks', ?)",
+            (int(row["max_id"]),),
+        )
 
 
 def _migrate_result_items_status(conn: sqlite3.Connection) -> None:

@@ -83,26 +83,58 @@ class SqliteTaskRepository(TaskRepository):
         with sqlite_connection(self.db_path) as conn:
             task_id = task.id
             if task_id is None:
-                task_id = self._next_task_id(conn)
-            payload = self._task_values(task.model_copy(update={"id": task_id}))
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO tasks (
-                    id, task_name, enabled, keyword, description, analyze_images,
-                    max_pages, personal_only, min_price, max_price, cron,
-                    ai_prompt_base_file, ai_prompt_criteria_file, account_state_file,
-                    account_strategy, free_shipping, new_publish_option, region,
-                    decision_mode, keyword_rules_json, is_running
-                ) VALUES (
-                    :id, :task_name, :enabled, :keyword, :description, :analyze_images,
-                    :max_pages, :personal_only, :min_price, :max_price, :cron,
-                    :ai_prompt_base_file, :ai_prompt_criteria_file, :account_state_file,
-                    :account_strategy, :free_shipping, :new_publish_option, :region,
-                    :decision_mode, :keyword_rules_json, :is_running
+                payload = self._task_values(task)
+                payload.pop("id", None)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_name, enabled, keyword, description, analyze_images,
+                        max_pages, personal_only, min_price, max_price, cron,
+                        ai_prompt_base_file, ai_prompt_criteria_file, account_state_file,
+                        account_strategy, free_shipping, new_publish_option, region,
+                        decision_mode, keyword_rules_json, is_running
+                    ) VALUES (
+                        :task_name, :enabled, :keyword, :description, :analyze_images,
+                        :max_pages, :personal_only, :min_price, :max_price, :cron,
+                        :ai_prompt_base_file, :ai_prompt_criteria_file, :account_state_file,
+                        :account_strategy, :free_shipping, :new_publish_option, :region,
+                        :decision_mode, :keyword_rules_json, :is_running
+                    )
+                    """,
+                    payload,
                 )
-                """,
-                payload,
-            )
+                task_id = int(cursor.lastrowid)
+            else:
+                payload = self._task_values(task)
+                cursor = conn.execute(
+                    """
+                    UPDATE tasks SET
+                        task_name = :task_name,
+                        enabled = :enabled,
+                        keyword = :keyword,
+                        description = :description,
+                        analyze_images = :analyze_images,
+                        max_pages = :max_pages,
+                        personal_only = :personal_only,
+                        min_price = :min_price,
+                        max_price = :max_price,
+                        cron = :cron,
+                        ai_prompt_base_file = :ai_prompt_base_file,
+                        ai_prompt_criteria_file = :ai_prompt_criteria_file,
+                        account_state_file = :account_state_file,
+                        account_strategy = :account_strategy,
+                        free_shipping = :free_shipping,
+                        new_publish_option = :new_publish_option,
+                        region = :region,
+                        decision_mode = :decision_mode,
+                        keyword_rules_json = :keyword_rules_json,
+                        is_running = :is_running
+                    WHERE id = :id
+                    """,
+                    payload,
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"任务 {task_id} 不存在")
             conn.commit()
         return task.model_copy(update={"id": task_id})
 
@@ -115,10 +147,6 @@ class SqliteTaskRepository(TaskRepository):
             cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             conn.commit()
         return cursor.rowcount > 0
-
-    def _next_task_id(self, conn) -> int:
-        row = conn.execute("SELECT COALESCE(MAX(id), -1) AS max_id FROM tasks").fetchone()
-        return int(row["max_id"]) + 1
 
     def _task_values(self, task: Task) -> dict:
         values = task.model_dump()

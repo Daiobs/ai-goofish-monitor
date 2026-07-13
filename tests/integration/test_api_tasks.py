@@ -6,6 +6,7 @@ def test_create_list_update_delete_task(api_client, api_context, sample_task_pay
     response = api_client.post("/api/tasks/", json=sample_task_payload)
     assert response.status_code == 200
     created = response.json()["task"]
+    task_id = created["id"]
     assert created["task_name"] == sample_task_payload["task_name"]
     assert created["analyze_images"] is True
     assert created["next_run_at"] == "2026-03-19T08:15:00+08:00"
@@ -18,14 +19,17 @@ def test_create_list_update_delete_task(api_client, api_context, sample_task_pay
     assert tasks[0]["analyze_images"] is True
     assert tasks[0]["next_run_at"] == "2026-03-19T08:15:00+08:00"
 
-    response = api_client.patch("/api/tasks/0", json={"enabled": False, "analyze_images": False})
+    response = api_client.patch(
+        f"/api/tasks/{task_id}",
+        json={"enabled": False, "analyze_images": False},
+    )
     assert response.status_code == 200
     updated = response.json()["task"]
     assert updated["enabled"] is False
     assert updated["analyze_images"] is False
     assert updated["next_run_at"] is None
 
-    response = api_client.delete("/api/tasks/0")
+    response = api_client.delete(f"/api/tasks/{task_id}")
     assert response.status_code == 200
 
     response = api_client.get("/api/tasks")
@@ -36,24 +40,25 @@ def test_create_list_update_delete_task(api_client, api_context, sample_task_pay
 def test_start_stop_task_updates_status(api_client, api_context, sample_task_payload):
     response = api_client.post("/api/tasks/", json=sample_task_payload)
     assert response.status_code == 200
+    task_id = response.json()["task"]["id"]
 
-    response = api_client.post("/api/tasks/start/0")
+    response = api_client.post(f"/api/tasks/start/{task_id}")
     assert response.status_code == 200
 
-    response = api_client.get("/api/tasks/0")
+    response = api_client.get(f"/api/tasks/{task_id}")
     assert response.status_code == 200
     assert response.json()["is_running"] is True
 
-    response = api_client.post("/api/tasks/stop/0")
+    response = api_client.post(f"/api/tasks/stop/{task_id}")
     assert response.status_code == 200
 
-    response = api_client.get("/api/tasks/0")
+    response = api_client.get(f"/api/tasks/{task_id}")
     assert response.status_code == 200
     assert response.json()["is_running"] is False
 
     process_service = api_context["process_service"]
-    assert process_service.started == [(0, sample_task_payload["task_name"])]
-    assert process_service.stopped == [0]
+    assert process_service.started == [(task_id, sample_task_payload["task_name"])]
+    assert process_service.stopped == [task_id]
 
 
 def test_generate_keyword_mode_task_without_ai_criteria(api_client):
@@ -154,12 +159,13 @@ def test_create_task_accepts_rotate_account_strategy(api_client, sample_task_pay
 def test_update_task_accepts_six_field_cron_expression(api_client, sample_task_payload):
     create_response = api_client.post("/api/tasks/", json=sample_task_payload)
     assert create_response.status_code == 200
+    task_id = create_response.json()["task"]["id"]
 
-    response = api_client.patch("/api/tasks/0", json={"cron": "0 0 8 * * *"})
+    response = api_client.patch(f"/api/tasks/{task_id}", json={"cron": "0 0 8 * * *"})
 
     assert response.status_code == 200
 
-    task_response = api_client.get("/api/tasks/0")
+    task_response = api_client.get(f"/api/tasks/{task_id}")
     assert task_response.status_code == 200
     assert task_response.json()["cron"] == "0 0 8 * * *"
 
@@ -173,7 +179,7 @@ def test_create_task_rejects_invalid_cron_expression(api_client, sample_task_pay
     assert response.status_code == 422
 
 
-def test_delete_task_stops_runtime_and_reindexes_process_state(
+def test_delete_task_stops_only_deleted_runtime(
     api_client,
     api_context,
     sample_task_payload,
@@ -183,13 +189,21 @@ def test_delete_task_stops_runtime_and_reindexes_process_state(
     second_payload["keyword"] = "sony a7cr"
     second_payload["ai_prompt_criteria_file"] = "prompts/sony_a7cr_criteria.txt"
 
-    assert api_client.post("/api/tasks/", json=sample_task_payload).status_code == 200
-    assert api_client.post("/api/tasks/", json=second_payload).status_code == 200
-    assert api_client.post("/api/tasks/start/0").status_code == 200
+    first_response = api_client.post("/api/tasks/", json=sample_task_payload)
+    second_response = api_client.post("/api/tasks/", json=second_payload)
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_id = first_response.json()["task"]["id"]
+    second_id = second_response.json()["task"]["id"]
+    assert api_client.post(f"/api/tasks/start/{first_id}").status_code == 200
 
-    response = api_client.delete("/api/tasks/0")
+    response = api_client.delete(f"/api/tasks/{first_id}")
 
     assert response.status_code == 200
     process_service = api_context["process_service"]
-    assert process_service.stopped == [0]
+    assert process_service.stopped == [first_id]
     assert process_service.reindexed == []
+
+    remaining = api_client.get(f"/api/tasks/{second_id}")
+    assert remaining.status_code == 200
+    assert remaining.json()["id"] == second_id
