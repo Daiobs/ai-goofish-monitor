@@ -9,6 +9,7 @@ import re
 
 from src.config import STATE_FILE
 from src.failure_guard import FailureGuard
+from src.infrastructure.persistence.sqlite_bootstrap import migrate_task_prompts
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.scraper import ScrapeTaskFailed, sanitize_failure_reason, scrape_xianyu
 
@@ -48,6 +49,7 @@ async def main() -> int:
         if args.config:
             print("错误：--task-id 必须从 SQLite 加载，不能与 --config 同时使用。")
             return 1
+        migrate_task_prompts()
         repository = SqliteTaskRepository()
         selected_task = await repository.find_by_id(args.task_id)
         if selected_task is None:
@@ -68,6 +70,7 @@ async def main() -> int:
                 f"{sanitize_failure_reason(e)}"
             )
     else:
+        migrate_task_prompts()
         repository = SqliteTaskRepository()
         loaded_tasks = await repository.find_all()
         FailureGuard().migrate_legacy_task_keys(loaded_tasks)

@@ -183,6 +183,7 @@ def test_cli_task_id_selects_exact_same_name_task(
 
     monkeypatch.setattr(spider_v2, "SqliteTaskRepository", FakeRepository)
     monkeypatch.setattr(spider_v2, "FailureGuard", _FakeGuard)
+    monkeypatch.setattr(spider_v2, "migrate_task_prompts", lambda: None)
     monkeypatch.setattr(spider_v2, "scrape_xianyu", fake_scrape)
     monkeypatch.setattr(sys, "argv", ["spider_v2.py", "--task-id", str(task_id)])
 
@@ -206,6 +207,7 @@ def test_cli_missing_task_id_fails_before_scraper_start(monkeypatch, capsys):
         raise AssertionError("scraper must not start for a missing task ID")
 
     monkeypatch.setattr(spider_v2, "SqliteTaskRepository", FakeRepository)
+    monkeypatch.setattr(spider_v2, "migrate_task_prompts", lambda: None)
     monkeypatch.setattr(spider_v2, "scrape_xianyu", unexpected_scrape)
     monkeypatch.setattr(sys, "argv", ["spider_v2.py", "--task-id", "999"])
 

@@ -121,7 +121,12 @@ def test_generate_ai_task_returns_job_and_completes_async(api_client, api_contex
         raise AssertionError("任务生成作业未在预期时间内完成")
 
     assert latest_job["task"]["task_name"] == payload["task_name"]
-    assert latest_job["task"]["ai_prompt_criteria_file"].endswith("_criteria.txt")
+    task_id = latest_job["task"]["id"]
+    criteria_path = latest_job["task"]["ai_prompt_criteria_file"]
+    assert criteria_path == f"prompts/tasks/{task_id}/criteria.txt"
+    assert (api_context["db_path"].parent / criteria_path).read_text(
+        encoding="utf-8"
+    ) == "[V6.3 核心升级]\\nApple Watch criteria"
     assert latest_job["task"]["analyze_images"] is False
     assert api_context["scheduler_service"].reload_calls == 1
 
@@ -154,6 +159,44 @@ def test_create_task_accepts_rotate_account_strategy(api_client, sample_task_pay
     assert response.status_code == 200
     task = response.json()["task"]
     assert task["account_strategy"] == "rotate"
+
+
+def test_task_id_is_read_only_and_prompt_path_stays_id_scoped(
+    api_client, sample_task_payload
+):
+    created_response = api_client.post("/api/tasks/", json=sample_task_payload)
+    assert created_response.status_code == 200
+    created = created_response.json()["task"]
+
+    response = api_client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "id": 999999,
+            "task_name": "renamed task",
+            "keyword": "renamed keyword",
+            "ai_prompt_criteria_file": "prompts/untrusted.txt",
+        },
+    )
+
+    assert response.status_code == 200
+    updated = response.json()["task"]
+    assert updated["id"] == created["id"]
+    assert updated["ai_prompt_criteria_file"] == (
+        f"prompts/tasks/{created['id']}/criteria.txt"
+    )
+
+
+def test_duplicate_task_names_remain_distinct_by_id(api_client, sample_task_payload):
+    first_response = api_client.post("/api/tasks/", json=sample_task_payload)
+    second_response = api_client.post("/api/tasks/", json=sample_task_payload)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first = first_response.json()["task"]
+    second = second_response.json()["task"]
+    assert first["task_name"] == second["task_name"]
+    assert first["id"] != second["id"]
+    assert first["ai_prompt_criteria_file"] != second["ai_prompt_criteria_file"]
 
 
 def test_update_task_accepts_six_field_cron_expression(api_client, sample_task_payload):

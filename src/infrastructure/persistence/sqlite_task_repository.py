@@ -11,6 +11,7 @@ from src.domain.models.task import Task
 from src.domain.repositories.task_repository import TaskRepository
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import sqlite_connection
+from src.services.task_prompt_service import TaskPromptStore
 
 
 def _row_to_task(row) -> Task:
@@ -92,6 +93,7 @@ class SqliteTaskRepository(TaskRepository):
         )
         with sqlite_connection(self.db_path) as conn:
             task_id = task.id
+            persisted_task = task
             if task_id is None:
                 payload = self._task_values(task)
                 payload.pop("id", None)
@@ -114,6 +116,16 @@ class SqliteTaskRepository(TaskRepository):
                     payload,
                 )
                 task_id = int(cursor.lastrowid)
+                persisted_task = task.model_copy(update={"id": task_id})
+                if persisted_task.decision_mode == "ai":
+                    canonical_path = TaskPromptStore().criteria_path_string(task_id)
+                    conn.execute(
+                        "UPDATE tasks SET ai_prompt_criteria_file = ? WHERE id = ?",
+                        (canonical_path, task_id),
+                    )
+                    persisted_task = persisted_task.model_copy(
+                        update={"ai_prompt_criteria_file": canonical_path}
+                    )
             else:
                 payload = self._task_values(task)
                 cursor = conn.execute(
@@ -146,7 +158,7 @@ class SqliteTaskRepository(TaskRepository):
                 if cursor.rowcount != 1:
                     raise ValueError(f"任务 {task_id} 不存在")
             conn.commit()
-        return task.model_copy(update={"id": task_id})
+        return persisted_task.model_copy(update={"id": task_id})
 
     def _delete_sync(self, task_id: int) -> bool:
         bootstrap_sqlite_storage(

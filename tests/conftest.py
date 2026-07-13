@@ -95,7 +95,8 @@ class FakeSchedulerService:
 
 
 @pytest.fixture()
-def api_context(tmp_path):
+def api_context(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     config_file = tmp_path / "config.json"
     config_file.write_text("[]", encoding="utf-8")
     db_path = tmp_path / "app.sqlite3"

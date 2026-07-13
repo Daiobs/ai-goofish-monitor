@@ -18,6 +18,7 @@ from src.infrastructure.persistence.storage_names import (
     normalize_keyword_from_filename,
     normalize_keyword_slug,
 )
+from src.services.task_prompt_service import TaskPromptStore
 
 
 BOOTSTRAP_LOCK = threading.Lock()
@@ -27,6 +28,7 @@ LEGACY_PRICE_HISTORY_DIR = "price_history"
 TASKS_BOOTSTRAP_KEY = "bootstrap:legacy_tasks"
 RESULTS_BOOTSTRAP_KEY = "bootstrap:legacy_results"
 SNAPSHOTS_BOOTSTRAP_KEY = "bootstrap:legacy_price_snapshots"
+TASK_PROMPT_MIGRATION_PREFIX = "migration:task_prompt_v1:"
 
 
 def bootstrap_sqlite_storage(
@@ -42,6 +44,68 @@ def bootstrap_sqlite_storage(
             _import_tasks_if_needed(conn, legacy_config_file)
             _import_results_if_needed(conn, legacy_result_dir)
             _import_price_snapshots_if_needed(conn, legacy_price_history_dir)
+
+
+def migrate_task_prompts(
+    db_path: str | None = None,
+    *,
+    prompt_store: TaskPromptStore | None = None,
+) -> dict[str, int]:
+    """Copy legacy criteria into stable task directories without deleting sources."""
+    bootstrap_sqlite_storage(db_path)
+    store = prompt_store or TaskPromptStore()
+    result = {"migrated": 0, "missing": 0, "failed": 0}
+
+    with BOOTSTRAP_LOCK:
+        with sqlite_connection(db_path) as conn:
+            init_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT id, ai_prompt_criteria_file
+                FROM tasks
+                WHERE decision_mode = 'ai'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            for row in rows:
+                task_id = int(row["id"])
+                marker_key = f"{TASK_PROMPT_MIGRATION_PREFIX}{task_id}"
+                if _bootstrap_completed(conn, marker_key):
+                    continue
+
+                target_path = store.criteria_path(task_id)
+                target_value = store.criteria_path_string(task_id)
+                legacy_value = str(row["ai_prompt_criteria_file"] or "").strip()
+                try:
+                    if not target_path.exists():
+                        legacy_path = Path(legacy_value) if legacy_value else None
+                        if legacy_path is None or not legacy_path.is_file():
+                            result["missing"] += 1
+                            print(
+                                f"[PromptMigration] 任务 ID {task_id} 的旧 criteria "
+                                "文件缺失，保留现状并将在下次启动重试。"
+                            )
+                            continue
+                        store.write_criteria(
+                            task_id,
+                            legacy_path.read_text(encoding="utf-8"),
+                        )
+
+                    conn.execute(
+                        "UPDATE tasks SET ai_prompt_criteria_file = ? WHERE id = ?",
+                        (target_value, task_id),
+                    )
+                    _mark_bootstrap_completed(conn, marker_key)
+                    conn.commit()
+                    result["migrated"] += 1
+                except Exception:
+                    conn.rollback()
+                    result["failed"] += 1
+                    print(
+                        f"[PromptMigration] 任务 ID {task_id} 的 criteria 迁移失败，"
+                        "保留旧数据并将在下次启动重试。"
+                    )
+    return result
 
 
 def _table_is_empty(conn, table_name: str) -> bool:

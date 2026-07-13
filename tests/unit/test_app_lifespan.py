@@ -59,6 +59,11 @@ def test_lifespan_cleans_task_logs_on_startup(monkeypatch):
     monkeypatch.setattr(app_module, "bootstrap_sqlite_storage", lambda: called.setdefault("bootstrapped", True))
     monkeypatch.setattr(
         app_module,
+        "migrate_task_prompts",
+        lambda: called.setdefault("prompts_migrated", True),
+    )
+    monkeypatch.setattr(
+        app_module,
         "cleanup_task_logs",
         lambda *args, **kwargs: called.setdefault("keep_days", kwargs.get("keep_days")),
     )
@@ -72,6 +77,7 @@ def test_lifespan_cleans_task_logs_on_startup(monkeypatch):
     asyncio.run(_run())
 
     assert called["bootstrapped"] is True
+    assert called["prompts_migrated"] is True
     assert called["keep_days"] == 9
     assert fake_scheduler.stopped is True
     assert fake_process.stop_all_called is True

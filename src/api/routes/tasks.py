@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List
 import os
-import aiofiles
 from src.api.dependencies import (
     get_process_service,
     get_scheduler_service,
@@ -158,6 +157,7 @@ async def update_task(
             and task_update.description != existing_task.description
         )
         switched_to_ai = current_mode != "ai" and target_mode == "ai"
+        task_already_updated = False
 
         if target_mode == "keyword":
             final_rules = (
@@ -177,12 +177,6 @@ async def update_task(
                 )
                 if not str(description_for_ai or "").strip():
                     raise HTTPException(status_code=400, detail="AI 模式下详细需求不能为空。")
-                safe_keyword = "".join(
-                    c for c in existing_task.keyword.lower().replace(' ', '_')
-                    if c.isalnum() or c in "_-"
-                ).rstrip()
-                output_filename = f"prompts/{safe_keyword}_criteria.txt"
-                print(f"目标文件路径: {output_filename}")
                 print("开始调用 AI 生成新的分析标准...")
                 generated_criteria = await generate_criteria(
                     user_description=description_for_ai,
@@ -191,13 +185,13 @@ async def update_task(
                 if not generated_criteria or len(generated_criteria.strip()) == 0:
                     print("AI 返回的内容为空")
                     raise HTTPException(status_code=500, detail="AI 未能生成分析标准，返回内容为空。")
-                print(f"保存新的分析标准到: {output_filename}")
-                os.makedirs("prompts", exist_ok=True)
-                async with aiofiles.open(output_filename, 'w', encoding='utf-8') as f:
-                    await f.write(generated_criteria)
-                print(f"新的分析标准已保存")
-                task_update.ai_prompt_criteria_file = output_filename
-                print(f"已更新 ai_prompt_criteria_file 字段为: {output_filename}")
+                task = await service.update_task_with_generated_criteria(
+                    task_id,
+                    task_update,
+                    generated_criteria,
+                )
+                task_already_updated = True
+                print("新的任务级分析标准已保存")
             except HTTPException:
                 raise
             except Exception as e:
@@ -206,7 +200,8 @@ async def update_task(
                 import traceback
                 print(traceback.format_exc())
                 raise HTTPException(status_code=500, detail=error_msg)
-        task = await service.update_task(task_id, task_update)
+        if not task_already_updated:
+            task = await service.update_task(task_id, task_update)
         await _reload_scheduler_if_needed(service, scheduler_service)
         return {"message": "任务更新成功", "task": serialize_task(task, scheduler_service)}
     except ValueError as e:
