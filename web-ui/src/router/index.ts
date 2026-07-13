@@ -75,16 +75,17 @@ function updateDocumentTitle() {
   document.title = titleKey ? `${t(titleKey)} - ${appName}` : appName
 }
 
-router.beforeEach((to, _from, next) => {
-  const { isAuthenticated } = useAuth()
+router.beforeEach(async (to) => {
+  const { isAuthenticated, restoreSession } = useAuth()
+  await restoreSession()
 
   if (to.meta.requiresAuth && !isAuthenticated.value) {
-    next({ name: 'Login', query: { redirect: to.fullPath } })
-  } else if (to.name === 'Login' && isAuthenticated.value) {
-    next({ name: 'Dashboard' })
-  } else {
-    next()
+    return { name: 'Login', query: { redirect: to.fullPath } }
   }
+  if (to.name === 'Login' && isAuthenticated.value) {
+    return { name: 'Dashboard' }
+  }
+  return true
 })
 
 router.afterEach(() => {
