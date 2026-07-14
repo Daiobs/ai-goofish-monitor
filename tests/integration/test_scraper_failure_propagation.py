@@ -266,6 +266,7 @@ class ScrapeEnvironment:
 
 def _task_config(state_path, *, max_pages=2):
     return {
+        "id": 41,
         "task_name": "risk-control-task",
         "keyword": "camera",
         "max_pages": max_pages,
@@ -614,7 +615,7 @@ def test_first_detail_risk_control_stops_items_pages_and_analysis(
     assert environment.dispatchers[0].jobs == []
     assert guard.failure_calls == [
         (
-            "risk-control-task",
+            "task-id:41",
             "FAIL_SYS_USER_VALIDATE",
             {"cookie_path": str(state_path), "min_failures_to_pause": None},
         )
@@ -805,7 +806,7 @@ def test_scrape_success_returns_processed_count(tmp_path, monkeypatch):
     assert environment.dispatchers[0].join_calls == 1
     assert environment.dispatchers[0].cancel_and_join_calls == 0
     assert guard.failure_calls == []
-    assert guard.success_calls == ["risk-control-task"]
+    assert guard.success_calls == ["task-id:41"]
     assert environment.cleanup_calls == ["risk-control-task"]
     assert environment.contexts[0].detail_pages[0].closed is True
     assert environment.contexts[0].main_page.closed is True
@@ -861,7 +862,7 @@ def test_transient_runtime_error_still_retries(tmp_path, monkeypatch):
     assert result == 0
     assert environment.launch_calls == 2
     assert guard.failure_calls == []
-    assert guard.success_calls == ["risk-control-task"]
+    assert guard.success_calls == ["task-id:41"]
     assert environment.cleanup_calls == ["risk-control-task"]
 
 

@@ -33,9 +33,18 @@ class _FakeSchedulerService:
 class _FakeProcessService:
     def __init__(self):
         self.stop_all_called = False
+        self.failure_guard = _FakeFailureGuard()
 
     async def stop_all(self):
         self.stop_all_called = True
+
+
+class _FakeFailureGuard:
+    def __init__(self):
+        self.migration_payload = None
+
+    def migrate_legacy_task_keys(self, tasks):
+        self.migration_payload = list(tasks)
 
 
 def test_lifespan_cleans_task_logs_on_startup(monkeypatch):
@@ -48,6 +57,11 @@ def test_lifespan_cleans_task_logs_on_startup(monkeypatch):
     monkeypatch.setattr(app_module, "TaskService", _FakeTaskService)
     monkeypatch.setattr(app_module, "SqliteTaskRepository", lambda: object())
     monkeypatch.setattr(app_module, "bootstrap_sqlite_storage", lambda: called.setdefault("bootstrapped", True))
+    monkeypatch.setattr(
+        app_module,
+        "migrate_task_prompts",
+        lambda: called.setdefault("prompts_migrated", True),
+    )
     monkeypatch.setattr(
         app_module,
         "cleanup_task_logs",
@@ -63,6 +77,7 @@ def test_lifespan_cleans_task_logs_on_startup(monkeypatch):
     asyncio.run(_run())
 
     assert called["bootstrapped"] is True
+    assert called["prompts_migrated"] is True
     assert called["keep_days"] == 9
     assert fake_scheduler.stopped is True
     assert fake_process.stop_all_called is True

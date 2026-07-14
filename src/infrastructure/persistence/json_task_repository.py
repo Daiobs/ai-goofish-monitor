@@ -9,7 +9,7 @@ from src.domain.repositories.task_repository import TaskRepository
 
 
 class JsonTaskRepository(TaskRepository):
-    """基于JSON文件的任务仓储"""
+    """只读旧配置适配器；可写任务统一存储在 SQLite。"""
 
     def __init__(self, config_file: str = "config.json"):
         self.config_file = config_file
@@ -24,9 +24,36 @@ class JsonTaskRepository(TaskRepository):
 
                 tasks_data = json.loads(content)
                 tasks = []
-                for i, task_data in enumerate(tasks_data):
-                    task_data['id'] = i
-                    tasks.append(Task(**task_data))
+                reserved_ids = {
+                    int(task_data["id"])
+                    for task_data in tasks_data
+                    if isinstance(task_data, dict)
+                    and not isinstance(task_data.get("id"), bool)
+                    and str(task_data.get("id", "")).isdigit()
+                }
+                next_fallback_id = 0
+                assigned_ids = set()
+                for task_data in tasks_data:
+                    if not isinstance(task_data, dict):
+                        continue
+                    payload = dict(task_data)
+                    raw_id = payload.get("id")
+                    parsed_id = (
+                        int(raw_id)
+                        if not isinstance(raw_id, bool)
+                        and raw_id is not None
+                        and str(raw_id).isdigit()
+                        else None
+                    )
+                    if parsed_id is None or parsed_id in assigned_ids:
+                        while next_fallback_id in reserved_ids:
+                            next_fallback_id += 1
+                        parsed_id = next_fallback_id
+                        reserved_ids.add(parsed_id)
+                        next_fallback_id += 1
+                    assigned_ids.add(parsed_id)
+                    payload["id"] = parsed_id
+                    tasks.append(Task(**payload))
                 return tasks
         except FileNotFoundError:
             return []
@@ -37,36 +64,12 @@ class JsonTaskRepository(TaskRepository):
     async def find_by_id(self, task_id: int) -> Optional[Task]:
         """根据ID获取任务"""
         tasks = await self.find_all()
-        if 0 <= task_id < len(tasks):
-            return tasks[task_id]
-        return None
+        return next((task for task in tasks if task.id == task_id), None)
 
     async def save(self, task: Task) -> Task:
         """保存任务（创建或更新）"""
-        tasks = await self.find_all()
-
-        if task.id is not None and 0 <= task.id < len(tasks):
-            # 更新现有任务
-            tasks[task.id] = task
-        else:
-            # 创建新任务
-            task.id = len(tasks)
-            tasks.append(task)
-
-        await self._write_tasks(tasks)
-        return task
+        raise RuntimeError("JSON 任务写入已禁用，请使用 SqliteTaskRepository。")
 
     async def delete(self, task_id: int) -> bool:
         """删除任务"""
-        tasks = await self.find_all()
-        if 0 <= task_id < len(tasks):
-            tasks.pop(task_id)
-            await self._write_tasks(tasks)
-            return True
-        return False
-
-    async def _write_tasks(self, tasks: List[Task]):
-        """写入任务列表到文件"""
-        tasks_data = [task.model_dump(exclude={'id'}) for task in tasks]
-        async with aiofiles.open(self.config_file, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(tasks_data, ensure_ascii=False, indent=2))
+        raise RuntimeError("JSON 任务删除已禁用，请使用 SqliteTaskRepository。")

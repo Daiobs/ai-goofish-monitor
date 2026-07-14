@@ -13,8 +13,8 @@ from typing import Awaitable, Callable, Dict, TextIO
 
 from src.ai_handler import send_ntfy_notification
 from src.config import STATE_FILE
-from src.failure_guard import FailureGuard
-from src.infrastructure.persistence.sqlite_task_repository import find_task_by_name_sync
+from src.failure_guard import FailureGuard, canonical_task_key
+from src.infrastructure.persistence.sqlite_task_repository import find_task_by_id_sync
 from src.utils import build_task_log_path
 
 STOP_TIMEOUT_SECONDS = 20
@@ -51,10 +51,10 @@ class ProcessService:
         if asyncio.iscoroutine(result):
             await result
 
-    def _resolve_cookie_path(self, task_name: str) -> str | None:
+    def _resolve_cookie_path(self, task_id: int) -> str | None:
         """Best-effort cookie/state path for a task."""
         try:
-            task = find_task_by_name_sync(task_name)
+            task = find_task_by_id_sync(task_id)
             if task and isinstance(task.account_state_file, str) and task.account_state_file.strip():
                 return task.account_state_file.strip()
         except Exception:
@@ -86,13 +86,13 @@ class ProcessService:
         log_file_handle = open(log_file_path, "a", encoding="utf-8")
         return log_file_path, log_file_handle
 
-    def _build_spawn_command(self, task_name: str) -> list[str]:
+    def _build_spawn_command(self, task_id: int) -> list[str]:
         command = [
             sys.executable,
             "-u",
             "spider_v2.py",
-            "--task-name",
-            task_name,
+            "--task-id",
+            str(task_id),
         ]
         debug_limit = str(os.getenv(SPIDER_DEBUG_LIMIT_ENV, "")).strip()
         if debug_limit.isdigit() and int(debug_limit) > 0:
@@ -101,7 +101,7 @@ class ProcessService:
 
     async def _spawn_process(
         self,
-        task_name: str,
+        task_id: int,
         log_file_handle: TextIO,
     ) -> asyncio.subprocess.Process:
         preexec_fn = os.setsid if sys.platform != "win32" else None
@@ -109,7 +109,7 @@ class ProcessService:
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
         return await asyncio.create_subprocess_exec(
-            *self._build_spawn_command(task_name),
+            *self._build_spawn_command(task_id),
             stdout=log_file_handle,
             stderr=log_file_handle,
             preexec_fn=preexec_fn,
@@ -138,8 +138,8 @@ class ProcessService:
             return False
 
         decision = self.failure_guard.should_skip_start(
-            task_name,
-            cookie_path=self._resolve_cookie_path(task_name),
+            canonical_task_key(task_id),
+            cookie_path=self._resolve_cookie_path(task_id),
         )
         if decision.skip:
             await self._notify_skip(task_name, decision)
@@ -149,7 +149,7 @@ class ProcessService:
         log_file_handle = None
         try:
             log_file_path, log_file_handle = self._open_log_file(task_id, task_name)
-            process = await self._spawn_process(task_name, log_file_handle)
+            process = await self._spawn_process(task_id, log_file_handle)
         except Exception as exc:
             self._close_log_handle(log_file_handle)
             print(f"启动任务 '{task_name}' 失败: {exc}")
@@ -282,23 +282,6 @@ class ProcessService:
         if watcher is None:
             return
         await asyncio.shield(watcher)
-
-    def reindex_after_delete(self, deleted_task_id: int) -> None:
-        """删除任务后同步重排运行时索引，避免任务下标漂移。"""
-        self.processes = self._reindex_mapping(self.processes, deleted_task_id)
-        self.log_paths = self._reindex_mapping(self.log_paths, deleted_task_id)
-        self.log_handles = self._reindex_mapping(self.log_handles, deleted_task_id)
-        self.task_names = self._reindex_mapping(self.task_names, deleted_task_id)
-        self.exit_watchers = self._reindex_mapping(self.exit_watchers, deleted_task_id)
-
-    def _reindex_mapping(self, mapping: Dict[int, object], deleted_task_id: int) -> Dict[int, object]:
-        reindexed: Dict[int, object] = {}
-        for task_id, value in mapping.items():
-            if task_id == deleted_task_id:
-                continue
-            next_task_id = task_id - 1 if task_id > deleted_task_id else task_id
-            reindexed[next_task_id] = value
-        return reindexed
 
     async def stop_all(self) -> None:
         """停止所有任务进程"""

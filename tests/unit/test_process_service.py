@@ -81,38 +81,49 @@ def test_process_service_marks_task_stopped_when_process_exits(
     asyncio.run(run_scenario())
 
 
-def test_process_service_reindexes_runtime_maps_after_delete():
-    service = ProcessService()
-    proc_a = object()
-    proc_c = object()
-    watcher_a = object()
-    watcher_c = object()
-
-    service.processes = {0: proc_a, 2: proc_c}
-    service.log_paths = {0: "a.log", 2: "c.log"}
-    service.task_names = {0: "A", 2: "C"}
-    service.exit_watchers = {0: watcher_a, 2: watcher_c}
-
-    service.reindex_after_delete(1)
-
-    assert service.processes == {0: proc_a, 1: proc_c}
-    assert service.log_paths == {0: "a.log", 1: "c.log"}
-    assert service.task_names == {0: "A", 1: "C"}
-    assert service.exit_watchers == {0: watcher_a, 1: watcher_c}
-
-
 def test_process_service_adds_debug_limit_arg_when_env_enabled(monkeypatch):
     monkeypatch.setenv("SPIDER_DEBUG_LIMIT", "1")
     service = ProcessService()
 
-    command = service._build_spawn_command("task-a")
+    command = service._build_spawn_command(42)
 
     assert command == [
         sys.executable,
         "-u",
         "spider_v2.py",
-        "--task-name",
-        "task-a",
+        "--task-id",
+        "42",
         "--debug-limit",
         "1",
     ]
+
+
+def test_process_service_uses_task_id_for_guard_and_account_lookup(monkeypatch):
+    service = ProcessService()
+    captured = {}
+
+    monkeypatch.setattr(
+        "src.services.process_service.find_task_by_id_sync",
+        lambda task_id: SimpleNamespace(account_state_file=f"state/{task_id}.json"),
+    )
+
+    def should_skip(task_key, *, cookie_path):
+        captured["task_key"] = task_key
+        captured["cookie_path"] = cookie_path
+        return SimpleNamespace(
+            skip=True,
+            should_notify=False,
+            reason="paused",
+            consecutive_failures=1,
+            paused_until=None,
+        )
+
+    service.failure_guard.should_skip_start = should_skip
+
+    started = asyncio.run(service.start_task(84, "duplicate-name"))
+
+    assert started is False
+    assert captured == {
+        "task_key": "task-id:84",
+        "cookie_path": "state/84.json",
+    }

@@ -58,7 +58,6 @@ class FakeProcessService:
     def __init__(self):
         self.started = []
         self.stopped = []
-        self.reindexed = []
         self._on_started = None
         self._on_stopped = None
 
@@ -76,10 +75,6 @@ class FakeProcessService:
         self.stopped.append(task_id)
         if self._on_stopped:
             await self._on_stopped(task_id)
-
-    def reindex_after_delete(self, deleted_task_id: int):
-        self.reindexed.append(deleted_task_id)
-
 
 class FakeSchedulerService:
     def __init__(self):
@@ -100,9 +95,20 @@ class FakeSchedulerService:
 
 
 @pytest.fixture()
-def api_context(tmp_path):
+def api_context(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     config_file = tmp_path / "config.json"
     config_file.write_text("[]", encoding="utf-8")
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "sony_a7m4_criteria.txt").write_text(
+        "fictional Sony A7M4 criteria",
+        encoding="utf-8",
+    )
+    (prompts_dir / "sony_a7cr_criteria.txt").write_text(
+        "fictional Sony A7CR criteria",
+        encoding="utf-8",
+    )
     db_path = tmp_path / "app.sqlite3"
 
     repository = SqliteTaskRepository(

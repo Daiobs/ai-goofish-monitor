@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -85,6 +86,44 @@ def _cookie_changed(
     if current is None or previous_mtime is None:
         return False
     return current > (previous_mtime + 1e-6)
+
+
+TASK_KEY_PREFIX = "task-id:"
+TASK_KEY_PATTERN = re.compile(r"^task-id:\d+$")
+
+
+def canonical_task_key(task_id: int) -> str:
+    if isinstance(task_id, bool):
+        raise ValueError("task_id must be a non-negative integer")
+    try:
+        normalized_id = int(task_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task_id must be a non-negative integer") from exc
+    if normalized_id < 0:
+        raise ValueError("task_id must be a non-negative integer")
+    return f"{TASK_KEY_PREFIX}{normalized_id}"
+
+
+def task_guard_key(task_id: Any, task_name: str) -> str:
+    """Use stable identity when available, with legacy config compatibility."""
+    try:
+        return canonical_task_key(task_id)
+    except ValueError:
+        return str(task_name)
+
+
+def _task_identity(task: Any) -> tuple[int | None, str]:
+    if isinstance(task, dict):
+        task_id = task.get("id")
+        task_name = task.get("task_name")
+    else:
+        task_id = getattr(task, "id", None)
+        task_name = getattr(task, "task_name", None)
+    try:
+        key = canonical_task_key(task_id)
+    except ValueError:
+        return None, str(task_name or "")
+    return int(key.removeprefix(TASK_KEY_PREFIX)), str(task_name or "")
 
 
 class _FileLock:
@@ -200,6 +239,44 @@ class FailureGuard:
                 tasks[task_key] = entry
                 self._save(data)
                 return entry
+
+    def migrate_legacy_task_keys(self, tasks: list[Any]) -> dict[str, int]:
+        """Move name-keyed state only when the full task set has one match."""
+        ids_by_name: dict[str, list[int]] = {}
+        for task in tasks:
+            task_id, task_name = _task_identity(task)
+            if task_id is None or not task_name:
+                continue
+            ids_by_name.setdefault(task_name, []).append(task_id)
+
+        result = {"migrated": 0, "ambiguous": 0}
+        _ensure_parent_dir(self.path)
+        with open(self.path, "a+", encoding="utf-8") as fh:
+            with _FileLock(fh):
+                fh.seek(0)
+                data = self._load()
+                stored_tasks = data.setdefault("tasks", {})
+                source_version = _as_int(data.get("version"), 1)
+                changed = False
+                for legacy_key in list(stored_tasks):
+                    if source_version >= 2 and TASK_KEY_PATTERN.fullmatch(legacy_key):
+                        continue
+                    matching_ids = ids_by_name.get(legacy_key, [])
+                    if len(matching_ids) > 1:
+                        result["ambiguous"] += 1
+                        continue
+                    if len(matching_ids) != 1:
+                        continue
+                    stable_key = canonical_task_key(matching_ids[0])
+                    if stable_key not in stored_tasks:
+                        stored_tasks[stable_key] = stored_tasks[legacy_key]
+                    stored_tasks.pop(legacy_key, None)
+                    result["migrated"] += 1
+                    changed = True
+                if changed or data.get("version") != 2:
+                    data["version"] = 2
+                    self._save(data)
+        return result
 
     def record_success(self, task_key: str, *, now: Optional[datetime] = None) -> None:
         def _reset(_: dict) -> dict:

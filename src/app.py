@@ -30,7 +30,10 @@ from src.services.process_service import ProcessService
 from src.services.scheduler_service import SchedulerService
 from src.services.task_log_cleanup_service import cleanup_task_logs
 from src.services.task_generation_service import TaskGenerationService
-from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
+from src.infrastructure.persistence.sqlite_bootstrap import (
+    bootstrap_sqlite_storage,
+    migrate_task_prompts,
+)
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.infrastructure.config.settings import settings as app_settings
 
@@ -71,12 +74,14 @@ async def lifespan(app: FastAPI):
     print("正在启动应用...")
     initialize_session_security()
     bootstrap_sqlite_storage()
+    migrate_task_prompts()
     cleanup_task_logs(keep_days=app_settings.task_log_retention_days)
 
     # 重置所有任务状态为停止
     task_repo = SqliteTaskRepository()
     task_service = TaskService(task_repo)
     tasks_list = await task_service.get_all_tasks()
+    process_service.failure_guard.migrate_legacy_task_keys(tasks_list)
 
     for task in tasks_list:
         if task.is_running:

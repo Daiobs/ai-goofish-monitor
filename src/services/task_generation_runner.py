@@ -1,9 +1,8 @@
 """
 任务生成作业执行器
 """
-import os
-
-import aiofiles
+import asyncio
+import contextlib
 
 from src.domain.models.task import TaskCreate, TaskGenerateRequest
 from src.prompt_utils import generate_criteria
@@ -11,15 +10,7 @@ from src.services.scheduler_service import SchedulerService
 from src.services.task_generation_service import TaskGenerationService
 from src.services.task_service import TaskService
 
-def build_criteria_filename(keyword: str) -> str:
-    safe_keyword = "".join(
-        char for char in keyword.lower().replace(" ", "_")
-        if char.isalnum() or char in "_-"
-    ).rstrip()
-    return f"prompts/{safe_keyword}_criteria.txt"
-
-
-def build_task_create(req: TaskGenerateRequest, criteria_file: str) -> TaskCreate:
+def build_task_create(req: TaskGenerateRequest, criteria_file: str = "") -> TaskCreate:
     return TaskCreate(
         task_name=req.task_name,
         enabled=True,
@@ -41,15 +32,6 @@ def build_task_create(req: TaskGenerateRequest, criteria_file: str) -> TaskCreat
         decision_mode=req.decision_mode or "ai",
         keyword_rules=req.keyword_rules,
     )
-
-
-async def save_generated_criteria(output_filename: str, generated_criteria: str) -> None:
-    if not generated_criteria or not generated_criteria.strip():
-        raise RuntimeError("AI 未能生成分析标准，返回内容为空。")
-
-    os.makedirs("prompts", exist_ok=True)
-    async with aiofiles.open(output_filename, "w", encoding="utf-8") as file:
-        await file.write(generated_criteria)
 
 
 async def reload_scheduler(
@@ -77,7 +59,7 @@ async def run_ai_generation_job(
     scheduler_service: SchedulerService,
     generation_service: TaskGenerationService,
 ) -> None:
-    output_filename = build_criteria_filename(req.keyword)
+    task = None
     try:
         await advance_job(
             generation_service,
@@ -99,20 +81,26 @@ async def run_ai_generation_job(
             generation_service,
             job_id,
             "persist",
-            f"正在保存分析标准到 {output_filename}。",
+            "正在为任务保存独立分析标准。",
         )
-        await save_generated_criteria(output_filename, generated_criteria)
-
+        task = await task_service.create_ai_task_with_criteria(
+            build_task_create(req),
+            generated_criteria,
+        )
         await advance_job(
             generation_service,
             job_id,
             "task",
-            "分析标准已生成，正在创建任务记录。",
+            "分析标准已生成，正在完成任务记录。",
         )
-        task = await task_service.create_task(build_task_create(req, output_filename))
         await reload_scheduler(task_service, scheduler_service)
         await generation_service.complete(job_id, task, f"任务“{req.task_name}”创建完成。")
-    except Exception as exc:
-        if os.path.exists(output_filename):
-            os.remove(output_filename)
+    except BaseException as exc:
+        if task is not None and task.id is not None:
+            with contextlib.suppress(Exception):
+                await task_service.delete_task(task.id)
+            with contextlib.suppress(Exception):
+                await reload_scheduler(task_service, scheduler_service)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         await generation_service.fail(job_id, f"AI 任务生成失败: {exc}")

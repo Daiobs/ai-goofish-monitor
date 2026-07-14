@@ -44,7 +44,7 @@ from src.utils import (
     save_to_jsonl,
 )
 from src.rotation import RotationPool, load_state_files, parse_proxy_pool, RotationItem
-from src.failure_guard import FailureGuard
+from src.failure_guard import FailureGuard, task_guard_key
 from src.services.account_strategy_service import resolve_account_runtime_plan
 from src.infrastructure.persistence.storage_names import build_result_filename
 from src.services.item_analysis_dispatcher import (
@@ -322,6 +322,7 @@ async def _notify_task_failure(
     task_config: dict, reason: str, *, cookie_path: Optional[str]
 ) -> None:
     task_name = task_config.get("task_name", "未命名任务")
+    guard_key = task_guard_key(task_config.get("id"), task_name)
     keyword = task_config.get("keyword", "")
     formatted_reason = sanitize_failure_reason(reason)
 
@@ -335,7 +336,7 @@ async def _notify_task_failure(
     )
 
     guard_result = FAILURE_GUARD.record_failure(
-        task_name,
+        guard_key,
         formatted_reason,
         cookie_path=cookie_path,
         min_failures_to_pause=1 if pause_immediately else None,
@@ -1468,6 +1469,7 @@ async def _scrape_xianyu_core(
         return attempt_processed_item_count
 
     task_name_for_guard = task_config.get("task_name", "未命名任务")
+    guard_key = task_guard_key(task_config.get("id"), task_name_for_guard)
 
     async def _run_with_rotation() -> int:
         nonlocal attempt_processed_item_count, selected_account, selected_proxy
@@ -1485,7 +1487,7 @@ async def _scrape_xianyu_core(
         pause_cookie_path = _best_effort_cookie_path(task_config)
 
         decision = FAILURE_GUARD.should_skip_start(
-            task_name_for_guard, cookie_path=pause_cookie_path
+            guard_key, cookie_path=pause_cookie_path
         )
         if decision.skip:
             paused_reason = sanitize_failure_reason(decision.reason)
@@ -1563,7 +1565,7 @@ async def _scrape_xianyu_core(
                 processed_item_count += completed_count
                 attempt_processed_item_count = 0
                 last_error = ""
-                FAILURE_GUARD.record_success(task_name_for_guard)
+                FAILURE_GUARD.record_success(guard_key)
                 break
             except asyncio.CancelledError:
                 raise

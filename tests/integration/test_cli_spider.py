@@ -52,6 +52,21 @@ def _write_keyword_task_config(tmp_path, load_json_fixture):
     return config_data[0]["task_name"], config_path
 
 
+class _FakeStoredTask:
+    def __init__(self, payload):
+        self.payload = dict(payload)
+        self.id = self.payload["id"]
+        self.task_name = self.payload["task_name"]
+
+    def model_dump(self):
+        return dict(self.payload)
+
+
+class _FakeGuard:
+    def migrate_legacy_task_keys(self, _tasks):
+        return {"migrated": 0, "ambiguous": 0}
+
+
 def test_cli_runs_single_task_with_prompt(tmp_path, load_json_fixture, monkeypatch):
     spider_v2 = _load_spider(monkeypatch)
     config_data = load_json_fixture("config.sample.json")
@@ -126,6 +141,118 @@ def test_cli_runs_keyword_mode_without_prompt_files(tmp_path, load_json_fixture,
     assert captured[0]["decision_mode"] == "keyword"
     assert captured[0]["ai_prompt_text"] == ""
     assert exit_code == 0
+
+
+@pytest.mark.parametrize("task_id", [71, 72])
+def test_cli_task_id_selects_exact_same_name_task(
+    tmp_path, monkeypatch, task_id
+):
+    spider_v2 = _load_spider(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    stored_tasks = [
+        _FakeStoredTask(
+            {
+                "id": current_id,
+                "task_name": "duplicate-name",
+                "enabled": True,
+                "keyword": f"camera-{current_id}",
+                "decision_mode": "keyword",
+                "keyword_rules": ["camera"],
+                "account_state_file": str(state_path),
+            }
+        )
+        for current_id in (71, 72)
+    ]
+
+    class FakeRepository:
+        async def find_by_id(self, requested_id):
+            return next(
+                (task for task in stored_tasks if task.id == requested_id),
+                None,
+            )
+
+        async def find_all(self):
+            return list(stored_tasks)
+
+    called = []
+
+    async def fake_scrape(task_config, debug_limit):
+        called.append((task_config["id"], task_config["keyword"]))
+        return 0
+
+    monkeypatch.setattr(spider_v2, "SqliteTaskRepository", FakeRepository)
+    monkeypatch.setattr(spider_v2, "FailureGuard", _FakeGuard)
+    monkeypatch.setattr(spider_v2, "migrate_task_prompts", lambda: None)
+    monkeypatch.setattr(spider_v2, "scrape_xianyu", fake_scrape)
+    monkeypatch.setattr(sys, "argv", ["spider_v2.py", "--task-id", str(task_id)])
+
+    exit_code = asyncio.run(spider_v2.main())
+
+    assert exit_code == 0
+    assert called == [(task_id, f"camera-{task_id}")]
+
+
+def test_cli_missing_task_id_fails_before_scraper_start(monkeypatch, capsys):
+    spider_v2 = _load_spider(monkeypatch)
+
+    class FakeRepository:
+        async def find_by_id(self, _task_id):
+            return None
+
+        async def find_all(self):
+            raise AssertionError("missing ID must stop before loading runnable tasks")
+
+    async def unexpected_scrape(*_args, **_kwargs):
+        raise AssertionError("scraper must not start for a missing task ID")
+
+    monkeypatch.setattr(spider_v2, "SqliteTaskRepository", FakeRepository)
+    monkeypatch.setattr(spider_v2, "migrate_task_prompts", lambda: None)
+    monkeypatch.setattr(spider_v2, "scrape_xianyu", unexpected_scrape)
+    monkeypatch.setattr(sys, "argv", ["spider_v2.py", "--task-id", "999"])
+
+    exit_code = asyncio.run(spider_v2.main())
+    output = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "未找到任务 ID 999" in output
+
+
+def test_cli_deprecated_task_name_rejects_duplicate_matches(
+    tmp_path, load_json_fixture, monkeypatch, capsys
+):
+    spider_v2 = _load_spider(monkeypatch)
+    config_data = load_json_fixture("config.sample.json")[:2]
+    for index, task in enumerate(config_data):
+        task["id"] = index + 1
+        task["task_name"] = "duplicate-name"
+        task["enabled"] = True
+        task["decision_mode"] = "keyword"
+        task["keyword_rules"] = ["camera"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+    async def unexpected_scrape(*_args, **_kwargs):
+        raise AssertionError("ambiguous legacy name must not start a task")
+
+    monkeypatch.setattr(spider_v2, "scrape_xianyu", unexpected_scrape)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "spider_v2.py",
+            "--config",
+            str(config_path),
+            "--task-name",
+            "duplicate-name",
+        ],
+    )
+
+    exit_code = asyncio.run(spider_v2.main())
+    output = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "请改用 --task-id" in output
 
 
 @pytest.mark.parametrize(
