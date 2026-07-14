@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List
 import os
+import asyncio
 from src.api.dependencies import (
     get_process_service,
     get_scheduler_service,
@@ -24,10 +25,51 @@ from src.domain.models.task import TaskCreate, TaskUpdate, TaskGenerateRequest
 from src.prompt_utils import generate_criteria
 from src.utils import resolve_task_log_path
 from src.services.account_strategy_service import normalize_account_strategy
-from src.infrastructure.persistence.storage_names import build_result_filename
-from src.services.price_history_service import delete_price_snapshots
-from src.services.result_storage_service import delete_result_file_records
+from src.services.price_history_service import delete_task_price_snapshots
+from src.services.result_storage_service import (
+    delete_task_result_blacklist_rules,
+    delete_task_result_records,
+)
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def _log_delete_failure(task_id: int, resource: str, exc: BaseException) -> None:
+    print(
+        f"[TaskDeletion] task_id={task_id} resource={resource} "
+        f"error={type(exc).__name__}"
+    )
+
+
+async def _delete_task_record_cancellation_safe(
+    service: TaskService,
+    task_id: int,
+) -> bool:
+    """Keep the lifecycle lock until the durable delete has settled."""
+    operation = asyncio.create_task(service.delete_task_record(task_id))
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+
+    if cancellation is not None:
+        try:
+            operation.result()
+        except BaseException:
+            pass
+        raise cancellation
+    return bool(operation.result())
+
+
+async def _delete_task_log(task_id: int, task_name: str) -> None:
+    log_file_path = resolve_task_log_path(task_id, task_name)
+    if os.path.exists(log_file_path):
+        await asyncio.to_thread(os.remove, log_file_path)
 
 async def _reload_scheduler_if_needed(
     task_service: TaskService,
@@ -217,35 +259,64 @@ async def delete_task(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
 ):
     """删除任务"""
-    task = await service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务未找到")
+    async with process_service.task_lifecycle_guard(task_id):
+        task = await service.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务未找到")
 
-    await process_service.stop_task(task_id)
-    success = await service.delete_task(task_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="任务未找到")
-    await _reload_scheduler_if_needed(service, scheduler_service)
-    try:
-        keyword = (task.keyword or "").strip()
-        if keyword:
-            remaining_tasks = await service.get_all_tasks()
-            keyword_still_in_use = any(
-                (remaining_task.keyword or "").strip() == keyword
-                for remaining_task in remaining_tasks
+        try:
+            await process_service._stop_task_locked(task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "process_stop", exc)
+        try:
+            process_is_running = process_service.is_running(task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "process_status", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="无法确认任务进程已停止，删除已取消",
+            ) from None
+        if process_is_running:
+            print(
+                f"[TaskDeletion] task_id={task_id} resource=process "
+                "error=StillRunning"
             )
-            if not keyword_still_in_use:
-                await delete_result_file_records(build_result_filename(keyword))
-                delete_price_snapshots(keyword)
-    except Exception as e:
-        print(f"删除任务结果文件时出错: {e}")
+            raise HTTPException(status_code=409, detail="任务进程仍在运行，删除已取消")
 
-    try:
-        log_file_path = resolve_task_log_path(task_id, task.task_name)
-        if os.path.exists(log_file_path):
-            os.remove(log_file_path)
-    except Exception as e:
-        print(f"删除任务日志文件时出错: {e}")
+        try:
+            success = await _delete_task_record_cancellation_safe(service, task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "task_record", exc)
+            raise HTTPException(status_code=500, detail="任务记录删除失败") from None
+        if not success:
+            print(
+                f"[TaskDeletion] task_id={task_id} resource=task_record "
+                "error=DeleteRejected"
+            )
+            raise HTTPException(status_code=500, detail="任务记录删除失败")
+
+    cleanup_steps = (
+        ("prompt", lambda: service.delete_task_prompt(task_id)),
+        ("result_items", lambda: delete_task_result_records(task_id)),
+        (
+            "price_snapshots",
+            lambda: asyncio.to_thread(delete_task_price_snapshots, task_id),
+        ),
+        (
+            "blacklist_rules",
+            lambda: asyncio.to_thread(delete_task_result_blacklist_rules, task_id),
+        ),
+        ("log", lambda: _delete_task_log(task_id, task.task_name)),
+        (
+            "scheduler",
+            lambda: _reload_scheduler_if_needed(service, scheduler_service),
+        ),
+    )
+    for resource, cleanup in cleanup_steps:
+        try:
+            await cleanup()
+        except Exception as exc:
+            _log_delete_failure(task_id, resource, exc)
     return {"message": "任务删除成功"}
 @router.post("/start/{task_id}", response_model=dict)
 async def start_task(

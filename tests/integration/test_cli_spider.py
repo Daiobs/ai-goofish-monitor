@@ -97,6 +97,7 @@ def test_cli_runs_single_task_with_prompt(tmp_path, load_json_fixture, monkeypat
 
     async def fake_scrape_xianyu(task_config, debug_limit):
         called.append(task_config["task_name"])
+        assert task_config["_result_ownership"] == "legacy"
         assert "{{CRITERIA_SECTION}}" not in task_config["ai_prompt_text"]
         assert "Criteria text for A7M4." in task_config["ai_prompt_text"]
         return 1
@@ -140,6 +141,7 @@ def test_cli_runs_keyword_mode_without_prompt_files(tmp_path, load_json_fixture,
     assert len(captured) == 1
     assert captured[0]["decision_mode"] == "keyword"
     assert captured[0]["ai_prompt_text"] == ""
+    assert captured[0]["_result_ownership"] == "legacy"
     assert exit_code == 0
 
 
@@ -178,7 +180,13 @@ def test_cli_task_id_selects_exact_same_name_task(
     called = []
 
     async def fake_scrape(task_config, debug_limit):
-        called.append((task_config["id"], task_config["keyword"]))
+        called.append(
+            (
+                task_config["id"],
+                task_config["keyword"],
+                task_config["_result_ownership"],
+            )
+        )
         return 0
 
     monkeypatch.setattr(spider_v2, "SqliteTaskRepository", FakeRepository)
@@ -190,7 +198,7 @@ def test_cli_task_id_selects_exact_same_name_task(
     exit_code = asyncio.run(spider_v2.main())
 
     assert exit_code == 0
-    assert called == [(task_id, f"camera-{task_id}")]
+    assert called == [(task_id, f"camera-{task_id}", "task")]
 
 
 def test_cli_missing_task_id_fails_before_scraper_start(monkeypatch, capsys):

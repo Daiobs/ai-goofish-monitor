@@ -57,6 +57,7 @@ def _login(client: TestClient):
         "/api/tasks",
         "/api/accounts",
         "/api/results/files",
+        "/api/results/tasks/1",
         "/api/settings/status",
         "/api/prompts",
         "/api/logs?task_id=0",

@@ -7,6 +7,10 @@ from datetime import datetime
 from typing import Any
 
 from src.domain.models.task import Task
+from src.infrastructure.persistence.storage_names import (
+    decode_legacy_result_filename,
+    try_parse_task_result_filename,
+)
 from src.services.price_history_service import parse_price_value
 from src.services.result_file_service import (
     normalize_keyword_from_filename,
@@ -90,9 +94,14 @@ def sort_key_by_activity_time(item: dict[str, Any]) -> tuple[float, str]:
     return (timestamp.timestamp() if timestamp else 0.0, item.get("id", ""))
 
 
-def _build_fallback_summary(task_name: str, keyword: str) -> dict[str, Any]:
+def _build_fallback_summary(
+    task_name: str,
+    keyword: str,
+    *,
+    task_id: int | None = None,
+) -> dict[str, Any]:
     return {
-        "task_id": None,
+        "task_id": task_id,
         "task_name": task_name,
         "keyword": keyword,
         "filename": None,
@@ -111,19 +120,40 @@ def _build_fallback_summary(task_name: str, keyword: str) -> dict[str, Any]:
     }
 
 
-def _resolve_task(
-    task_lookup: dict[str, Task],
+def _resolve_legacy_task(
+    tasks: list[Task],
     latest_record: dict[str, Any] | None,
     keyword: str,
 ) -> Task | None:
-    task = task_lookup.get(normalize_text(keyword))
-    if task is not None or latest_record is None:
-        return task
-    fallback_name = str(latest_record.get("任务名称") or "")
-    return next(
-        (candidate for candidate in task_lookup.values() if candidate.task_name == fallback_name),
-        None,
-    )
+    keyword_matches = [
+        task for task in tasks
+        if normalize_text(task.keyword) == normalize_text(keyword)
+    ]
+    if len(keyword_matches) == 1:
+        return keyword_matches[0]
+
+    fallback_name = str((latest_record or {}).get("任务名称") or "")
+    name_candidates = keyword_matches or tasks
+    name_matches = [
+        task for task in name_candidates
+        if task.task_name == fallback_name
+    ]
+    return name_matches[0] if len(name_matches) == 1 else None
+
+
+def _resolve_task(
+    filename: str,
+    task_lookup: dict[int, Task],
+    tasks: list[Task],
+    latest_record: dict[str, Any] | None,
+    keyword: str,
+) -> tuple[Task | None, int | None]:
+    if decode_legacy_result_filename(filename) is not None:
+        return None, None
+    task_id = try_parse_task_result_filename(filename)
+    if task_id is not None:
+        return task_lookup.get(task_id), task_id
+    return _resolve_legacy_task(tasks, latest_record, keyword), None
 
 
 def _collect_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -226,7 +256,8 @@ def _build_scan_activity(
 
 async def summarize_result_file(
     filename: str,
-    task_lookup: dict[str, Task],
+    task_lookup: dict[int, Task],
+    tasks: list[Task],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], datetime | None]:
     metrics = await load_result_summary(filename)
     if not metrics:
@@ -234,10 +265,29 @@ async def summarize_result_file(
 
     latest_record = metrics["latest_record"]
     latest_crawl_time = parse_timestamp(metrics["latest_crawl_time"])
-    keyword = str((latest_record or {}).get("搜索关键字") or "") or normalize_keyword_from_filename(filename)
-    task = _resolve_task(task_lookup, latest_record, keyword)
-    task_name = task.task_name if task else str((latest_record or {}).get("任务名称") or keyword)
-    summary = build_empty_summary(task) if task else _build_fallback_summary(task_name, keyword)
+    record_keyword = str(
+        (latest_record or {}).get("搜索关键字") or ""
+    ) or normalize_keyword_from_filename(filename)
+    task, owned_task_id = _resolve_task(
+        filename,
+        task_lookup,
+        tasks,
+        latest_record,
+        record_keyword,
+    )
+    keyword = task.keyword if task else record_keyword
+    task_name = task.task_name if task else str(
+        (latest_record or {}).get("任务名称") or keyword
+    )
+    summary = (
+        build_empty_summary(task)
+        if task
+        else _build_fallback_summary(
+            task_name,
+            keyword,
+            task_id=owned_task_id,
+        )
+    )
 
     activities: list[dict[str, Any]] = []
     recommendation, title, price = _build_recommendation_activity(

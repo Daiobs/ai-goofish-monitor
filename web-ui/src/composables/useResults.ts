@@ -7,6 +7,8 @@ import type { GetResultContentParams } from '@/api/results'
 import { useWebSocket } from '@/composables/useWebSocket'
 import * as tasksApi from '@/api/tasks'
 
+const LEGACY_RESULT_ESCAPE_PREFIX = '__legacy__'
+
 export function useResults() {
   const { t } = useI18n()
   const route = useRoute()
@@ -20,6 +22,7 @@ export function useResults() {
   const limit = ref(100)
   const blacklistKeywords = ref<string[]>([])
   const taskNameByKeyword = ref<Record<string, string>>({})
+  const taskNameById = ref<Record<number, string>>({})
   const isFileOptionsReady = ref(false)
   const hasFetchedFiles = ref(false)
   const hasFetchedTasks = ref(false)
@@ -55,8 +58,34 @@ export function useResults() {
     return value.trim().toLowerCase().replace(/\s+/g, '_')
   }
 
+  function decodeEscapedLegacyKeyword(filename: string) {
+    const suffix = '_full_data.jsonl'
+    const stem = filename.endsWith(suffix) ? filename.slice(0, -suffix.length) : filename
+    if (!stem.startsWith(LEGACY_RESULT_ESCAPE_PREFIX)) return null
+
+    const encoded = stem.slice(LEGACY_RESULT_ESCAPE_PREFIX.length)
+    if (encoded.length === 0 || encoded.length % 2 !== 0 || !/^[0-9a-f]+$/.test(encoded)) {
+      return null
+    }
+    try {
+      const bytes = new Uint8Array(
+        encoded.match(/.{2}/g)?.map((value) => Number.parseInt(value, 16)) || []
+      )
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      return null
+    }
+  }
+
   function getKeywordFromFilename(filename: string) {
-    return filename.replace(/_full_data\.jsonl$/i, '').toLowerCase()
+    const decodedKeyword = decodeEscapedLegacyKeyword(filename)
+    const fallback = filename.replace(/_full_data\.jsonl$/i, '')
+    return normalizeKeyword(decodedKeyword ?? fallback)
+  }
+
+  function getTaskIdFromFilename(filename: string) {
+    const match = /^task_(0|[1-9]\d*)_full_data\.jsonl$/i.exec(filename)
+    return match ? Number(match[1]) : null
   }
 
   // Methods
@@ -144,12 +173,17 @@ export function useResults() {
     try {
       const tasks = await tasksApi.getAllTasks()
       const mapping: Record<string, string> = {}
+      const idMapping: Record<number, string> = {}
       tasks.forEach((task) => {
         if (task.keyword) {
           mapping[normalizeKeyword(task.keyword)] = task.task_name
         }
+        if (task.id !== null && task.id !== undefined) {
+          idMapping[task.id] = task.task_name
+        }
       })
       taskNameByKeyword.value = mapping
+      taskNameById.value = idMapping
     } catch (e) {
       if (e instanceof Error) error.value = e
     } finally {
@@ -276,13 +310,20 @@ export function useResults() {
   const fileOptions = computed(() =>
     files.value.map((file) => {
       const keyword = getKeywordFromFilename(file)
-      const taskName = taskNameByKeyword.value[keyword]
+      const escapedLegacyKeyword = decodeEscapedLegacyKeyword(file)
+      const taskId = getTaskIdFromFilename(file)
+      const taskName = taskId !== null
+        ? taskNameById.value[taskId]
+        : escapedLegacyKeyword ?? taskNameByKeyword.value[keyword]
+      const label = escapedLegacyKeyword !== null
+        ? t('results.filters.legacyTaskNameLabel', { keyword: escapedLegacyKeyword })
+        : t('results.filters.taskNameLabel', {
+            task: taskName || t('common.unnamed'),
+          })
       return {
         value: file,
         taskName: taskName || t('common.unnamed'),
-        label: t('results.filters.taskNameLabel', {
-          task: taskName || t('common.unnamed'),
-        }),
+        label,
       }
     })
   )

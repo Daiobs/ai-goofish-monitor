@@ -36,10 +36,11 @@ class FakeFailureGuard:
 
 
 class FakeDispatcher:
-    def __init__(self, **_kwargs):
+    def __init__(self, **kwargs):
         self.jobs = []
         self.join_calls = 0
         self.cancel_and_join_calls = 0
+        self.saver = kwargs["saver"]
 
     def submit(self, job):
         self.jobs.append(job)
@@ -254,6 +255,13 @@ class ScrapeEnvironment:
         self.advance_calls = 0
         self.cleanup_calls = []
         self.notifications = []
+        self.task_snapshot_loads = []
+        self.task_processed_link_loads = []
+        self.legacy_snapshot_loads = []
+        self.legacy_processed_link_loads = []
+        self.snapshot_task_ids = []
+        self.saved_task_records = []
+        self.saved_legacy_records = []
         self.launch_calls = 0
         self.cancel_started = asyncio.Event()
         self.cancel_blocker = asyncio.Event()
@@ -302,9 +310,42 @@ def _install_scraper_fakes(monkeypatch, environment, guard, *, retry_limit=1):
         lambda: FakePlaywrightManager(environment),
     )
     monkeypatch.setattr(scraper, "FAILURE_GUARD", guard)
-    monkeypatch.setattr(scraper, "load_price_snapshots", lambda _keyword: [])
-    monkeypatch.setattr(scraper, "load_processed_link_keys", lambda _keyword: set())
-    monkeypatch.setattr(scraper, "record_market_snapshots", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        scraper,
+        "load_price_snapshots",
+        lambda keyword: environment.legacy_snapshot_loads.append(keyword) or [],
+    )
+    monkeypatch.setattr(
+        scraper,
+        "load_task_price_snapshots",
+        lambda task_id: environment.task_snapshot_loads.append(task_id) or [],
+    )
+    monkeypatch.setattr(
+        scraper,
+        "load_processed_link_keys",
+        lambda keyword: environment.legacy_processed_link_loads.append(keyword) or set(),
+    )
+    monkeypatch.setattr(
+        scraper,
+        "load_task_processed_link_keys",
+        lambda task_id: environment.task_processed_link_loads.append(task_id) or set(),
+    )
+
+    def record_snapshots(**kwargs):
+        environment.snapshot_task_ids.append(kwargs.get("task_id"))
+        return []
+
+    async def save_task_record(record, keyword, task_id):
+        environment.saved_task_records.append((task_id, keyword, record))
+        return True
+
+    async def save_legacy_record(record, keyword):
+        environment.saved_legacy_records.append((keyword, record))
+        return True
+
+    monkeypatch.setattr(scraper, "record_market_snapshots", record_snapshots)
+    monkeypatch.setattr(scraper, "save_task_result_record", save_task_record)
+    monkeypatch.setattr(scraper, "save_to_jsonl", save_legacy_record)
     monkeypatch.setattr(scraper, "build_market_reference", lambda **_kwargs: {})
     monkeypatch.setattr(scraper, "load_state_files", lambda _directory: [])
     monkeypatch.setattr(scraper, "parse_proxy_pool", lambda _value: [])
@@ -485,7 +526,7 @@ def test_preflight_failure_is_terminal_notified_once_and_cleaned(
     def fail_preflight(_keyword):
         raise RuntimeError('{"api_key":"preflight-secret"}')
 
-    monkeypatch.setattr(scraper, "load_price_snapshots", fail_preflight)
+    monkeypatch.setattr(scraper, "load_task_price_snapshots", fail_preflight)
 
     with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
         asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
@@ -555,7 +596,7 @@ def test_prebuilt_terminal_failure_is_not_reported_twice(tmp_path, monkeypatch):
         raise terminal_failure
 
     monkeypatch.setattr(
-        scraper, "load_price_snapshots", raise_terminal_failure
+        scraper, "load_task_price_snapshots", raise_terminal_failure
     )
 
     with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
@@ -579,7 +620,7 @@ def test_preflight_cancellation_propagates_without_failure_reporting(
     def cancel_preflight(_keyword):
         raise asyncio.CancelledError("preflight cancellation")
 
-    monkeypatch.setattr(scraper, "load_price_snapshots", cancel_preflight)
+    monkeypatch.setattr(scraper, "load_task_price_snapshots", cancel_preflight)
 
     with pytest.raises(asyncio.CancelledError, match="preflight cancellation"):
         asyncio.run(scraper.scrape_xianyu(_task_config(state_path)))
@@ -812,6 +853,80 @@ def test_scrape_success_returns_processed_count(tmp_path, monkeypatch):
     assert environment.contexts[0].main_page.closed is True
     assert environment.contexts[0].closed is True
     assert environment.browsers[0].closed is True
+
+
+def test_sqlite_task_uses_task_owned_result_chain(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment(
+        items=[_item("first")],
+        detail_payloads=[_success_detail_payload()],
+    )
+    guard = FakeFailureGuard()
+
+    result = _run_scrape(
+        environment,
+        guard,
+        _task_config(state_path, max_pages=1),
+        monkeypatch,
+    )
+    job = environment.dispatchers[0].jobs[0]
+    asyncio.run(environment.dispatchers[0].saver(job.final_record, job.keyword))
+
+    assert result == 1
+    assert environment.task_snapshot_loads == [41]
+    assert environment.task_processed_link_loads == [41]
+    assert environment.legacy_snapshot_loads == []
+    assert environment.legacy_processed_link_loads == []
+    assert environment.snapshot_task_ids == [41]
+    assert job.final_record["任务ID"] == 41
+    assert environment.saved_task_records[0][:2] == (41, "camera")
+
+
+def test_explicit_legacy_config_does_not_claim_task_id(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment(
+        items=[_item("first")],
+        detail_payloads=[_success_detail_payload()],
+    )
+    guard = FakeFailureGuard()
+    config = _task_config(state_path, max_pages=1)
+    config["_result_ownership"] = "legacy"
+
+    result = _run_scrape(environment, guard, config, monkeypatch)
+    job = environment.dispatchers[0].jobs[0]
+    asyncio.run(environment.dispatchers[0].saver(job.final_record, job.keyword))
+
+    assert result == 1
+    assert environment.task_snapshot_loads == []
+    assert environment.task_processed_link_loads == []
+    assert environment.legacy_snapshot_loads == ["camera"]
+    assert environment.legacy_processed_link_loads == ["camera"]
+    assert environment.snapshot_task_ids == [None]
+    assert "任务ID" not in job.final_record
+    assert environment.saved_legacy_records[0][0] == "camera"
+
+
+def test_sqlite_task_missing_id_fails_before_network_access(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment()
+    guard = FakeFailureGuard()
+    config = _task_config(state_path)
+    config.pop("id")
+    _install_scraper_fakes(monkeypatch, environment, guard)
+
+    with pytest.raises(scraper.ScrapeTaskFailed) as exc_info:
+        asyncio.run(scraper.scrape_xianyu(config))
+
+    assert exc_info.value.failure_kind == "runtime_error"
+    assert "stable task ID" in exc_info.value.reason
+    assert environment.launch_calls == 0
+    assert environment.task_snapshot_loads == []
+    assert environment.legacy_snapshot_loads == []
+    assert len(guard.failure_calls) == 1
+    assert len(environment.notifications) == 1
 
 
 def test_debug_limit_preserves_success_and_stops_after_limit(tmp_path, monkeypatch):

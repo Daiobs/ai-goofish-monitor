@@ -1,14 +1,24 @@
 """
 结果文件管理路由
 """
-from fastapi import APIRouter, HTTPException, Query
+import asyncio
 from fastapi.responses import Response
 from enum import Enum
 
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from urllib.parse import quote
 
-from src.services.price_history_service import build_price_history_insights
+from src.api.dependencies import get_task_service
+from src.infrastructure.persistence.storage_names import (
+    build_task_result_filename,
+    try_parse_task_result_filename,
+)
+from src.services.price_history_service import (
+    build_price_history_insights,
+    build_task_price_history_insights,
+    delete_task_price_snapshots,
+)
 from src.services.result_export_service import build_results_csv
 from src.services.result_file_service import (
     enrich_records_with_price_insight,
@@ -16,21 +26,53 @@ from src.services.result_file_service import (
 )
 from src.services.result_storage_service import (
     build_result_ndjson,
+    build_task_result_ndjson,
     delete_result_file_records,
+    delete_task_result_blacklist_rules,
+    delete_task_result_records,
     list_result_filenames,
     load_all_result_records,
+    load_all_task_result_records,
+    load_legacy_result_keyword,
     load_result_blacklist_keywords,
+    load_task_result_blacklist_keywords,
     load_visible_result_item_ids,
+    load_visible_task_result_item_ids,
     query_result_records,
+    query_task_result_records,
     result_file_exists,
     save_result_blacklist_keywords,
+    save_task_result_blacklist_keywords,
     update_item_status,
+    update_task_result_item_status,
 )
+from src.services.task_service import TaskService
 
 
 router = APIRouter(prefix="/api/results", tags=["results"])
 
 DEFAULT_EXPORT_FILENAME = "export.csv"
+
+
+class ItemStatus(str, Enum):
+    ACTIVE = "active"
+    HIDDEN = "hidden"
+    EXPIRED = "expired"
+
+
+class UpdateStatusRequest(BaseModel):
+    status: ItemStatus
+
+
+class BlacklistRulesRequest(BaseModel):
+    keywords: list[str]
+
+
+async def _require_task(task_id: int, service: TaskService):
+    task = await service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务未找到")
+    return task
 
 
 def _build_download_headers(export_name: str) -> dict[str, str]:
@@ -55,9 +97,11 @@ async def get_result_files():
 @router.get("/files/{filename:path}")
 async def download_result_file(filename: str):
     """下载指定的结果文件"""
-    if ".." in filename or filename.startswith("/"):
-        return {"error": "非法的文件路径"}
-    if not filename.endswith(".jsonl") or not await result_file_exists(filename):
+    try:
+        validate_result_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not await result_file_exists(filename):
         return {"error": "文件不存在"}
     return Response(
         content=await build_result_ndjson(filename),
@@ -69,14 +113,163 @@ async def download_result_file(filename: str):
 @router.delete("/files/{filename:path}")
 async def delete_result_file(filename: str):
     """删除指定的结果文件"""
-    if ".." in filename or filename.startswith("/"):
-        raise HTTPException(status_code=400, detail="非法的文件路径")
-    if not filename.endswith(".jsonl"):
-        raise HTTPException(status_code=400, detail="只能删除 .jsonl 文件")
+    try:
+        validate_result_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     deleted_rows = await delete_result_file_records(filename)
     if deleted_rows <= 0:
         raise HTTPException(status_code=404, detail="文件不存在")
     return {"message": f"文件 {filename} 已成功删除"}
+
+
+@router.get("/tasks/{task_id}")
+async def get_task_result_content(
+    task_id: int,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    recommended_only: bool = Query(False),
+    ai_recommended_only: bool = Query(False),
+    keyword_recommended_only: bool = Query(False),
+    include_hidden: bool = Query(False),
+    sort_by: str = Query("crawl_time"),
+    sort_order: str = Query("desc"),
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    if ai_recommended_only and keyword_recommended_only:
+        raise HTTPException(status_code=400, detail="AI推荐筛选与关键词推荐筛选不能同时开启。")
+    if recommended_only and not ai_recommended_only and not keyword_recommended_only:
+        ai_recommended_only = True
+
+    total_items, items = await query_task_result_records(
+        task_id,
+        ai_recommended_only=ai_recommended_only,
+        keyword_recommended_only=keyword_recommended_only,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        page=page,
+        limit=limit,
+        include_hidden=include_hidden,
+    )
+    filename = build_task_result_filename(task_id)
+    return {
+        "task_id": task_id,
+        "filename": filename,
+        "total_items": total_items,
+        "page": page,
+        "limit": limit,
+        "items": enrich_records_with_price_insight(items, filename),
+    }
+
+
+@router.get("/tasks/{task_id}/insights")
+async def get_task_result_insights(
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    visible_item_ids = load_visible_task_result_item_ids(task_id)
+    return build_task_price_history_insights(
+        task_id,
+        visible_item_ids=visible_item_ids,
+    )
+
+
+@router.get("/tasks/{task_id}/export")
+async def export_task_result_content(
+    task_id: int,
+    recommended_only: bool = Query(False),
+    ai_recommended_only: bool = Query(False),
+    keyword_recommended_only: bool = Query(False),
+    include_hidden: bool = Query(False),
+    sort_by: str = Query("crawl_time"),
+    sort_order: str = Query("desc"),
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    if ai_recommended_only and keyword_recommended_only:
+        raise HTTPException(status_code=400, detail="AI推荐筛选与关键词推荐筛选不能同时开启。")
+    if recommended_only and not ai_recommended_only and not keyword_recommended_only:
+        ai_recommended_only = True
+
+    results = await load_all_task_result_records(
+        task_id,
+        ai_recommended_only=ai_recommended_only,
+        keyword_recommended_only=keyword_recommended_only,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        include_hidden=include_hidden,
+    )
+    filename = build_task_result_filename(task_id)
+    csv_text = build_results_csv(
+        enrich_records_with_price_insight(results, filename)
+    )
+    export_name = filename.replace(".jsonl", ".csv")
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers=_build_download_headers(export_name),
+    )
+
+
+@router.patch("/tasks/{task_id}/items/{item_id}/status")
+async def patch_task_result_item_status(
+    task_id: int,
+    item_id: str,
+    body: UpdateStatusRequest,
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    updated = await update_task_result_item_status(
+        task_id,
+        item_id,
+        body.status.value,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="商品未找到")
+    return {"message": "状态已更新", "status": body.status.value}
+
+
+@router.get("/tasks/{task_id}/blacklist-rules")
+async def get_task_result_blacklist_rules(
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    return {"keywords": await load_task_result_blacklist_keywords(task_id)}
+
+
+@router.put("/tasks/{task_id}/blacklist-rules")
+async def put_task_result_blacklist_rules(
+    task_id: int,
+    body: BlacklistRulesRequest,
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    keywords = await save_task_result_blacklist_keywords(task_id, body.keywords)
+    return {"message": "黑名单规则已更新", "keywords": keywords}
+
+
+@router.delete("/tasks/{task_id}")
+async def delete_task_result_content(
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+):
+    await _require_task(task_id, service)
+    deleted_results = await delete_task_result_records(task_id)
+    deleted_snapshots = await asyncio.to_thread(delete_task_price_snapshots, task_id)
+    deleted_blacklist_rules = await asyncio.to_thread(
+        delete_task_result_blacklist_rules,
+        task_id,
+    )
+    return {
+        "message": "任务结果已删除",
+        "task_id": task_id,
+        "deleted_results": deleted_results,
+        "deleted_price_snapshots": deleted_snapshots,
+        "deleted_blacklist_rules": deleted_blacklist_rules,
+    }
 
 
 @router.get("/{filename}")
@@ -130,7 +323,16 @@ async def get_result_file_content(
 async def get_result_file_insights(filename: str):
     try:
         validate_result_filename(filename)
-        keyword = filename.replace("_full_data.jsonl", "")
+        task_id = try_parse_task_result_filename(filename)
+        if task_id is not None:
+            visible_item_ids = load_visible_task_result_item_ids(task_id)
+            return build_task_price_history_insights(
+                task_id,
+                visible_item_ids=visible_item_ids,
+            )
+        keyword = load_legacy_result_keyword(filename)
+        if keyword is None:
+            raise HTTPException(status_code=404, detail="结果文件未找到")
         visible_item_ids = load_visible_result_item_ids(filename)
         return build_price_history_insights(keyword, visible_item_ids=visible_item_ids)
     except ValueError as exc:
@@ -175,20 +377,6 @@ async def export_result_file_content(
     export_name = filename.replace(".jsonl", ".csv")
     headers = _build_download_headers(export_name)
     return Response(content=csv_text, media_type="text/csv; charset=utf-8", headers=headers)
-
-
-class ItemStatus(str, Enum):
-    ACTIVE = "active"
-    HIDDEN = "hidden"
-    EXPIRED = "expired"
-
-
-class UpdateStatusRequest(BaseModel):
-    status: ItemStatus
-
-
-class BlacklistRulesRequest(BaseModel):
-    keywords: list[str]
 
 
 @router.patch("/{filename}/items/{item_id}/status")

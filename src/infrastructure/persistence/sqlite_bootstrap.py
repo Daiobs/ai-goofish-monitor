@@ -9,7 +9,10 @@ import threading
 from pathlib import Path
 
 from src.infrastructure.persistence.sqlite_connection import (
+    assign_legacy_task_ownership,
     init_schema,
+    migrate_legacy_result_filename_namespace,
+    migrate_task_owned_blacklist_rules,
     sqlite_connection,
     sync_tasks_autoincrement_sequence,
 )
@@ -41,9 +44,24 @@ def bootstrap_sqlite_storage(
     with BOOTSTRAP_LOCK:
         with sqlite_connection(db_path) as conn:
             init_schema(conn)
-            _import_tasks_if_needed(conn, legacy_config_file)
-            _import_results_if_needed(conn, legacy_result_dir)
-            _import_price_snapshots_if_needed(conn, legacy_price_history_dir)
+            try:
+                imported = (
+                    _import_tasks_if_needed(conn, legacy_config_file),
+                    _import_results_if_needed(conn, legacy_result_dir),
+                    _import_price_snapshots_if_needed(
+                        conn,
+                        legacy_price_history_dir,
+                    ),
+                )
+                if any(imported):
+                    assign_legacy_task_ownership(conn)
+                    migrate_task_owned_blacklist_rules(conn, force=True)
+                    migrate_legacy_result_filename_namespace(conn, force=True)
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
 
 def migrate_task_prompts(
@@ -116,25 +134,23 @@ def _load_json_file(path: Path):
     return json.loads(content)
 
 
-def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> None:
+def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> bool:
     if _bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY):
-        return
+        return False
     if not _table_is_empty(conn, "tasks"):
         _mark_bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
     if legacy_config_file is None:
         _mark_bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
     path = Path(legacy_config_file)
     tasks = _load_json_file(path)
     if not isinstance(tasks, list):
         _mark_bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
 
     task_ids = _resolve_legacy_task_ids(tasks)
+    imported = False
     for index, raw_task in enumerate(tasks):
         if not isinstance(raw_task, dict):
             continue
@@ -172,9 +188,10 @@ def _import_tasks_if_needed(conn, legacy_config_file: str | None) -> None:
                 _as_int(raw_task.get("is_running", False)),
             ),
         )
+        imported = True
     sync_tasks_autoincrement_sequence(conn)
     _mark_bootstrap_completed(conn, TASKS_BOOTSTRAP_KEY)
-    conn.commit()
+    return imported
 
 
 def _resolve_legacy_task_ids(tasks: list) -> dict[int, int]:
@@ -213,19 +230,18 @@ def _parse_task_id(value) -> int | None:
     return task_id if task_id >= 0 else None
 
 
-def _import_results_if_needed(conn, legacy_result_dir: str) -> None:
+def _import_results_if_needed(conn, legacy_result_dir: str) -> bool:
     if _bootstrap_completed(conn, RESULTS_BOOTSTRAP_KEY):
-        return
+        return False
     if not _table_is_empty(conn, "result_items"):
         _mark_bootstrap_completed(conn, RESULTS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
     result_dir = Path(legacy_result_dir)
     if not result_dir.exists():
         _mark_bootstrap_completed(conn, RESULTS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
 
+    imported = False
     for path in sorted(result_dir.glob("*.jsonl")):
         filename = path.name
         keyword = normalize_keyword_from_filename(filename)
@@ -238,24 +254,31 @@ def _import_results_if_needed(conn, legacy_result_dir: str) -> None:
                     record = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-                _insert_result_record(conn, record, keyword=keyword, filename=filename)
+                imported = (
+                    _insert_result_record(
+                        conn,
+                        record,
+                        keyword=keyword,
+                        filename=filename,
+                    )
+                    or imported
+                )
     _mark_bootstrap_completed(conn, RESULTS_BOOTSTRAP_KEY)
-    conn.commit()
+    return imported
 
 
-def _import_price_snapshots_if_needed(conn, legacy_price_history_dir: str) -> None:
+def _import_price_snapshots_if_needed(conn, legacy_price_history_dir: str) -> bool:
     if _bootstrap_completed(conn, SNAPSHOTS_BOOTSTRAP_KEY):
-        return
+        return False
     if not _table_is_empty(conn, "price_snapshots"):
         _mark_bootstrap_completed(conn, SNAPSHOTS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
     history_dir = Path(legacy_price_history_dir)
     if not history_dir.exists():
         _mark_bootstrap_completed(conn, SNAPSHOTS_BOOTSTRAP_KEY)
-        conn.commit()
-        return
+        return False
 
+    imported = False
     for path in sorted(history_dir.glob("*_history.jsonl")):
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -266,12 +289,18 @@ def _import_price_snapshots_if_needed(conn, legacy_price_history_dir: str) -> No
                     record = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-                _insert_price_snapshot(conn, record)
+                imported = _insert_price_snapshot(conn, record) or imported
     _mark_bootstrap_completed(conn, SNAPSHOTS_BOOTSTRAP_KEY)
-    conn.commit()
+    return imported
 
 
-def _insert_result_record(conn, record: dict, *, keyword: str, filename: str) -> None:
+def _insert_result_record(
+    conn,
+    record: dict,
+    *,
+    keyword: str,
+    filename: str,
+) -> bool:
     item = record.get("商品信息", {}) or {}
     analysis = record.get("ai_analysis", {}) or {}
     link = str(item.get("商品链接") or "")
@@ -293,7 +322,7 @@ def _insert_result_record(conn, record: dict, *, keyword: str, filename: str) ->
     except (TypeError, ValueError):
         keyword_hit_count = 0
 
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT OR IGNORE INTO result_items (
             result_filename, keyword, task_name, crawl_time, publish_time, price,
@@ -320,12 +349,13 @@ def _insert_result_record(conn, record: dict, *, keyword: str, filename: str) ->
             json.dumps(record, ensure_ascii=False),
         ),
     )
+    return cursor.rowcount > 0
 
 
-def _insert_price_snapshot(conn, record: dict) -> None:
+def _insert_price_snapshot(conn, record: dict) -> bool:
     keyword = str(record.get("keyword") or "")
     slug = str(record.get("keyword_slug") or normalize_keyword_slug(keyword))
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT OR IGNORE INTO price_snapshots (
             keyword_slug, keyword, task_name, snapshot_time, snapshot_day, run_id,
@@ -351,6 +381,7 @@ def _insert_price_snapshot(conn, record: dict) -> None:
             record.get("link"),
         ),
     )
+    return cursor.rowcount > 0
 
 
 def _as_int(value) -> int:

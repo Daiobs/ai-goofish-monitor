@@ -76,6 +76,11 @@ async def main() -> int:
         FailureGuard().migrate_legacy_task_keys(loaded_tasks)
         tasks_config = [task.model_dump() for task in loaded_tasks]
 
+    result_ownership = "legacy" if args.config else "task"
+    for task in tasks_config:
+        if isinstance(task, dict):
+            task["_result_ownership"] = result_ownership
+
     def normalize_keywords(value):
         if value is None:
             return []
@@ -166,6 +171,11 @@ async def main() -> int:
 
     # 读取所有prompt文件内容（关键词模式不需要加载prompt）
     for task in active_task_configs:
+        if task.get("_result_ownership") == "legacy":
+            print(
+                f"[LegacyOwnership] 任务 '{task.get('task_name', '未命名任务')}' "
+                "来自 --config，结果将继续使用 legacy 数据归属。"
+            )
         decision_mode = str(task.get("decision_mode", "ai")).strip().lower()
         if decision_mode not in {"ai", "keyword"}:
             decision_mode = "ai"
