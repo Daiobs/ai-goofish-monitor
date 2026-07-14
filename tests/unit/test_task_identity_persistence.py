@@ -18,6 +18,17 @@ from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepo
 from src.services.task_service import TaskService
 
 
+SCHEMA_WRITE_PREFIXES = (
+    "BEGIN IMMEDIATE",
+    "CREATE ",
+    "DROP ",
+    "ALTER ",
+    "INSERT ",
+    "DELETE ",
+    "UPDATE ",
+)
+
+
 def _task_create(name: str) -> TaskCreate:
     return TaskCreate(
         task_name=name,
@@ -57,6 +68,43 @@ def _insert_old_task(conn: sqlite3.Connection, task_id: int, name: str) -> None:
                   'ai', '[]', 0)
         """,
         (task_id, name),
+    )
+
+
+def _result_status_columns(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(result_items)").fetchall()
+    }
+
+
+def _result_status_index_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_results_filename_status_crawl'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _assert_schema_trace_is_read_only(statements: list[str]) -> None:
+    normalized = [statement.strip().upper() for statement in statements]
+    assert not any(
+        statement.startswith(SCHEMA_WRITE_PREFIXES) for statement in normalized
+    )
+
+
+def _insert_result_item(conn: sqlite3.Connection, item_id: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO result_items (
+            result_filename, keyword, task_name, crawl_time, item_id,
+            link_unique_key, is_recommended, keyword_hit_count, raw_json
+        ) VALUES ('camera.jsonl', 'camera', 'task', '2026-01-01T00:00:00',
+                  ?, ?, 0, 0, '{}')
+        """,
+        (item_id, f"item:{item_id}"),
     )
 
 
@@ -227,19 +275,153 @@ def test_current_schema_init_is_read_only_and_avoids_immediate_lock(tmp_path):
     init_schema(conn)
     conn.execute("SELECT * FROM tasks").fetchall()
 
+    _assert_schema_trace_is_read_only(statements)
+    conn.close()
+
+
+def test_result_status_missing_index_is_repaired_once(tmp_path):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    conn.execute("DROP INDEX idx_results_filename_status_crawl")
+    conn.commit()
+    marker = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    ).fetchone()
+    assert marker["value"] == "done"
+
+    first_statements = []
+    conn.set_trace_callback(first_statements.append)
+    init_schema(conn)
+
+    assert _result_status_index_exists(conn) is True
+    assert any(
+        statement.strip().upper().startswith("BEGIN IMMEDIATE")
+        for statement in first_statements
+    )
+    assert any(
+        "CREATE INDEX IF NOT EXISTS IDX_RESULTS_FILENAME_STATUS_CRAWL"
+        in statement.upper()
+        for statement in first_statements
+    )
+
+    second_statements = []
+    conn.set_trace_callback(second_statements.append)
+    init_schema(conn)
+    _assert_schema_trace_is_read_only(second_statements)
+    conn.close()
+
+
+def test_result_status_missing_column_preserves_data_and_repairs_once(tmp_path):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    _insert_result_item(conn, "preserved-item")
+    conn.execute("DROP INDEX idx_results_filename_status_crawl")
+    conn.execute("ALTER TABLE result_items DROP COLUMN status")
+    conn.commit()
+    marker = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    ).fetchone()
+    assert marker["value"] == "done"
+
+    first_statements = []
+    conn.set_trace_callback(first_statements.append)
+    init_schema(conn)
+
+    preserved = conn.execute(
+        "SELECT item_id, status FROM result_items WHERE item_id = 'preserved-item'"
+    ).fetchone()
+    assert _result_status_columns(conn) >= {"status"}
+    assert _result_status_index_exists(conn) is True
+    assert any(
+        statement.strip().upper().startswith("ALTER TABLE RESULT_ITEMS")
+        for statement in first_statements
+    )
+    assert (preserved["item_id"], preserved["status"]) == (
+        "preserved-item",
+        "active",
+    )
+
+    second_statements = []
+    conn.set_trace_callback(second_statements.append)
+    init_schema(conn)
+    _assert_schema_trace_is_read_only(second_statements)
+    conn.close()
+
+
+def test_result_status_missing_marker_only_writes_marker(tmp_path):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    conn.execute(
+        "DELETE FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    )
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    init_schema(conn)
+
+    marker = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    ).fetchone()
     normalized = [statement.strip().upper() for statement in statements]
-    forbidden_prefixes = (
-        "BEGIN IMMEDIATE",
-        "CREATE ",
-        "DROP ",
-        "ALTER ",
-        "INSERT ",
-        "DELETE ",
-        "UPDATE ",
-    )
+    structural_prefixes = ("CREATE ", "DROP ", "ALTER ", "UPDATE ", "DELETE ")
+    assert marker["value"] == "done"
     assert not any(
-        statement.startswith(forbidden_prefixes) for statement in normalized
+        statement.startswith(structural_prefixes) for statement in normalized
     )
+    assert sum(
+        statement.startswith("INSERT OR REPLACE INTO APP_METADATA")
+        for statement in normalized
+    ) == 1
+    conn.close()
+
+
+def test_result_status_repair_failure_rolls_back_structure_and_marker(
+    tmp_path,
+    monkeypatch,
+):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    _insert_result_item(conn, "rollback-item")
+    conn.execute("DROP INDEX idx_results_filename_status_crawl")
+    conn.execute("ALTER TABLE result_items DROP COLUMN status")
+    conn.execute(
+        "DELETE FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    )
+    conn.commit()
+
+    def fail_marker(_conn):
+        raise RuntimeError("marker write failed")
+
+    monkeypatch.setattr(
+        connection_module,
+        "_write_result_status_migration_marker",
+        fail_marker,
+    )
+
+    with pytest.raises(RuntimeError, match="marker write failed"):
+        init_schema(conn)
+
+    marker = conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
+    ).fetchone()
+    preserved = conn.execute(
+        "SELECT item_id FROM result_items WHERE item_id = 'rollback-item'"
+    ).fetchone()
+    assert "status" not in _result_status_columns(conn)
+    assert _result_status_index_exists(conn) is False
+    assert marker is None
+    assert preserved["item_id"] == "rollback-item"
     conn.close()
 
 

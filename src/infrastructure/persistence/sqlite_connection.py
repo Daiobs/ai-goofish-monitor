@@ -138,6 +138,7 @@ SCHEMA_STATEMENTS = (
 
 TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
 RESULT_STATUS_MIGRATION_KEY = "migration:result_items_status"
+RESULT_STATUS_INDEX_NAME = "idx_results_filename_status_crawl"
 REQUIRED_TABLES = {
     "app_metadata",
     "tasks",
@@ -152,7 +153,7 @@ REQUIRED_INDEXES = {
     "idx_results_filename_publish",
     "idx_results_filename_price",
     "idx_results_filename_recommended",
-    "idx_results_filename_status_crawl",
+    RESULT_STATUS_INDEX_NAME,
     "idx_snapshots_keyword_time",
     "idx_snapshots_keyword_item_time",
     "idx_auth_sessions_expires",
@@ -210,8 +211,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if _schema_is_current(conn):
             conn.commit()
             return
-        for statement in SCHEMA_STATEMENTS:
-            conn.execute(statement)
+        if not _base_schema_objects_exist(conn):
+            for statement in SCHEMA_STATEMENTS:
+                conn.execute(statement)
         _migrate_tasks_autoincrement(conn)
         _migrate_result_items_status(conn)
         conn.commit()
@@ -248,6 +250,17 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     completed = {str(row["key"]) for row in migration_rows}
     return completed == {TASK_IDENTITY_MIGRATION_KEY, RESULT_STATUS_MIGRATION_KEY}
+
+
+def _base_schema_objects_exist(conn: sqlite3.Connection) -> bool:
+    """Check objects created by SCHEMA_STATEMENTS, excluding status migration."""
+    rows = conn.execute(
+        "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index')"
+    ).fetchall()
+    tables = {str(row["name"]) for row in rows if row["type"] == "table"}
+    indexes = {str(row["name"]) for row in rows if row["type"] == "index"}
+    base_indexes = REQUIRED_INDEXES - {RESULT_STATUS_INDEX_NAME}
+    return REQUIRED_TABLES.issubset(tables) and base_indexes.issubset(indexes)
 
 
 def _migrate_tasks_autoincrement(conn: sqlite3.Connection) -> None:
@@ -344,25 +357,28 @@ def sync_tasks_autoincrement_sequence(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_result_items_status(conn: sqlite3.Connection) -> None:
-    """为 result_items 表添加 status 列（仅执行一次）。"""
-    row = conn.execute(
-        "SELECT value FROM app_metadata WHERE key = ?",
-        (RESULT_STATUS_MIGRATION_KEY,),
-    ).fetchone()
-    if row is not None:
-        return
+    """Repair the result status column, index, and completion marker."""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(result_items)").fetchall()]
     if "status" not in cols:
         conn.execute(
             "ALTER TABLE result_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
         )
+    index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (RESULT_STATUS_INDEX_NAME,),
+    ).fetchone()
+    if index_exists is None:
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {RESULT_STATUS_INDEX_NAME}"
+            " ON result_items(result_filename, status, crawl_time DESC)"
+        )
+    _write_result_status_migration_marker(conn)
+
+
+def _write_result_status_migration_marker(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, 'done')",
         (RESULT_STATUS_MIGRATION_KEY,),
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_results_filename_status_crawl"
-        " ON result_items(result_filename, status, crawl_time DESC)"
     )
 
 
