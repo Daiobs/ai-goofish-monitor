@@ -19,8 +19,14 @@ from src.services.result_storage_service import (
 
 
 def validate_result_filename(filename: str) -> None:
-    if not filename.endswith(".jsonl") or "/" in filename or ".." in filename:
+    if (
+        not filename.endswith(".jsonl")
+        or "/" in filename
+        or "\\" in filename
+        or ".." in filename
+    ):
         raise ValueError("无效的文件名")
+    try_parse_task_result_filename(filename)
 
 
 def enrich_records_with_price_insight(records: list[dict], filename: str) -> list[dict]:

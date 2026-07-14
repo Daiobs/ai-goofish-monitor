@@ -8,6 +8,7 @@ from src.api import dependencies as deps
 from src.api.routes import dashboard
 from src.domain.models.task import TaskCreate
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
+from src.services.result_storage_service import save_task_result_record
 from src.services.task_service import TaskService
 
 
@@ -123,3 +124,82 @@ def test_dashboard_summary_aggregates_tasks_and_results(tmp_path, monkeypatch):
     assert "AI 推荐" in statuses
     assert "结果已更新" in statuses
     assert "运行中" in statuses
+
+
+def test_dashboard_maps_task_owned_results_by_id_for_duplicate_tasks(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    database_path = tmp_path / "app.sqlite3"
+    monkeypatch.setenv("APP_DATABASE_FILE", str(database_path))
+
+    repository = SqliteTaskRepository(
+        db_path=str(database_path),
+        legacy_config_file=None,
+    )
+    task_service = TaskService(repository)
+    app = FastAPI()
+    app.include_router(dashboard.router)
+    app.dependency_overrides[deps.get_task_service] = lambda: task_service
+
+    duplicate = TaskCreate(
+        task_name="重复任务",
+        keyword="camera",
+        description="关注价格合适的相机。",
+        max_pages=2,
+        personal_only=True,
+    )
+    first = asyncio.run(
+        task_service.create_ai_task_with_criteria(duplicate, "first criteria")
+    )
+    second = asyncio.run(
+        task_service.create_ai_task_with_criteria(duplicate, "second criteria")
+    )
+
+    def task_record(item_id, title, crawl_time):
+        return {
+            "爬取时间": crawl_time,
+            "搜索关键字": "historical keyword",
+            "任务名称": "historical task name",
+            "商品信息": {
+                "商品ID": item_id,
+                "商品标题": title,
+                "商品链接": f"https://www.goofish.com/item?id={item_id}",
+                "当前售价": "¥1000",
+            },
+            "ai_analysis": {
+                "analysis_source": "keyword",
+                "is_recommended": True,
+            },
+        }
+
+    asyncio.run(
+        save_task_result_record(
+            task_record("camera-1", "First camera", "2026-07-14T10:00:00"),
+            first.keyword,
+            first.id,
+        )
+    )
+    asyncio.run(
+        save_task_result_record(
+            task_record("camera-2", "Second camera", "2026-07-14T11:00:00"),
+            second.keyword,
+            second.id,
+        )
+    )
+
+    response = TestClient(app).get("/api/dashboard/summary")
+    assert response.status_code == 200
+    payload = response.json()
+
+    summaries = {item["task_id"]: item for item in payload["task_summaries"]}
+    assert set(summaries) == {first.id, second.id}
+    assert summaries[first.id]["filename"] == f"task_{first.id}_full_data.jsonl"
+    assert summaries[second.id]["filename"] == f"task_{second.id}_full_data.jsonl"
+    assert summaries[first.id]["latest_recommended_title"] == "First camera"
+    assert summaries[second.id]["latest_recommended_title"] == "Second camera"
+    assert all(item["task_name"] == "重复任务" for item in summaries.values())
+    assert all(item["keyword"] == "camera" for item in summaries.values())
+    assert payload["summary"]["result_files"] == 2
+    assert payload["summary"]["scanned_items"] == 2

@@ -1,5 +1,63 @@
 import asyncio
 import time
+from pathlib import Path
+
+from src.services.price_history_service import (
+    load_price_snapshots,
+    load_task_price_snapshots,
+    record_market_snapshots,
+)
+from src.services.result_storage_service import (
+    load_all_result_records,
+    load_all_task_result_records,
+    load_task_result_blacklist_keywords,
+    save_result_record,
+    save_task_result_blacklist_keywords,
+    save_task_result_record,
+)
+from src.services.task_prompt_service import TaskPromptStore
+from src.utils import resolve_task_log_path
+
+
+def _owned_result_record(title: str) -> dict:
+    return {
+        "爬取时间": "2026-07-14T12:00:00",
+        "搜索关键字": "same keyword",
+        "任务名称": "same task",
+        "商品信息": {
+            "商品ID": "shared",
+            "商品标题": title,
+            "商品链接": "https://www.goofish.com/item?id=shared",
+            "当前售价": "100",
+        },
+        "ai_analysis": {"analysis_source": "ai", "is_recommended": True},
+    }
+
+
+def _all_owned_records(task_id: int) -> list[dict]:
+    return asyncio.run(
+        load_all_task_result_records(
+            task_id,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            sort_by="crawl_time",
+            sort_order="desc",
+            include_hidden=True,
+        )
+    )
+
+
+def _all_legacy_records() -> list[dict]:
+    return asyncio.run(
+        load_all_result_records(
+            "same_keyword_full_data.jsonl",
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            sort_by="crawl_time",
+            sort_order="desc",
+            include_hidden=True,
+        )
+    )
 
 
 def test_create_list_update_delete_task(api_client, api_context, sample_task_payload):
@@ -283,3 +341,76 @@ def test_delete_task_stops_only_deleted_runtime(
     remaining = api_client.get(f"/api/tasks/{second_id}")
     assert remaining.status_code == 200
     assert remaining.json()["id"] == second_id
+
+
+def test_delete_task_cleans_only_its_owned_data(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+):
+    monkeypatch.setenv("APP_DATABASE_FILE", str(api_context["db_path"]))
+    first_payload = dict(sample_task_payload)
+    first_payload.update(task_name="same task", keyword="same keyword")
+    second_payload = dict(first_payload)
+
+    first_response = api_client.post("/api/tasks/", json=first_payload)
+    second_response = api_client.post("/api/tasks/", json=second_payload)
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_id = first_response.json()["task"]["id"]
+    second_id = second_response.json()["task"]["id"]
+
+    asyncio.run(
+        save_task_result_record(
+            _owned_result_record("first task item"),
+            "same keyword",
+            first_id,
+        )
+    )
+    asyncio.run(
+        save_task_result_record(
+            _owned_result_record("second task item"),
+            "same keyword",
+            second_id,
+        )
+    )
+    asyncio.run(save_result_record(_owned_result_record("legacy item"), "same keyword"))
+    for task_id, price in ((first_id, "100"), (second_id, "900")):
+        record_market_snapshots(
+            task_id=task_id,
+            keyword="same keyword",
+            task_name="same task",
+            items=[{"商品ID": "shared", "当前售价": price}],
+            run_id=f"run-{task_id}",
+        )
+    record_market_snapshots(
+        keyword="same keyword",
+        task_name="legacy",
+        items=[{"商品ID": "shared", "当前售价": "500"}],
+        run_id="legacy-run",
+    )
+    asyncio.run(save_task_result_blacklist_keywords(first_id, ["first-only"]))
+    asyncio.run(save_task_result_blacklist_keywords(second_id, ["second-only"]))
+
+    log_path = resolve_task_log_path(first_id, "same task")
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(log_path).write_text("fictional log", encoding="utf-8")
+    prompt_path = TaskPromptStore().criteria_path(first_id)
+    assert prompt_path.exists()
+
+    response = api_client.delete(f"/api/tasks/{first_id}")
+
+    assert response.status_code == 200
+    assert _all_owned_records(first_id) == []
+    assert len(_all_owned_records(second_id)) == 1
+    assert len(_all_legacy_records()) == 1
+    assert load_task_price_snapshots(first_id) == []
+    assert len(load_task_price_snapshots(second_id)) == 1
+    assert len(load_price_snapshots("same keyword")) == 1
+    assert asyncio.run(load_task_result_blacklist_keywords(first_id)) == []
+    assert asyncio.run(load_task_result_blacklist_keywords(second_id)) == [
+        "second-only"
+    ]
+    assert not prompt_path.exists()
+    assert not Path(log_path).exists()

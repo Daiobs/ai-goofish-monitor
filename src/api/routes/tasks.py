@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List
 import os
+import asyncio
 from src.api.dependencies import (
     get_process_service,
     get_scheduler_service,
@@ -24,9 +25,11 @@ from src.domain.models.task import TaskCreate, TaskUpdate, TaskGenerateRequest
 from src.prompt_utils import generate_criteria
 from src.utils import resolve_task_log_path
 from src.services.account_strategy_service import normalize_account_strategy
-from src.infrastructure.persistence.storage_names import build_result_filename
-from src.services.price_history_service import delete_price_snapshots
-from src.services.result_storage_service import delete_result_file_records
+from src.services.price_history_service import delete_task_price_snapshots
+from src.services.result_storage_service import (
+    delete_task_result_blacklist_rules,
+    delete_task_result_records,
+)
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 async def _reload_scheduler_if_needed(
@@ -225,27 +228,37 @@ async def delete_task(
     success = await service.delete_task(task_id)
     if not success:
         raise HTTPException(status_code=404, detail="任务未找到")
-    await _reload_scheduler_if_needed(service, scheduler_service)
-    try:
-        keyword = (task.keyword or "").strip()
-        if keyword:
-            remaining_tasks = await service.get_all_tasks()
-            keyword_still_in_use = any(
-                (remaining_task.keyword or "").strip() == keyword
-                for remaining_task in remaining_tasks
+    cleanup_steps = (
+        ("结果", lambda: delete_task_result_records(task_id)),
+        (
+            "价格快照",
+            lambda: asyncio.to_thread(delete_task_price_snapshots, task_id),
+        ),
+        (
+            "黑名单规则",
+            lambda: asyncio.to_thread(delete_task_result_blacklist_rules, task_id),
+        ),
+    )
+    for label, cleanup in cleanup_steps:
+        try:
+            await cleanup()
+        except Exception as exc:
+            print(
+                f"删除任务 {task_id} 的{label}时出错: "
+                f"{type(exc).__name__}"
             )
-            if not keyword_still_in_use:
-                await delete_result_file_records(build_result_filename(keyword))
-                delete_price_snapshots(keyword)
-    except Exception as e:
-        print(f"删除任务结果文件时出错: {e}")
+
+    await _reload_scheduler_if_needed(service, scheduler_service)
 
     try:
         log_file_path = resolve_task_log_path(task_id, task.task_name)
         if os.path.exists(log_file_path):
             os.remove(log_file_path)
-    except Exception as e:
-        print(f"删除任务日志文件时出错: {e}")
+    except Exception as exc:
+        print(
+            f"删除任务 {task_id} 的日志文件时出错: "
+            f"{type(exc).__name__}"
+        )
     return {"message": "任务删除成功"}
 @router.post("/start/{task_id}", response_model=dict)
 async def start_task(

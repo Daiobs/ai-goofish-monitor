@@ -7,10 +7,10 @@ from __future__ import annotations
 from typing import Any
 
 from src.domain.models.task import Task
+from src.infrastructure.persistence.storage_names import try_parse_task_result_filename
 from src.services.dashboard_payloads import (
     build_empty_summary,
     build_task_state_activities,
-    normalize_text,
     serialize_timestamp,
     sort_key_by_activity_time,
     sort_key_by_latest_time,
@@ -35,17 +35,43 @@ def _build_summary_metrics(tasks: list[Task], summary_list: list[dict[str, Any]]
 
 
 async def build_dashboard_snapshot(tasks: list[Task]) -> dict[str, Any]:
-    task_lookup = {normalize_text(task.keyword): task for task in tasks}
-    task_summaries: dict[str, dict[str, Any]] = {
-        task.task_name: build_empty_summary(task) for task in tasks
+    task_lookup = {
+        int(task.id): task
+        for task in tasks
+        if task.id is not None
     }
+    task_summaries: dict[tuple[str, int | str], dict[str, Any]] = {}
+    for index, task in enumerate(tasks):
+        key = (
+            ("task_id", int(task.id))
+            if task.id is not None
+            else ("task_index", index)
+        )
+        task_summaries[key] = build_empty_summary(task)
+
+    canonical_task_ids: set[int] = set()
     recent_activities = build_task_state_activities(tasks)
     latest_updated_at = None
 
     for filename in await list_result_filenames():
-        summary, activities, file_latest_time = await summarize_result_file(filename, task_lookup)
+        owned_task_id = try_parse_task_result_filename(filename)
+        summary, activities, file_latest_time = await summarize_result_file(
+            filename,
+            task_lookup,
+            tasks,
+        )
         if summary:
-            task_summaries[summary["task_name"]] = summary
+            summary_task_id = summary.get("task_id")
+            if summary_task_id is None:
+                summary_key = ("legacy_file", filename)
+            else:
+                summary_key = ("task_id", int(summary_task_id))
+
+            if owned_task_id is not None:
+                task_summaries[summary_key] = summary
+                canonical_task_ids.add(owned_task_id)
+            elif summary_task_id is None or int(summary_task_id) not in canonical_task_ids:
+                task_summaries[summary_key] = summary
         recent_activities.extend(activities)
         if file_latest_time and (latest_updated_at is None or file_latest_time > latest_updated_at):
             latest_updated_at = file_latest_time
