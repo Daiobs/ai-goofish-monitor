@@ -73,23 +73,17 @@ def migrate_task_prompts(
                 if _bootstrap_completed(conn, marker_key):
                     continue
 
-                target_path = store.criteria_path(task_id)
                 target_value = store.criteria_path_string(task_id)
                 legacy_value = str(row["ai_prompt_criteria_file"] or "").strip()
                 try:
-                    if not target_path.exists():
-                        legacy_path = Path(legacy_value) if legacy_value else None
-                        if legacy_path is None or not legacy_path.is_file():
+                    if not store.has_safe_criteria(task_id):
+                        if not store.copy_legacy_criteria(task_id, legacy_value):
                             result["missing"] += 1
                             print(
                                 f"[PromptMigration] 任务 ID {task_id} 的旧 criteria "
                                 "文件缺失，保留现状并将在下次启动重试。"
                             )
                             continue
-                        store.write_criteria(
-                            task_id,
-                            legacy_path.read_text(encoding="utf-8"),
-                        )
 
                     conn.execute(
                         "UPDATE tasks SET ai_prompt_criteria_file = ? WHERE id = ?",

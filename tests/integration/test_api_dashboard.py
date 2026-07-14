@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import FastAPI
@@ -48,11 +49,12 @@ def test_dashboard_summary_aggregates_tasks_and_results(tmp_path, monkeypatch):
       personal_only=True,
     )
 
-    created_first = task_service.create_task(first)
-    created_second = task_service.create_task(second)
-    import asyncio
-    created_first = asyncio.run(created_first)
-    created_second = asyncio.run(created_second)
+    created_first = asyncio.run(
+        task_service.create_ai_task_with_criteria(first, "fictional watch criteria")
+    )
+    created_second = asyncio.run(
+        task_service.create_ai_task_with_criteria(second, "fictional iPad criteria")
+    )
     asyncio.run(task_service.update_task_status(created_second.id, True))
 
     records = [

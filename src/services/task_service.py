@@ -9,6 +9,10 @@ from src.domain.repositories.task_repository import TaskRepository
 from src.services.task_prompt_service import TaskPromptStore
 
 
+class TaskPromptIntegrityError(ValueError):
+    """A newly created AI task does not have a valid criteria file."""
+
+
 class TaskService:
     """任务管理服务"""
 
@@ -30,41 +34,37 @@ class TaskService:
 
     async def create_task(self, task_create: TaskCreate) -> Task:
         """创建新任务"""
-        payload = task_create.model_dump()
-        legacy_criteria_source = payload.get("ai_prompt_criteria_file", "")
-        payload["ai_prompt_criteria_file"] = ""
-        task = Task(**payload, is_running=False)
-        created = await self.repository.save(task)
-        if created.decision_mode != "ai" or created.id is None:
+        created = await self._create_task_record(task_create)
+        if created.decision_mode != "ai":
             return created
 
-        canonical_path = self.prompt_store.criteria_path_string(created.id)
         try:
-            if created.ai_prompt_criteria_file != canonical_path:
-                created = await self.repository.save(
-                    created.model_copy(
-                        update={"ai_prompt_criteria_file": canonical_path}
-                    )
-                )
-            await asyncio.to_thread(
+            copied = await asyncio.to_thread(
                 self.prompt_store.copy_legacy_criteria,
                 created.id,
-                legacy_criteria_source,
+                task_create.ai_prompt_criteria_file,
             )
+            if not copied:
+                raise TaskPromptIntegrityError(
+                    "AI 任务必须提供 prompts/ 目录内有效且非空的 criteria 文件。"
+                )
             return created
-        except BaseException:
-            await self.repository.delete(created.id)
-            await asyncio.to_thread(self.prompt_store.delete_task_prompt, created.id)
-            raise
+        except BaseException as exc:
+            await self._compensate_failed_creation(created.id)
+            if isinstance(exc, TaskPromptIntegrityError):
+                raise
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise TaskPromptIntegrityError(
+                "AI 任务 criteria 复制失败，任务未创建。"
+            ) from exc
 
     async def create_ai_task_with_criteria(
         self,
         task_create: TaskCreate,
         generated_criteria: str,
     ) -> Task:
-        created = await self.create_task(task_create)
-        if created.id is None:
-            raise RuntimeError("数据库未为任务分配 ID。")
+        created = await self._create_task_record(task_create)
         try:
             await asyncio.to_thread(
                 self.prompt_store.write_criteria,
@@ -73,9 +73,48 @@ class TaskService:
             )
             return created
         except BaseException:
-            await self.repository.delete(created.id)
-            await asyncio.to_thread(self.prompt_store.delete_task_prompt, created.id)
+            await self._compensate_failed_creation(created.id)
             raise
+
+    async def _create_task_record(self, task_create: TaskCreate) -> Task:
+        payload = task_create.model_dump()
+        payload["ai_prompt_criteria_file"] = ""
+        task = Task(**payload, is_running=False)
+        created = await self.repository.save(task)
+        if created.decision_mode != "ai":
+            return created
+        if created.id is None:
+            raise RuntimeError("数据库未为任务分配 ID。")
+
+        canonical_path = self.prompt_store.criteria_path_string(created.id)
+        if created.ai_prompt_criteria_file == canonical_path:
+            return created
+        try:
+            return await self.repository.save(
+                created.model_copy(
+                    update={"ai_prompt_criteria_file": canonical_path}
+                )
+            )
+        except BaseException:
+            await self._compensate_failed_creation(created.id)
+            raise
+
+    async def _compensate_failed_creation(self, task_id: int) -> None:
+        try:
+            await self.repository.delete(task_id)
+        except BaseException as exc:
+            self._log_cleanup_failure("数据库任务", exc)
+        try:
+            await asyncio.to_thread(self.prompt_store.delete_task_prompt, task_id)
+        except BaseException as exc:
+            self._log_cleanup_failure("Prompt 目录", exc)
+
+    @staticmethod
+    def _log_cleanup_failure(resource: str, exc: BaseException) -> None:
+        print(
+            f"[TaskCleanup] 补偿清理{resource}失败 "
+            f"({type(exc).__name__})，已保留原始错误。"
+        )
 
     async def update_task(self, task_id: int, task_update: TaskUpdate) -> Task:
         """更新任务"""

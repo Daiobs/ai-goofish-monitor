@@ -137,6 +137,26 @@ SCHEMA_STATEMENTS = (
 )
 
 TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
+RESULT_STATUS_MIGRATION_KEY = "migration:result_items_status"
+REQUIRED_TABLES = {
+    "app_metadata",
+    "tasks",
+    "result_items",
+    "price_snapshots",
+    "result_blacklist_rules",
+    "auth_sessions",
+}
+REQUIRED_INDEXES = {
+    "idx_tasks_name",
+    "idx_results_filename_crawl",
+    "idx_results_filename_publish",
+    "idx_results_filename_price",
+    "idx_results_filename_recommended",
+    "idx_results_filename_status_crawl",
+    "idx_snapshots_keyword_time",
+    "idx_snapshots_keyword_item_time",
+    "idx_auth_sessions_expires",
+}
 TASK_COLUMNS = (
     "id",
     "task_name",
@@ -182,8 +202,14 @@ def _apply_read_only_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
+    if _schema_is_current(conn):
+        return
+
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if _schema_is_current(conn):
+            conn.commit()
+            return
         for statement in SCHEMA_STATEMENTS:
             conn.execute(statement)
         _migrate_tasks_autoincrement(conn)
@@ -192,6 +218,36 @@ def init_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Check schema readiness without starting a write transaction."""
+    rows = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index')"
+    ).fetchall()
+    tables = {str(row["name"]): row for row in rows if row["type"] == "table"}
+    indexes = {str(row["name"]) for row in rows if row["type"] == "index"}
+    if not REQUIRED_TABLES.issubset(tables) or not REQUIRED_INDEXES.issubset(indexes):
+        return False
+
+    tasks_sql = str(tables["tasks"]["sql"] or "")
+    if "AUTOINCREMENT" not in tasks_sql.upper():
+        return False
+
+    result_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(result_items)").fetchall()
+    }
+    if "status" not in result_columns:
+        return False
+
+    migration_rows = conn.execute(
+        "SELECT key FROM app_metadata WHERE key IN (?, ?)",
+        (TASK_IDENTITY_MIGRATION_KEY, RESULT_STATUS_MIGRATION_KEY),
+    ).fetchall()
+    completed = {str(row["key"]) for row in migration_rows}
+    return completed == {TASK_IDENTITY_MIGRATION_KEY, RESULT_STATUS_MIGRATION_KEY}
 
 
 def _migrate_tasks_autoincrement(conn: sqlite3.Connection) -> None:
@@ -258,19 +314,40 @@ def _copy_tasks_to_autoincrement_table(conn: sqlite3.Connection) -> None:
 
 def sync_tasks_autoincrement_sequence(conn: sqlite3.Connection) -> None:
     """Advance SQLite's durable task sequence past every preserved explicit ID."""
-    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'tasks'")
-    row = conn.execute("SELECT MAX(id) AS max_id FROM tasks").fetchone()
-    if row is not None and row["max_id"] is not None:
+    sequence_row = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+    ).fetchone()
+    max_id_row = conn.execute("SELECT MAX(id) AS max_id FROM tasks").fetchone()
+    current_sequence = (
+        int(sequence_row["seq"]) if sequence_row is not None else None
+    )
+    max_id = (
+        int(max_id_row["max_id"])
+        if max_id_row is not None and max_id_row["max_id"] is not None
+        else None
+    )
+
+    if current_sequence is None:
+        if max_id is None:
+            return
         conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) VALUES ('tasks', ?)",
-            (int(row["max_id"]),),
+            (max_id,),
+        )
+        return
+
+    if max_id is not None and max_id > current_sequence:
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = 'tasks'",
+            (max_id,),
         )
 
 
 def _migrate_result_items_status(conn: sqlite3.Connection) -> None:
     """为 result_items 表添加 status 列（仅执行一次）。"""
     row = conn.execute(
-        "SELECT value FROM app_metadata WHERE key = 'migration:result_items_status'"
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (RESULT_STATUS_MIGRATION_KEY,),
     ).fetchone()
     if row is not None:
         return
@@ -280,7 +357,8 @@ def _migrate_result_items_status(conn: sqlite3.Connection) -> None:
             "ALTER TABLE result_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
         )
     conn.execute(
-        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES ('migration:result_items_status', 'done')"
+        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, 'done')",
+        (RESULT_STATUS_MIGRATION_KEY,),
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_results_filename_status_crawl"

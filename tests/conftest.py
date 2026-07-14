@@ -99,6 +99,16 @@ def api_context(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config_file = tmp_path / "config.json"
     config_file.write_text("[]", encoding="utf-8")
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "sony_a7m4_criteria.txt").write_text(
+        "fictional Sony A7M4 criteria",
+        encoding="utf-8",
+    )
+    (prompts_dir / "sony_a7cr_criteria.txt").write_text(
+        "fictional Sony A7CR criteria",
+        encoding="utf-8",
+    )
     db_path = tmp_path / "app.sqlite3"
 
     repository = SqliteTaskRepository(

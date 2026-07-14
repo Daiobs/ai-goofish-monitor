@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,7 @@ from src.services import task_prompt_service as prompt_module
 from src.services.task_generation_runner import run_ai_generation_job
 from src.services.task_generation_service import TaskGenerationService
 from src.services.task_prompt_service import TaskPromptStore
-from src.services.task_service import TaskService
+from src.services.task_service import TaskPromptIntegrityError, TaskService
 
 
 def _task_create(name="same-name", keyword="same-keyword") -> TaskCreate:
@@ -105,11 +106,113 @@ def test_direct_create_copies_only_prompt_root_legacy_source(
     outside_payload = _task_create(name="outside").model_copy(
         update={"ai_prompt_criteria_file": str(outside)}
     )
-    outside_task = asyncio.run(service.create_task(outside_payload))
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path.resolve() == outside.resolve():
+            raise AssertionError("outside source must not be read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    with pytest.raises(TaskPromptIntegrityError, match="criteria"):
+        asyncio.run(service.create_task(outside_payload))
 
     assert TaskPromptStore().read_criteria(compatible.id) == "legacy criteria"
-    assert TaskPromptStore().read_criteria(outside_task.id) is None
-    assert outside.read_text(encoding="utf-8") == "outside secret"
+    assert [task.id for task in asyncio.run(service.get_all_tasks())] == [compatible.id]
+    assert not (tmp_path / "prompts" / "tasks" / "2").exists()
+    assert original_read_text(outside, encoding="utf-8") == "outside secret"
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "empty", "unreadable", "copy"])
+def test_direct_ai_creation_rolls_back_invalid_criteria_sources(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+):
+    monkeypatch.chdir(tmp_path)
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    source = prompts_dir / f"{source_kind}.txt"
+    if source_kind != "missing":
+        source.write_text(
+            "" if source_kind == "empty" else "fictional criteria",
+            encoding="utf-8",
+        )
+
+    original_read_text = Path.read_text
+    if source_kind == "unreadable":
+        def fail_source_read(path, *args, **kwargs):
+            if path.resolve() == source.resolve():
+                raise PermissionError("fictional unreadable source")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fail_source_read)
+    elif source_kind == "copy":
+        def fail_replace(_source, _target):
+            raise OSError("fictional copy failure")
+
+        monkeypatch.setattr(prompt_module.os, "replace", fail_replace)
+
+    repository = SqliteTaskRepository(
+        db_path=str(tmp_path / "app.sqlite3"),
+        legacy_config_file=None,
+    )
+    service = TaskService(repository)
+    payload = _task_create().model_copy(
+        update={"ai_prompt_criteria_file": source.relative_to(tmp_path).as_posix()}
+    )
+
+    with pytest.raises(TaskPromptIntegrityError, match="criteria"):
+        asyncio.run(service.create_task(payload))
+
+    assert asyncio.run(service.get_all_tasks()) == []
+    assert not (prompts_dir / "tasks").exists()
+
+
+def test_failed_database_compensation_still_removes_prompt_and_preserves_error(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    store = TaskPromptStore()
+    stale_path = store.criteria_path(41)
+    stale_path.parent.mkdir(parents=True)
+    (stale_path.parent / "stale.tmp").write_text("fictional", encoding="utf-8")
+    payload = _task_create().model_dump()
+    payload.update(
+        {
+            "id": 41,
+            "ai_prompt_criteria_file": store.criteria_path_string(41),
+            "is_running": False,
+        }
+    )
+    persisted = Task(**payload)
+
+    class FailingRepository:
+        async def save(self, _task):
+            return persisted
+
+        async def delete(self, _task_id):
+            raise RuntimeError("secondary cleanup secret")
+
+    def fail_write(_task_id, _content):
+        raise ValueError("original criteria write failure")
+
+    monkeypatch.setattr(store, "write_criteria", fail_write)
+    service = TaskService(FailingRepository(), prompt_store=store)
+
+    with pytest.raises(ValueError, match="original criteria write failure"):
+        asyncio.run(
+            service.create_ai_task_with_criteria(
+                _task_create(),
+                "generated criteria",
+            )
+        )
+
+    output = capsys.readouterr().out
+    assert "secondary cleanup secret" not in output
+    assert not stale_path.parent.exists()
 
 
 def test_atomic_prompt_write_failure_leaves_no_partial_file(
@@ -333,3 +436,60 @@ def test_legacy_prompt_migration_is_isolated_idempotent_and_retryable(
         f"prompts/tasks/{task_id}/criteria.txt" for task_id in (5, 8, 9, 10)
     ]
     assert len(markers) == 4
+
+
+@pytest.mark.parametrize("source_kind", ["absolute", "traversal", "symlink"])
+def test_prompt_migration_rejects_sources_outside_prompt_root(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    source_kind,
+):
+    monkeypatch.chdir(tmp_path)
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    outside = tmp_path / "outside-fictional.txt"
+    outside.write_text("fictional external criteria", encoding="utf-8")
+
+    if source_kind == "absolute":
+        source_value = str(outside)
+    elif source_kind == "traversal":
+        source_value = "prompts/../outside-fictional.txt"
+    else:
+        link = prompts_dir / "outside-link.txt"
+        link.symlink_to(outside)
+        source_value = "prompts/outside-link.txt"
+
+    payload = _task_create(name=f"unsafe-{source_kind}").model_dump()
+    payload.update({"id": 31, "ai_prompt_criteria_file": source_value})
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps([payload]), encoding="utf-8")
+    db_path = tmp_path / "app.sqlite3"
+    bootstrap_sqlite_storage(
+        str(db_path),
+        legacy_config_file=str(config_path),
+        legacy_result_dir=str(tmp_path / "no-results"),
+        legacy_price_history_dir=str(tmp_path / "no-snapshots"),
+    )
+
+    result = migrate_task_prompts(str(db_path), prompt_store=TaskPromptStore())
+    output = capsys.readouterr().out
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT ai_prompt_criteria_file FROM tasks WHERE id = 31"
+    ).fetchone()
+    marker = conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = ?",
+        (f"{TASK_PROMPT_MIGRATION_PREFIX}31",),
+    ).fetchone()
+    conn.close()
+
+    assert result == {"migrated": 0, "missing": 1, "failed": 0}
+    assert row["ai_prompt_criteria_file"] == source_value
+    assert marker is None
+    assert TaskPromptStore().read_criteria(31) is None
+    assert "fictional external criteria" not in output
+    assert source_value not in output
+    assert outside.read_text(encoding="utf-8") == "fictional external criteria"

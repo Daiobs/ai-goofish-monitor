@@ -11,7 +11,7 @@ from src.api.dependencies import (
     get_task_generation_service,
     get_task_service,
 )
-from src.services.task_service import TaskService
+from src.services.task_service import TaskPromptIntegrityError, TaskService
 from src.services.process_service import ProcessService
 from src.services.scheduler_service import SchedulerService
 from src.services.task_generation_service import TaskGenerationService
@@ -80,7 +80,10 @@ async def create_task(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
 ):
     """创建新任务"""
-    task = await service.create_task(task_create)
+    try:
+        task = await service.create_task(task_create)
+    except TaskPromptIntegrityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _reload_scheduler_if_needed(service, scheduler_service)
     return {"message": "任务创建成功", "task": serialize_task(task, scheduler_service)}
 @router.post("/generate", response_model=dict)

@@ -9,6 +9,7 @@ from src.infrastructure.persistence import sqlite_connection as connection_modul
 from src.infrastructure.persistence.json_task_repository import JsonTaskRepository
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import (
+    RESULT_STATUS_MIGRATION_KEY,
     SCHEMA_STATEMENTS,
     TASK_IDENTITY_MIGRATION_KEY,
     init_schema,
@@ -21,8 +22,9 @@ def _task_create(name: str) -> TaskCreate:
     return TaskCreate(
         task_name=name,
         keyword="camera",
-        description="A test task",
-        decision_mode="ai",
+        description="",
+        decision_mode="keyword",
+        keyword_rules=["camera"],
     )
 
 
@@ -74,6 +76,85 @@ def test_task_ids_are_monotonic_and_deleted_ids_are_not_reused(tmp_path):
 
     assert third.id > second.id
     assert [task.id for task in asyncio.run(service.get_all_tasks())] == [first.id, third.id]
+
+
+def test_reinitialization_never_reuses_deleted_historical_sequence(tmp_path):
+    db_path = tmp_path / "app.sqlite3"
+    repository = SqliteTaskRepository(db_path=str(db_path), legacy_config_file=None)
+    service = TaskService(repository)
+    created = [_create_task(service, f"task-{index}") for index in range(20)]
+    assert created[-1].id == 20
+    assert asyncio.run(service.delete_task(20)) is True
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "DELETE FROM app_metadata WHERE key = ?",
+        (TASK_IDENTITY_MIGRATION_KEY,),
+    )
+    conn.commit()
+    init_schema(conn)
+    sequence = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+    ).fetchone()["seq"]
+    conn.close()
+
+    assert sequence == 20
+    assert _create_task(service, "after-reinit").id > 20
+
+
+def test_empty_tasks_table_preserves_historical_sequence(tmp_path):
+    db_path = tmp_path / "app.sqlite3"
+    repository = SqliteTaskRepository(db_path=str(db_path), legacy_config_file=None)
+    service = TaskService(repository)
+    asyncio.run(service.get_all_tasks())
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("DELETE FROM tasks")
+    conn.execute(
+        "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('tasks', 50)"
+    )
+    conn.execute(
+        "DELETE FROM app_metadata WHERE key = ?",
+        (TASK_IDENTITY_MIGRATION_KEY,),
+    )
+    conn.commit()
+    init_schema(conn)
+    init_schema(conn)
+    sequence = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+    ).fetchone()["seq"]
+    conn.close()
+
+    assert sequence == 50
+    assert _create_task(service, "after-empty-table").id == 51
+
+
+def test_repeated_task_migration_never_lowers_sequence(tmp_path):
+    db_path = tmp_path / "app.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('tasks', 75)"
+    )
+    conn.commit()
+
+    for _ in range(2):
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key = ?",
+            (TASK_IDENTITY_MIGRATION_KEY,),
+        )
+        conn.commit()
+        init_schema(conn)
+
+    sequence = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+    ).fetchone()["seq"]
+    conn.close()
+
+    assert sequence == 75
 
 
 def test_concurrent_task_creation_uses_unique_database_ids(tmp_path):
@@ -134,6 +215,70 @@ def test_schema_migration_preserves_ids_and_is_idempotent(tmp_path):
     )
     assert cursor.lastrowid == 9
     conn.close()
+
+
+def test_current_schema_init_is_read_only_and_avoids_immediate_lock(tmp_path):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    init_schema(conn)
+    conn.execute("SELECT * FROM tasks").fetchall()
+
+    normalized = [statement.strip().upper() for statement in statements]
+    forbidden_prefixes = (
+        "BEGIN IMMEDIATE",
+        "CREATE ",
+        "DROP ",
+        "ALTER ",
+        "INSERT ",
+        "DELETE ",
+        "UPDATE ",
+    )
+    assert not any(
+        statement.startswith(forbidden_prefixes) for statement in normalized
+    )
+    conn.close()
+
+
+def test_old_schema_enters_immediate_atomic_migration(tmp_path):
+    conn = sqlite3.connect(tmp_path / "app.sqlite3")
+    conn.row_factory = sqlite3.Row
+    conn.execute(SCHEMA_STATEMENTS[0])
+    conn.execute(_old_tasks_schema())
+    _insert_old_task(conn, 4, "preserved")
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    init_schema(conn)
+
+    assert any(
+        statement.strip().upper().startswith("BEGIN IMMEDIATE")
+        for statement in statements
+    )
+    conn.close()
+
+
+def test_multiple_database_paths_initialize_independently(tmp_path):
+    for name in ("first.sqlite3", "second.sqlite3"):
+        conn = sqlite3.connect(tmp_path / name)
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        markers = {
+            row["key"]
+            for row in conn.execute(
+                "SELECT key FROM app_metadata WHERE key IN (?, ?)",
+                (TASK_IDENTITY_MIGRATION_KEY, RESULT_STATUS_MIGRATION_KEY),
+            ).fetchall()
+        }
+        assert markers == {
+            TASK_IDENTITY_MIGRATION_KEY,
+            RESULT_STATUS_MIGRATION_KEY,
+        }
+        conn.close()
 
 
 def test_schema_migration_failure_rolls_back_original_table(tmp_path, monkeypatch):

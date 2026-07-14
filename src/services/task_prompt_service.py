@@ -35,17 +35,40 @@ class TaskPromptStore:
         try:
             resolved_source = source.resolve(strict=True)
             resolved_root = self.root_dir.resolve(strict=True)
-        except FileNotFoundError:
+        except OSError:
             return False
-        if not resolved_source.is_file() or not resolved_source.is_relative_to(
-            resolved_root
+        if (
+            source.is_symlink()
+            or not resolved_source.is_file()
+            or not resolved_source.is_relative_to(resolved_root)
         ):
             return False
-        self.write_criteria(
-            task_id,
-            resolved_source.read_text(encoding="utf-8"),
-        )
+        try:
+            content = resolved_source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return False
+        if not content.strip():
+            return False
+        self.write_criteria(task_id, content)
         return True
+
+    def has_safe_criteria(self, task_id: int) -> bool:
+        target = self.criteria_path(task_id)
+        try:
+            resolved_target = target.resolve(strict=True)
+            resolved_root = self.root_dir.resolve(strict=True)
+        except OSError:
+            return False
+        if (
+            target.is_symlink()
+            or not resolved_target.is_file()
+            or not resolved_target.is_relative_to(resolved_root)
+        ):
+            return False
+        try:
+            return bool(resolved_target.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeError):
+            return False
 
     def write_criteria(self, task_id: int, content: str) -> Path:
         if not content or not content.strip():

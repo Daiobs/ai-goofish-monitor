@@ -80,6 +80,40 @@ def test_generate_keyword_mode_task_without_ai_criteria(api_client):
     assert created["keyword_rules"] == ["a7m4", "验货宝"]
 
 
+def test_direct_create_rejects_ai_task_without_valid_criteria(
+    api_client,
+    api_context,
+    sample_task_payload,
+):
+    payload = dict(sample_task_payload)
+    payload["ai_prompt_criteria_file"] = ""
+
+    response = api_client.post("/api/tasks/", json=payload)
+
+    assert response.status_code == 400
+    assert "criteria" in response.json()["detail"]
+    assert api_client.get("/api/tasks").json() == []
+    assert not (api_context["db_path"].parent / "prompts" / "tasks").exists()
+
+
+def test_direct_create_allows_keyword_task_without_criteria(api_client):
+    payload = {
+        "task_name": "Keyword-only task",
+        "keyword": "camera",
+        "description": "",
+        "decision_mode": "keyword",
+        "keyword_rules": ["camera"],
+        "ai_prompt_criteria_file": "",
+    }
+
+    response = api_client.post("/api/tasks/", json=payload)
+
+    assert response.status_code == 200
+    task = response.json()["task"]
+    assert task["decision_mode"] == "keyword"
+    assert task["ai_prompt_criteria_file"] == ""
+
+
 def test_generate_ai_task_returns_job_and_completes_async(api_client, api_context, monkeypatch):
     payload = {
         "task_name": "Apple Watch S10",
