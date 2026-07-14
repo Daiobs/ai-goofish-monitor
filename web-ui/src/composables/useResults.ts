@@ -20,6 +20,7 @@ export function useResults() {
   const limit = ref(100)
   const blacklistKeywords = ref<string[]>([])
   const taskNameByKeyword = ref<Record<string, string>>({})
+  const taskNameById = ref<Record<number, string>>({})
   const isFileOptionsReady = ref(false)
   const hasFetchedFiles = ref(false)
   const hasFetchedTasks = ref(false)
@@ -57,6 +58,11 @@ export function useResults() {
 
   function getKeywordFromFilename(filename: string) {
     return filename.replace(/_full_data\.jsonl$/i, '').toLowerCase()
+  }
+
+  function getTaskIdFromFilename(filename: string) {
+    const match = /^task_(0|[1-9]\d*)_full_data\.jsonl$/i.exec(filename)
+    return match ? Number(match[1]) : null
   }
 
   // Methods
@@ -144,12 +150,17 @@ export function useResults() {
     try {
       const tasks = await tasksApi.getAllTasks()
       const mapping: Record<string, string> = {}
+      const idMapping: Record<number, string> = {}
       tasks.forEach((task) => {
         if (task.keyword) {
           mapping[normalizeKeyword(task.keyword)] = task.task_name
         }
+        if (task.id !== null && task.id !== undefined) {
+          idMapping[task.id] = task.task_name
+        }
       })
       taskNameByKeyword.value = mapping
+      taskNameById.value = idMapping
     } catch (e) {
       if (e instanceof Error) error.value = e
     } finally {
@@ -276,7 +287,10 @@ export function useResults() {
   const fileOptions = computed(() =>
     files.value.map((file) => {
       const keyword = getKeywordFromFilename(file)
-      const taskName = taskNameByKeyword.value[keyword]
+      const taskId = getTaskIdFromFilename(file)
+      const taskName = taskId === null
+        ? taskNameByKeyword.value[keyword]
+        : taskNameById.value[taskId]
       return {
         value: file,
         taskName: taskName || t('common.unnamed'),
