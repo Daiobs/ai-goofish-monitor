@@ -7,6 +7,7 @@ import hashlib
 import json
 from datetime import datetime
 
+from src.keyword_rule_engine import build_search_text, normalize_text
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import sqlite_connection
 from src.infrastructure.persistence.storage_names import (
@@ -51,6 +52,8 @@ def _fallback_unique_key(record: dict, item: dict) -> str:
 
 def _parse_raw_record(raw_json: str, *, status: str | None = None) -> dict:
     record = json.loads(raw_json)
+    if not isinstance(record, dict):
+        raise ValueError("result raw_json must contain an object")
     if status is not None:
         record["_status"] = status
     return record
@@ -93,13 +96,20 @@ def _build_query_conditions(
     return " AND ".join(conditions), params, resolved_task_id
 
 
-def _sort_expression(sort_by: str, sort_order: str) -> str:
+def _sort_expression(
+    sort_by: str,
+    sort_order: str,
+    *,
+    include_hidden: bool,
+) -> str:
     column = SORT_COLUMN_MAP.get(sort_by, SORT_COLUMN_MAP["crawl_time"])
     direction = "ASC" if sort_order == "asc" else "DESC"
-    return (
+    status_order = (
         "(CASE WHEN status = 'active' THEN 0 ELSE 1 END), "
-        f"{column} {direction}, id {direction}"
+        if include_hidden
+        else ""
     )
+    return f"{status_order}{column} {direction}, id {direction}"
 
 
 def _decode_blacklist_payload(row) -> list[str]:
@@ -134,6 +144,39 @@ def _load_blacklist_keywords_from_conn(
     return _decode_blacklist_payload(row)
 
 
+def _encode_blacklist_rules(keywords: list[str]) -> str:
+    return json.dumps(keywords, ensure_ascii=False, separators=(",", ":"))
+
+
+def _prepare_filtered_query(
+    conn,
+    *,
+    filename: str | None,
+    task_id: int | None,
+    ai_recommended_only: bool,
+    keyword_recommended_only: bool,
+    include_hidden: bool,
+) -> tuple[str, list, int | None, list[str]]:
+    where_clause, params, resolved_task_id = _build_query_conditions(
+        task_id=task_id,
+        filename=filename,
+        ai_recommended_only=ai_recommended_only,
+        keyword_recommended_only=keyword_recommended_only,
+    )
+    blacklist_keywords = _load_blacklist_keywords_from_conn(
+        conn,
+        task_id=resolved_task_id,
+        filename=filename if resolved_task_id is None else None,
+    )
+    if not include_hidden:
+        where_clause += (
+            " AND status = ? "
+            "AND result_blacklist_match(search_text, ?) = 0"
+        )
+        params.extend(("active", _encode_blacklist_rules(blacklist_keywords)))
+    return where_clause, params, resolved_task_id, blacklist_keywords
+
+
 def _decorate_record_visibility(
     record: dict,
     status: str | None,
@@ -155,6 +198,21 @@ def _decorate_record_visibility(
     return record
 
 
+def _parse_decorated_row(row, blacklist_keywords: list[str]) -> dict | None:
+    try:
+        record = _parse_raw_record(
+            str(row["raw_json"]),
+            status=row["status"],
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return _decorate_record_visibility(
+        record,
+        row["status"],
+        blacklist_keywords,
+    )
+
+
 def _load_filtered_records_from_conn(
     conn,
     *,
@@ -166,32 +224,29 @@ def _load_filtered_records_from_conn(
     sort_order: str,
     include_hidden: bool,
 ) -> list[dict]:
-    where_clause, params, resolved_task_id = _build_query_conditions(
-        task_id=task_id,
+    where_clause, params, _, blacklist_keywords = _prepare_filtered_query(
+        conn,
         filename=filename,
+        task_id=task_id,
         ai_recommended_only=ai_recommended_only,
         keyword_recommended_only=keyword_recommended_only,
+        include_hidden=include_hidden,
+    )
+    order_by = _sort_expression(
+        sort_by,
+        sort_order,
+        include_hidden=include_hidden,
     )
     rows = conn.execute(
         f"SELECT raw_json, status FROM result_items WHERE {where_clause} "
-        f"ORDER BY {_sort_expression(sort_by, sort_order)}",
+        f"ORDER BY {order_by}",
         tuple(params),
     ).fetchall()
-    blacklist_keywords = _load_blacklist_keywords_from_conn(
-        conn,
-        task_id=resolved_task_id,
-        filename=filename if resolved_task_id is None else None,
-    )
 
     records: list[dict] = []
     for row in rows:
-        record = _parse_raw_record(str(row["raw_json"]), status=row["status"])
-        decorated = _decorate_record_visibility(
-            record,
-            row["status"],
-            blacklist_keywords,
-        )
-        if include_hidden or decorated.get("_effective_hidden") is not True:
+        decorated = _parse_decorated_row(row, blacklist_keywords)
+        if decorated is not None:
             records.append(decorated)
     return records
 
@@ -220,6 +275,7 @@ def _save_result_record_sync(
         keyword_hit_count = int(analysis.get("keyword_hit_count", 0))
     except (TypeError, ValueError):
         keyword_hit_count = 0
+    search_text = normalize_text(build_search_text(payload))
 
     with sqlite_connection() as conn:
         cursor = conn.execute(
@@ -228,8 +284,8 @@ def _save_result_record_sync(
                 task_id, result_filename, keyword, task_name, crawl_time,
                 publish_time, price, price_display, item_id, title, link,
                 link_unique_key, seller_nickname, is_recommended,
-                analysis_source, keyword_hit_count, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                analysis_source, keyword_hit_count, status, search_text, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -249,6 +305,8 @@ def _save_result_record_sync(
                 1 if analysis.get("is_recommended") else 0,
                 analysis.get("analysis_source"),
                 keyword_hit_count,
+                "active",
+                search_text,
                 json.dumps(payload, ensure_ascii=False),
             ),
         )
@@ -388,20 +446,40 @@ def _query_records_sync(
     include_hidden: bool,
 ) -> tuple[int, list[dict]]:
     bootstrap_sqlite_storage()
+    safe_limit = max(int(limit), 0)
     with sqlite_connection() as conn:
-        records = _load_filtered_records_from_conn(
+        conn.execute("BEGIN")
+        where_clause, params, _, blacklist_keywords = _prepare_filtered_query(
             conn,
             filename=filename,
             task_id=task_id,
             ai_recommended_only=ai_recommended_only,
             keyword_recommended_only=keyword_recommended_only,
-            sort_by=sort_by,
-            sort_order=sort_order,
             include_hidden=include_hidden,
         )
-    total = len(records)
-    offset = max(page - 1, 0) * limit
-    return total, records[offset : offset + limit]
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total FROM result_items WHERE {where_clause}",
+            tuple(params),
+        ).fetchone()
+        total = int(total_row["total"] if total_row is not None else 0)
+        offset = max(page - 1, 0) * safe_limit
+        order_by = _sort_expression(
+            sort_by,
+            sort_order,
+            include_hidden=include_hidden,
+        )
+        rows = conn.execute(
+            f"SELECT raw_json, status FROM result_items WHERE {where_clause} "
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (*params, safe_limit, offset),
+        ).fetchall()
+
+    records: list[dict] = []
+    for row in rows:
+        decorated = _parse_decorated_row(row, blacklist_keywords)
+        if decorated is not None:
+            records.append(decorated)
+    return total, records
 
 
 async def query_result_records(filename: str, **kwargs) -> tuple[int, list[dict]]:
@@ -436,6 +514,7 @@ def _load_all_records_sync(
 ) -> list[dict]:
     bootstrap_sqlite_storage()
     with sqlite_connection() as conn:
+        conn.execute("BEGIN")
         return _load_filtered_records_from_conn(
             conn,
             filename=filename,
@@ -525,16 +604,75 @@ def _load_summary_sync(
     filename: str | None = None,
     task_id: int | None = None,
 ) -> dict | None:
-    records = _load_all_records_sync(
-        filename=filename,
-        task_id=task_id,
-        ai_recommended_only=False,
-        keyword_recommended_only=False,
-        sort_by="crawl_time",
-        sort_order="desc",
-        include_hidden=False,
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        conn.execute("BEGIN")
+        where_clause, params, _, blacklist_keywords = _prepare_filtered_query(
+            conn,
+            filename=filename,
+            task_id=task_id,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            include_hidden=False,
+        )
+        aggregate = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_items,
+                COALESCE(SUM(CASE WHEN is_recommended = 1 THEN 1 ELSE 0 END), 0)
+                    AS recommended_items,
+                COALESCE(SUM(CASE WHEN is_recommended = 1
+                                   AND analysis_source = 'ai' THEN 1 ELSE 0 END), 0)
+                    AS ai_recommended_items,
+                COALESCE(SUM(CASE WHEN is_recommended = 1
+                                   AND analysis_source = 'keyword' THEN 1 ELSE 0 END), 0)
+                    AS keyword_recommended_items,
+                MAX(crawl_time) AS latest_crawl_time
+            FROM result_items
+            WHERE {where_clause}
+            """,
+            tuple(params),
+        ).fetchone()
+        total_items = int(aggregate["total_items"] if aggregate else 0)
+        if total_items == 0:
+            return None
+
+        order_by = _sort_expression(
+            "crawl_time",
+            "desc",
+            include_hidden=False,
+        )
+        latest_row = conn.execute(
+            f"SELECT raw_json, status FROM result_items "
+            f"WHERE {where_clause} ORDER BY {order_by} LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        latest_recommendation_row = conn.execute(
+            f"SELECT raw_json, status FROM result_items "
+            f"WHERE {where_clause} AND is_recommended = 1 "
+            f"ORDER BY {order_by} LIMIT 1",
+            tuple(params),
+        ).fetchone()
+
+    latest_record = (
+        _parse_decorated_row(latest_row, blacklist_keywords)
+        if latest_row is not None
+        else None
     )
-    return _summarize_visible_records(records)
+    latest_recommendation = (
+        _parse_decorated_row(latest_recommendation_row, blacklist_keywords)
+        if latest_recommendation_row is not None
+        else None
+    )
+    return {
+        "total_items": total_items,
+        "recommended_items": int(aggregate["recommended_items"]),
+        "ai_recommended_items": int(aggregate["ai_recommended_items"]),
+        "keyword_recommended_items": int(aggregate["keyword_recommended_items"]),
+        "latest_crawl_time": aggregate["latest_crawl_time"],
+        "latest_record": latest_record,
+        "latest_recommendation": latest_recommendation,
+    }
 
 
 async def load_result_summary(filename: str) -> dict | None:
@@ -687,20 +825,23 @@ def _load_visible_item_ids_sync(
     filename: str | None = None,
     task_id: int | None = None,
 ) -> set[str]:
-    records = _load_all_records_sync(
-        filename=filename,
-        task_id=task_id,
-        ai_recommended_only=False,
-        keyword_recommended_only=False,
-        sort_by="crawl_time",
-        sort_order="desc",
-        include_hidden=False,
-    )
-    return {
-        str((record.get("商品信息", {}) or {}).get("商品ID") or "").strip()
-        for record in records
-        if str((record.get("商品信息", {}) or {}).get("商品ID") or "").strip()
-    }
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        conn.execute("BEGIN")
+        where_clause, params, _, _ = _prepare_filtered_query(
+            conn,
+            filename=filename,
+            task_id=task_id,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            include_hidden=False,
+        )
+        rows = conn.execute(
+            f"SELECT item_id FROM result_items WHERE {where_clause} "
+            "AND item_id IS NOT NULL AND TRIM(item_id) <> ''",
+            tuple(params),
+        ).fetchall()
+    return {str(row["item_id"]).strip() for row in rows}
 
 
 def load_visible_result_item_ids(filename: str) -> set[str]:

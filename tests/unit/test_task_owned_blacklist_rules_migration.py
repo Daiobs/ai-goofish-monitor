@@ -17,6 +17,7 @@ from src.infrastructure.persistence.sqlite_connection import (
     TASK_OWNED_DATA_MIGRATION_KEY,
     init_schema,
     migrate_task_owned_blacklist_rules,
+    sqlite_connection,
 )
 from src.infrastructure.persistence.storage_names import (
     build_legacy_result_filename,
@@ -630,39 +631,38 @@ def test_jsonl_import_assigns_ownership_then_migrates_rules_in_one_transaction(
         legacy_price_history_dir=str(tmp_path / "price-history"),
     )
 
-    conn = _connect(db_path)
-    imported = conn.execute(
-        "SELECT task_id, result_filename FROM result_items"
-    ).fetchone()
-    assert tuple(imported) == (811, filename)
-    target = _rule(conn, "task_result_blacklist_rules", "task_id", 811)
-    assert json.loads(target["blacklist_keywords_json"]) == ["imported rule"]
-    visible = _load_filtered_records_from_conn(
-        conn,
-        filename=None,
-        task_id=811,
-        ai_recommended_only=False,
-        keyword_recommended_only=False,
-        sort_by="crawl_time",
-        sort_order="desc",
-        include_hidden=False,
-    )
-    assert visible == []
-    assert _rule(
-        conn,
-        "result_blacklist_rules",
-        "result_filename",
-        filename,
-    ) is None
-    assert _marker_payload(conn, TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY) == {
-        "failed": 0,
-        "legacy_rules_moved": 1,
-        "legacy_rules_preserved": 0,
-        "task_rules_created": 1,
-        "task_rules_merged": 0,
-        "task_targets": 1,
-    }
-    conn.close()
+    with sqlite_connection(str(db_path)) as conn:
+        imported = conn.execute(
+            "SELECT task_id, result_filename FROM result_items"
+        ).fetchone()
+        assert tuple(imported) == (811, filename)
+        target = _rule(conn, "task_result_blacklist_rules", "task_id", 811)
+        assert json.loads(target["blacklist_keywords_json"]) == ["imported rule"]
+        visible = _load_filtered_records_from_conn(
+            conn,
+            filename=None,
+            task_id=811,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            sort_by="crawl_time",
+            sort_order="desc",
+            include_hidden=False,
+        )
+        assert visible == []
+        assert _rule(
+            conn,
+            "result_blacklist_rules",
+            "result_filename",
+            filename,
+        ) is None
+        assert _marker_payload(conn, TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY) == {
+            "failed": 0,
+            "legacy_rules_moved": 1,
+            "legacy_rules_preserved": 0,
+            "task_rules_created": 1,
+            "task_rules_merged": 0,
+            "task_targets": 1,
+        }
 
 
 def test_jsonl_import_failure_rolls_back_import_ownership_rules_and_markers(
