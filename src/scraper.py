@@ -46,7 +46,10 @@ from src.utils import (
 from src.rotation import RotationPool, load_state_files, parse_proxy_pool, RotationItem
 from src.failure_guard import FailureGuard, task_guard_key
 from src.services.account_strategy_service import resolve_account_runtime_plan
-from src.infrastructure.persistence.storage_names import build_result_filename
+from src.infrastructure.persistence.storage_names import (
+    build_result_filename,
+    build_task_result_filename,
+)
 from src.services.item_analysis_dispatcher import (
     ItemAnalysisDispatcher,
     ItemAnalysisJob,
@@ -54,9 +57,14 @@ from src.services.item_analysis_dispatcher import (
 from src.services.price_history_service import (
     build_market_reference,
     load_price_snapshots,
+    load_task_price_snapshots,
     record_market_snapshots,
 )
-from src.services.result_storage_service import load_processed_link_keys
+from src.services.result_storage_service import (
+    load_processed_link_keys,
+    load_task_processed_link_keys,
+    save_task_result_record,
+)
 from src.services.seller_profile_cache import SellerProfileCache
 from src.services.search_pagination import (
     advance_search_page,
@@ -95,6 +103,21 @@ class ScrapeTaskFailed(Exception):
             f"{self.task_name} [{self.failure_kind}]: {self.reason} "
             f"(processed_item_count={self.processed_item_count})"
         )
+
+
+def _resolve_result_task_id(task_config: dict) -> Optional[int]:
+    if task_config.get("_result_ownership") == "legacy":
+        return None
+    value = task_config.get("id")
+    if isinstance(value, bool):
+        raise ValueError("SQLite task is missing a stable task ID")
+    try:
+        task_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SQLite task is missing a stable task ID") from exc
+    if task_id < 0:
+        raise ValueError("SQLite task is missing a stable task ID")
+    return task_id
 
 
 FAILURE_GUARD = FailureGuard()
@@ -663,6 +686,7 @@ async def _scrape_xianyu_core(
     根据单个任务配置，异步爬取闲鱼商品数据，并对每个新发现的商品进行实时的、独立的AI分析和通知。
     """
     keyword = task_config["keyword"]
+    result_task_id = _resolve_result_task_id(task_config)
     max_pages = task_config.get("max_pages", 1)
     personal_only = task_config.get("personal_only", False)
     min_price = task_config.get("min_price")
@@ -683,9 +707,22 @@ async def _scrape_xianyu_core(
     processed_links = set()
     history_run_id = datetime.now().strftime("%Y%m%d%H%M%S")
     history_seen_item_ids: set[str] = set()
-    historical_snapshots = load_price_snapshots(keyword)
-    result_filename = build_result_filename(keyword)
-    processed_links = load_processed_link_keys(keyword)
+    if result_task_id is None:
+        historical_snapshots = load_price_snapshots(keyword)
+        result_filename = build_result_filename(keyword)
+        processed_links = load_processed_link_keys(keyword)
+        result_saver = save_to_jsonl
+    else:
+        historical_snapshots = load_task_price_snapshots(result_task_id)
+        result_filename = build_task_result_filename(result_task_id)
+        processed_links = load_task_processed_link_keys(result_task_id)
+
+        async def result_saver(record: dict, record_keyword: str) -> bool:
+            return await save_task_result_record(
+                record,
+                record_keyword,
+                result_task_id,
+            )
     if processed_links:
         print(f"LOG: 发现已存在结果集 {result_filename}，已加载 {len(processed_links)} 个历史商品用于去重。")
     else:
@@ -828,7 +865,7 @@ async def _scrape_xianyu_core(
                     image_downloader=download_all_images,
                     ai_analyzer=get_ai_analysis,
                     notifier=send_ntfy_notification,
-                    saver=save_to_jsonl,
+                    saver=result_saver,
                 )
 
                 # 增强反检测脚本（模拟真实移动设备）
@@ -1194,6 +1231,7 @@ async def _scrape_xianyu_core(
                         break
                     historical_snapshots.extend(
                         record_market_snapshots(
+                            task_id=result_task_id,
                             keyword=keyword,
                             task_name=task_config.get("task_name", "Untitled Task"),
                             items=basic_items,
@@ -1323,6 +1361,8 @@ async def _scrape_xianyu_core(
                                     "商品信息": item_data,
                                     "卖家信息": {},
                                 }
+                                if result_task_id is not None:
+                                    final_record["任务ID"] = result_task_id
                                 price_reference = build_market_reference(
                                     keyword=keyword,
                                     item=item_data,
