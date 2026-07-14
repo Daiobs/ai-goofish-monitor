@@ -32,6 +32,19 @@ from src.services.result_storage_service import (
 )
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
+
+def _log_delete_failure(task_id: int, resource: str, exc: BaseException) -> None:
+    print(
+        f"[TaskDeletion] task_id={task_id} resource={resource} "
+        f"error={type(exc).__name__}"
+    )
+
+
+async def _delete_task_log(task_id: int, task_name: str) -> None:
+    log_file_path = resolve_task_log_path(task_id, task_name)
+    if os.path.exists(log_file_path):
+        await asyncio.to_thread(os.remove, log_file_path)
+
 async def _reload_scheduler_if_needed(
     task_service: TaskService,
     scheduler_service: SchedulerService,
@@ -224,40 +237,56 @@ async def delete_task(
     if not task:
         raise HTTPException(status_code=404, detail="任务未找到")
 
-    await process_service.stop_task(task_id)
-    success = await service.delete_task(task_id)
+    try:
+        await process_service.stop_task(task_id)
+    except Exception as exc:
+        _log_delete_failure(task_id, "process_stop", exc)
+    try:
+        process_is_running = process_service.is_running(task_id)
+    except Exception as exc:
+        _log_delete_failure(task_id, "process_status", exc)
+        raise HTTPException(status_code=500, detail="无法确认任务进程已停止，删除已取消") from None
+    if process_is_running:
+        print(
+            f"[TaskDeletion] task_id={task_id} resource=process "
+            "error=StillRunning"
+        )
+        raise HTTPException(status_code=409, detail="任务进程仍在运行，删除已取消")
+
+    try:
+        success = await service.delete_task_record(task_id)
+    except Exception as exc:
+        _log_delete_failure(task_id, "task_record", exc)
+        raise HTTPException(status_code=500, detail="任务记录删除失败") from None
     if not success:
-        raise HTTPException(status_code=404, detail="任务未找到")
+        print(
+            f"[TaskDeletion] task_id={task_id} resource=task_record "
+            "error=DeleteRejected"
+        )
+        raise HTTPException(status_code=500, detail="任务记录删除失败")
+
     cleanup_steps = (
-        ("结果", lambda: delete_task_result_records(task_id)),
+        ("prompt", lambda: service.delete_task_prompt(task_id)),
+        ("result_items", lambda: delete_task_result_records(task_id)),
         (
-            "价格快照",
+            "price_snapshots",
             lambda: asyncio.to_thread(delete_task_price_snapshots, task_id),
         ),
         (
-            "黑名单规则",
+            "blacklist_rules",
             lambda: asyncio.to_thread(delete_task_result_blacklist_rules, task_id),
         ),
+        ("log", lambda: _delete_task_log(task_id, task.task_name)),
+        (
+            "scheduler",
+            lambda: _reload_scheduler_if_needed(service, scheduler_service),
+        ),
     )
-    for label, cleanup in cleanup_steps:
+    for resource, cleanup in cleanup_steps:
         try:
             await cleanup()
         except Exception as exc:
-            print(
-                f"删除任务 {task_id} 的{label}时出错: "
-                f"{type(exc).__name__}"
-            )
-
-    try:
-        log_file_path = resolve_task_log_path(task_id, task.task_name)
-        if os.path.exists(log_file_path):
-            os.remove(log_file_path)
-    except Exception as exc:
-        print(
-            f"删除任务 {task_id} 的日志文件时出错: "
-            f"{type(exc).__name__}"
-        )
-    await _reload_scheduler_if_needed(service, scheduler_service)
+            _log_delete_failure(task_id, resource, exc)
     return {"message": "任务删除成功"}
 @router.post("/start/{task_id}", response_model=dict)
 async def start_task(

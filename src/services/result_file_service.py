@@ -13,6 +13,7 @@ from src.services.price_history_service import (
     parse_price_value,
 )
 from src.services.result_storage_service import (
+    load_legacy_result_keyword,
     load_visible_result_item_ids,
     load_visible_task_result_item_ids,
 )
@@ -32,7 +33,8 @@ def validate_result_filename(filename: str) -> None:
 def enrich_records_with_price_insight(records: list[dict], filename: str) -> list[dict]:
     task_id = try_parse_task_result_filename(filename)
     if task_id is None:
-        snapshots = load_price_snapshots(normalize_keyword_from_filename(filename))
+        keyword = load_legacy_result_keyword(filename)
+        snapshots = load_price_snapshots(keyword) if keyword is not None else []
     else:
         snapshots = load_task_price_snapshots(task_id)
     if not snapshots:

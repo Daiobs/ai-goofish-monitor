@@ -58,6 +58,9 @@ class FakeProcessService:
     def __init__(self):
         self.started = []
         self.stopped = []
+        self.running = set()
+        self.stop_result = True
+        self.keep_running_after_stop = False
         self._on_started = None
         self._on_stopped = None
 
@@ -67,14 +70,21 @@ class FakeProcessService:
 
     async def start_task(self, task_id: int, task_name: str) -> bool:
         self.started.append((task_id, task_name))
+        self.running.add(task_id)
         if self._on_started:
             await self._on_started(task_id)
         return True
 
     async def stop_task(self, task_id: int):
         self.stopped.append(task_id)
-        if self._on_stopped:
+        if not self.keep_running_after_stop:
+            self.running.discard(task_id)
+        if self._on_stopped and not self.keep_running_after_stop:
             await self._on_stopped(task_id)
+        return self.stop_result
+
+    def is_running(self, task_id: int) -> bool:
+        return task_id in self.running
 
 class FakeSchedulerService:
     def __init__(self):
@@ -154,6 +164,7 @@ def api_context(tmp_path, monkeypatch):
         "app": app,
         "config_file": config_file,
         "db_path": db_path,
+        "task_service": task_service,
         "process_service": process_service,
         "scheduler_service": scheduler_service,
         "task_generation_service": task_generation_service,

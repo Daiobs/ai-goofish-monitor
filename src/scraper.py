@@ -47,7 +47,7 @@ from src.rotation import RotationPool, load_state_files, parse_proxy_pool, Rotat
 from src.failure_guard import FailureGuard, task_guard_key
 from src.services.account_strategy_service import resolve_account_runtime_plan
 from src.infrastructure.persistence.storage_names import (
-    build_result_filename,
+    build_legacy_result_filename,
     build_task_result_filename,
 )
 from src.services.item_analysis_dispatcher import (
@@ -709,7 +709,7 @@ async def _scrape_xianyu_core(
     history_seen_item_ids: set[str] = set()
     if result_task_id is None:
         historical_snapshots = load_price_snapshots(keyword)
-        result_filename = build_result_filename(keyword)
+        result_filename = build_legacy_result_filename(keyword)
         processed_links = load_processed_link_keys(keyword)
         result_saver = save_to_jsonl
     else:

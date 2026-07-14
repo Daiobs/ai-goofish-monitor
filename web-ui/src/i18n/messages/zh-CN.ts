@@ -141,6 +141,7 @@ const zhCN = {
       noResults: '暂无结果，请先运行任务',
       chooseResult: '请选择任务结果',
       taskNameLabel: '任务名称：{task}',
+      legacyTaskNameLabel: '旧配置：{keyword}',
       sortByCrawlTime: '按爬取时间',
       sortByPublishTime: '按发布时间',
       sortByPrice: '按价格',

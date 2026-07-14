@@ -7,7 +7,10 @@ from datetime import datetime
 from typing import Any
 
 from src.domain.models.task import Task
-from src.infrastructure.persistence.storage_names import try_parse_task_result_filename
+from src.infrastructure.persistence.storage_names import (
+    decode_legacy_result_filename,
+    try_parse_task_result_filename,
+)
 from src.services.price_history_service import parse_price_value
 from src.services.result_file_service import (
     normalize_keyword_from_filename,
@@ -145,6 +148,8 @@ def _resolve_task(
     latest_record: dict[str, Any] | None,
     keyword: str,
 ) -> tuple[Task | None, int | None]:
+    if decode_legacy_result_filename(filename) is not None:
+        return None, None
     task_id = try_parse_task_result_filename(filename)
     if task_id is not None:
         return task_lookup.get(task_id), task_id

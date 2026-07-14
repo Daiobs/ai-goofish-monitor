@@ -10,7 +10,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from src.infrastructure.persistence.storage_names import DEFAULT_DATABASE_PATH
+from src.infrastructure.persistence.storage_names import (
+    DEFAULT_DATABASE_PATH,
+    build_legacy_result_filename,
+    build_result_filename,
+)
 
 
 BUSY_TIMEOUT_MS = 5000
@@ -148,6 +152,11 @@ TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
 RESULT_STATUS_MIGRATION_KEY = "migration:result_items_status"
 RESULT_STATUS_INDEX_NAME = "idx_results_filename_status_crawl"
 TASK_OWNED_DATA_MIGRATION_KEY = "migration:task_owned_results_v1"
+LEGACY_RESULT_NAMESPACE_MIGRATION_KEY = (
+    "migration:legacy_result_filename_namespace_v1"
+)
+LEGACY_RESULT_ITEMS_UNIQUE = ("result_filename", "link_unique_key")
+LEGACY_PRICE_SNAPSHOTS_UNIQUE = ("keyword_slug", "run_id", "item_id")
 TASK_OWNED_INDEXES = {
     "idx_result_items_task_link_unique",
     "idx_result_items_legacy_file_link_unique",
@@ -236,6 +245,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _migrate_tasks_autoincrement(conn)
         _migrate_result_items_status(conn)
         _migrate_task_owned_data(conn)
+        migrate_legacy_result_filename_namespace(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -269,13 +279,26 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     if "task_id" not in snapshot_columns:
         return False
+    if _has_table_unique_constraint(
+        conn,
+        "result_items",
+        LEGACY_RESULT_ITEMS_UNIQUE,
+    ):
+        return False
+    if _has_table_unique_constraint(
+        conn,
+        "price_snapshots",
+        LEGACY_PRICE_SNAPSHOTS_UNIQUE,
+    ):
+        return False
 
     migration_rows = conn.execute(
-        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?)",
+        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?, ?)",
         (
             TASK_IDENTITY_MIGRATION_KEY,
             RESULT_STATUS_MIGRATION_KEY,
             TASK_OWNED_DATA_MIGRATION_KEY,
+            LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
         ),
     ).fetchall()
     completed = {str(row["key"]) for row in migration_rows}
@@ -283,6 +306,7 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         TASK_IDENTITY_MIGRATION_KEY,
         RESULT_STATUS_MIGRATION_KEY,
         TASK_OWNED_DATA_MIGRATION_KEY,
+        LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
     }
 
 
@@ -459,6 +483,130 @@ def assign_legacy_task_ownership(
     return payload
 
 
+def migrate_legacy_result_filename_namespace(
+    conn: sqlite3.Connection,
+    *,
+    force: bool = False,
+) -> dict[str, int]:
+    """Move unowned collision-prone filenames into the reserved legacy namespace."""
+    marker = conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = ?",
+        (LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,),
+    ).fetchone()
+    if marker is not None and not force:
+        return {"renamed_rows": 0, "renamed_rule_keys": 0}
+
+    rows = conn.execute(
+        """
+        SELECT result_filename, keyword, COUNT(*) AS row_count
+        FROM result_items
+        WHERE task_id IS NULL
+        GROUP BY result_filename, keyword
+        ORDER BY result_filename, keyword
+        """
+    ).fetchall()
+    targets_by_source: dict[str, set[str]] = {}
+    renamed_rows = 0
+    for row in rows:
+        source = str(row["result_filename"] or "")
+        keyword = str(row["keyword"] or "")
+        target = build_legacy_result_filename(keyword)
+        if source != build_result_filename(keyword) or source == target:
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE result_items
+            SET result_filename = ?
+            WHERE task_id IS NULL AND result_filename = ? AND keyword = ?
+            """,
+            (target, source, keyword),
+        )
+        renamed_rows += int(cursor.rowcount or 0)
+        targets_by_source.setdefault(source, set()).add(target)
+
+    renamed_rule_keys = _migrate_legacy_blacklist_rule_keys(
+        conn,
+        targets_by_source,
+    )
+    payload = {
+        "renamed_rows": renamed_rows,
+        "renamed_rule_keys": renamed_rule_keys,
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, ?)",
+        (
+            LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
+            json.dumps(payload, sort_keys=True),
+        ),
+    )
+    return payload
+
+
+def _migrate_legacy_blacklist_rule_keys(
+    conn: sqlite3.Connection,
+    targets_by_source: dict[str, set[str]],
+) -> int:
+    migrated = 0
+    for source, targets in targets_by_source.items():
+        source_row = conn.execute(
+            """
+            SELECT blacklist_keywords_json, updated_at
+            FROM result_blacklist_rules
+            WHERE result_filename = ?
+            """,
+            (source,),
+        ).fetchone()
+        if source_row is None:
+            continue
+        source_keywords = _decode_blacklist_keywords(
+            source_row["blacklist_keywords_json"]
+        )
+        source_updated_at = str(source_row["updated_at"] or "")
+        for target in sorted(targets):
+            target_row = conn.execute(
+                """
+                SELECT blacklist_keywords_json, updated_at
+                FROM result_blacklist_rules
+                WHERE result_filename = ?
+                """,
+                (target,),
+            ).fetchone()
+            target_keywords = _decode_blacklist_keywords(
+                target_row["blacklist_keywords_json"] if target_row else None
+            )
+            merged = list(target_keywords)
+            merged.extend(value for value in source_keywords if value not in merged)
+            updated_at = max(
+                source_updated_at,
+                str(target_row["updated_at"] or "") if target_row else "",
+            )
+            conn.execute(
+                """
+                INSERT INTO result_blacklist_rules (
+                    result_filename, blacklist_keywords_json, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(result_filename) DO UPDATE SET
+                    blacklist_keywords_json = excluded.blacklist_keywords_json,
+                    updated_at = excluded.updated_at
+                """,
+                (target, json.dumps(merged, ensure_ascii=False), updated_at),
+            )
+        conn.execute(
+            "DELETE FROM result_blacklist_rules WHERE result_filename = ?",
+            (source,),
+        )
+        migrated += 1
+    return migrated
+
+
+def _decode_blacklist_keywords(raw_value) -> list:
+    try:
+        decoded = json.loads(str(raw_value or "[]"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {
         str(row["name"])
@@ -466,12 +614,27 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     }
 
 
-def _table_sql(conn: sqlite3.Connection, table_name: str) -> str:
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return str(row["sql"] if row else "")
+def _has_table_unique_constraint(
+    conn: sqlite3.Connection,
+    table_name: str,
+    expected_columns: tuple[str, ...],
+) -> bool:
+    """Detect a UNIQUE table constraint by its SQLite autoindex columns."""
+    quoted_table = '"' + table_name.replace('"', '""') + '"'
+    for index_row in conn.execute(f"PRAGMA index_list({quoted_table})").fetchall():
+        if str(index_row["origin"]) != "u":
+            continue
+        index_name = str(index_row["name"])
+        quoted_index = '"' + index_name.replace('"', '""') + '"'
+        actual_columns = tuple(
+            str(column_row["name"])
+            for column_row in conn.execute(
+                f"PRAGMA index_info({quoted_index})"
+            ).fetchall()
+        )
+        if actual_columns == expected_columns:
+            return True
+    return False
 
 
 def _table_sequence(conn: sqlite3.Connection, table_name: str) -> int | None:
@@ -507,8 +670,11 @@ def _preserve_table_sequence(
 
 def _rebuild_result_items_for_task_ownership(conn: sqlite3.Connection) -> bool:
     columns = _table_columns(conn, "result_items")
-    normalized_sql = "".join(_table_sql(conn, "result_items").lower().split())
-    old_unique = "unique(result_filename,link_unique_key)" in normalized_sql
+    old_unique = _has_table_unique_constraint(
+        conn,
+        "result_items",
+        LEGACY_RESULT_ITEMS_UNIQUE,
+    )
     if "task_id" in columns and not old_unique:
         return False
 
@@ -576,8 +742,11 @@ def _copy_result_items_for_task_ownership(
 
 def _rebuild_price_snapshots_for_task_ownership(conn: sqlite3.Connection) -> bool:
     columns = _table_columns(conn, "price_snapshots")
-    normalized_sql = "".join(_table_sql(conn, "price_snapshots").lower().split())
-    old_unique = "unique(keyword_slug,run_id,item_id)" in normalized_sql
+    old_unique = _has_table_unique_constraint(
+        conn,
+        "price_snapshots",
+        LEGACY_PRICE_SNAPSHOTS_UNIQUE,
+    )
     if "task_id" in columns and not old_unique:
         return False
 

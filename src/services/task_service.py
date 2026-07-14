@@ -103,16 +103,20 @@ class TaskService:
         try:
             await self.repository.delete(task_id)
         except BaseException as exc:
-            self._log_cleanup_failure("数据库任务", exc)
+            self._log_cleanup_failure(task_id, "数据库任务", exc)
         try:
             await asyncio.to_thread(self.prompt_store.delete_task_prompt, task_id)
         except BaseException as exc:
-            self._log_cleanup_failure("Prompt 目录", exc)
+            self._log_cleanup_failure(task_id, "Prompt 目录", exc)
 
     @staticmethod
-    def _log_cleanup_failure(resource: str, exc: BaseException) -> None:
+    def _log_cleanup_failure(
+        task_id: int,
+        resource: str,
+        exc: BaseException,
+    ) -> None:
         print(
-            f"[TaskCleanup] 补偿清理{resource}失败 "
+            f"[TaskCleanup] 任务 ID {task_id} 清理{resource}失败 "
             f"({type(exc).__name__})，已保留原始错误。"
         )
 
@@ -169,10 +173,22 @@ class TaskService:
 
     async def delete_task(self, task_id: int) -> bool:
         """删除任务"""
-        deleted = await self.repository.delete(task_id)
-        if deleted:
-            await asyncio.to_thread(self.prompt_store.delete_task_prompt, task_id)
+        deleted = await self.delete_task_record(task_id)
+        if not deleted:
+            return False
+        try:
+            await self.delete_task_prompt(task_id)
+        except BaseException as exc:
+            self._log_cleanup_failure(task_id, "Prompt 目录", exc)
         return deleted
+
+    async def delete_task_record(self, task_id: int) -> bool:
+        """Delete only the durable task row."""
+        return await self.repository.delete(task_id)
+
+    async def delete_task_prompt(self, task_id: int) -> None:
+        """Delete only the canonical task Prompt directory."""
+        await asyncio.to_thread(self.prompt_store.delete_task_prompt, task_id)
 
     async def update_task_status(self, task_id: int, is_running: bool) -> Task:
         """更新任务运行状态"""

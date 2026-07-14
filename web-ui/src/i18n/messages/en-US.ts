@@ -141,6 +141,7 @@ const enUS = {
       noResults: 'No results yet. Run a task first.',
       chooseResult: 'Select a task result',
       taskNameLabel: 'Task: {task}',
+      legacyTaskNameLabel: 'Legacy config: {keyword}',
       sortByCrawlTime: 'Crawl Time',
       sortByPublishTime: 'Publish Time',
       sortByPrice: 'Price',

@@ -2,6 +2,9 @@ import asyncio
 import time
 from pathlib import Path
 
+import pytest
+
+from src.api.routes import tasks as tasks_route
 from src.services.price_history_service import (
     load_price_snapshots,
     load_task_price_snapshots,
@@ -58,6 +61,77 @@ def _all_legacy_records() -> list[dict]:
             include_hidden=True,
         )
     )
+
+
+def _seed_task_deletion_data(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+) -> dict:
+    monkeypatch.setenv("APP_DATABASE_FILE", str(api_context["db_path"]))
+    first_payload = dict(sample_task_payload)
+    first_payload.update(task_name="same task", keyword="same keyword")
+    first_response = api_client.post("/api/tasks/", json=first_payload)
+    second_response = api_client.post("/api/tasks/", json=first_payload)
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_id = first_response.json()["task"]["id"]
+    second_id = second_response.json()["task"]["id"]
+
+    asyncio.run(
+        save_task_result_record(
+            _owned_result_record("first task item"),
+            "same keyword",
+            first_id,
+        )
+    )
+    asyncio.run(
+        save_task_result_record(
+            _owned_result_record("second task item"),
+            "same keyword",
+            second_id,
+        )
+    )
+    asyncio.run(save_result_record(_owned_result_record("legacy item"), "same keyword"))
+    for task_id, price in ((first_id, "100"), (second_id, "900")):
+        record_market_snapshots(
+            task_id=task_id,
+            keyword="same keyword",
+            task_name="same task",
+            items=[{"商品ID": "shared", "当前售价": price}],
+            run_id=f"run-{task_id}",
+        )
+    record_market_snapshots(
+        keyword="same keyword",
+        task_name="legacy",
+        items=[{"商品ID": "shared", "当前售价": "500"}],
+        run_id="legacy-run",
+    )
+    asyncio.run(save_task_result_blacklist_keywords(first_id, ["first-only"]))
+    asyncio.run(save_task_result_blacklist_keywords(second_id, ["second-only"]))
+
+    log_path = Path(resolve_task_log_path(first_id, "same task"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("fictional log", encoding="utf-8")
+    prompt_path = TaskPromptStore().criteria_path(first_id)
+    assert prompt_path.exists()
+    return {
+        "first_id": first_id,
+        "second_id": second_id,
+        "log_path": log_path,
+        "prompt_path": prompt_path,
+    }
+
+
+def _assert_sibling_and_legacy_data_remain(second_id: int) -> None:
+    assert len(_all_owned_records(second_id)) == 1
+    assert len(_all_legacy_records()) == 1
+    assert len(load_task_price_snapshots(second_id)) == 1
+    assert len(load_price_snapshots("same keyword")) == 1
+    assert asyncio.run(load_task_result_blacklist_keywords(second_id)) == [
+        "second-only"
+    ]
 
 
 def test_create_list_update_delete_task(api_client, api_context, sample_task_payload):
@@ -414,3 +488,210 @@ def test_delete_task_cleans_only_its_owned_data(
     ]
     assert not prompt_path.exists()
     assert not Path(log_path).exists()
+
+
+def test_delete_task_aborts_when_process_remains_running(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+):
+    seeded = _seed_task_deletion_data(
+        api_client,
+        api_context,
+        sample_task_payload,
+        monkeypatch,
+    )
+    task_id = seeded["first_id"]
+    process_service = api_context["process_service"]
+    process_service.stop_result = False
+    process_service.keep_running_after_stop = True
+    process_service.running.add(task_id)
+    scheduler_calls = api_context["scheduler_service"].reload_calls
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 409
+    assert api_client.get(f"/api/tasks/{task_id}").status_code == 200
+    assert len(_all_owned_records(task_id)) == 1
+    assert len(load_task_price_snapshots(task_id)) == 1
+    assert asyncio.run(load_task_result_blacklist_keywords(task_id)) == ["first-only"]
+    assert seeded["prompt_path"].exists()
+    assert seeded["log_path"].exists()
+    assert api_context["scheduler_service"].reload_calls == scheduler_calls
+    _assert_sibling_and_legacy_data_remain(seeded["second_id"])
+
+
+def test_task_record_delete_failure_preserves_all_owned_data(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+    capsys,
+):
+    seeded = _seed_task_deletion_data(
+        api_client,
+        api_context,
+        sample_task_payload,
+        monkeypatch,
+    )
+    task_id = seeded["first_id"]
+    scheduler_calls = api_context["scheduler_service"].reload_calls
+
+    async def fail_task_record_delete(_task_id):
+        raise RuntimeError("private-database-detail")
+
+    monkeypatch.setattr(
+        api_context["task_service"],
+        "delete_task_record",
+        fail_task_record_delete,
+    )
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+    output = capsys.readouterr().out
+
+    assert response.status_code == 500
+    assert "private-database-detail" not in response.text
+    assert "private-database-detail" not in output
+    assert api_client.get(f"/api/tasks/{task_id}").status_code == 200
+    assert len(_all_owned_records(task_id)) == 1
+    assert len(load_task_price_snapshots(task_id)) == 1
+    assert asyncio.run(load_task_result_blacklist_keywords(task_id)) == ["first-only"]
+    assert seeded["prompt_path"].exists()
+    assert seeded["log_path"].exists()
+    assert api_context["scheduler_service"].reload_calls == scheduler_calls
+    _assert_sibling_and_legacy_data_remain(seeded["second_id"])
+
+
+@pytest.mark.parametrize("stop_result", [False, True])
+def test_delete_task_continues_once_process_is_confirmed_stopped(
+    stop_result,
+    api_client,
+    api_context,
+    sample_task_payload,
+):
+    response = api_client.post("/api/tasks/", json=sample_task_payload)
+    task_id = response.json()["task"]["id"]
+    process_service = api_context["process_service"]
+    process_service.stop_result = stop_result
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    assert process_service.is_running(task_id) is False
+    assert api_client.get(f"/api/tasks/{task_id}").status_code == 404
+
+
+def test_prompt_cleanup_failure_does_not_block_other_cleanup(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+    capsys,
+):
+    seeded = _seed_task_deletion_data(
+        api_client,
+        api_context,
+        sample_task_payload,
+        monkeypatch,
+    )
+    task_id = seeded["first_id"]
+    scheduler_calls = api_context["scheduler_service"].reload_calls
+
+    async def fail_prompt_cleanup(_task_id):
+        raise RuntimeError("private-prompt-path-and-secret")
+
+    monkeypatch.setattr(
+        api_context["task_service"],
+        "delete_task_prompt",
+        fail_prompt_cleanup,
+    )
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+    output = capsys.readouterr().out
+
+    assert response.status_code == 200
+    assert "private-prompt-path-and-secret" not in response.text
+    assert "private-prompt-path-and-secret" not in output
+    assert f"task_id={task_id}" in output
+    assert "resource=prompt" in output
+    assert "error=RuntimeError" in output
+    assert seeded["prompt_path"].exists()
+    assert _all_owned_records(task_id) == []
+    assert load_task_price_snapshots(task_id) == []
+    assert asyncio.run(load_task_result_blacklist_keywords(task_id)) == []
+    assert not seeded["log_path"].exists()
+    assert api_context["scheduler_service"].reload_calls == scheduler_calls + 1
+    _assert_sibling_and_legacy_data_remain(seeded["second_id"])
+
+
+def test_result_cleanup_failure_does_not_block_other_cleanup(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+    capsys,
+):
+    seeded = _seed_task_deletion_data(
+        api_client,
+        api_context,
+        sample_task_payload,
+        monkeypatch,
+    )
+    task_id = seeded["first_id"]
+
+    async def fail_result_cleanup(_task_id):
+        raise RuntimeError("private-result-record")
+
+    monkeypatch.setattr(
+        tasks_route,
+        "delete_task_result_records",
+        fail_result_cleanup,
+    )
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+    output = capsys.readouterr().out
+
+    assert response.status_code == 200
+    assert "private-result-record" not in response.text
+    assert "private-result-record" not in output
+    assert len(_all_owned_records(task_id)) == 1
+    assert load_task_price_snapshots(task_id) == []
+    assert asyncio.run(load_task_result_blacklist_keywords(task_id)) == []
+    assert not seeded["prompt_path"].exists()
+    assert not seeded["log_path"].exists()
+    _assert_sibling_and_legacy_data_remain(seeded["second_id"])
+
+
+def test_log_cleanup_failure_happens_after_other_cleanup(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+    capsys,
+):
+    seeded = _seed_task_deletion_data(
+        api_client,
+        api_context,
+        sample_task_payload,
+        monkeypatch,
+    )
+    task_id = seeded["first_id"]
+
+    def fail_log_cleanup(_path):
+        raise PermissionError("private-log-path")
+
+    monkeypatch.setattr(tasks_route.os, "remove", fail_log_cleanup)
+
+    response = api_client.delete(f"/api/tasks/{task_id}")
+    output = capsys.readouterr().out
+
+    assert response.status_code == 200
+    assert "private-log-path" not in response.text
+    assert "private-log-path" not in output
+    assert seeded["log_path"].exists()
+    assert not seeded["prompt_path"].exists()
+    assert _all_owned_records(task_id) == []
+    assert load_task_price_snapshots(task_id) == []
+    assert asyncio.run(load_task_result_blacklist_keywords(task_id)) == []
+    _assert_sibling_and_legacy_data_remain(seeded["second_id"])

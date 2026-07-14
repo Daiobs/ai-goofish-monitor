@@ -10,7 +10,7 @@ from datetime import datetime
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import sqlite_connection
 from src.infrastructure.persistence.storage_names import (
-    build_result_filename,
+    build_legacy_result_filename,
     build_task_result_filename,
     try_parse_task_result_filename,
 )
@@ -208,7 +208,7 @@ def _save_result_record_sync(
         payload["任务ID"] = task_id
         result_filename = build_task_result_filename(task_id)
     else:
-        result_filename = build_result_filename(keyword)
+        result_filename = build_legacy_result_filename(keyword)
 
     item = payload.get("商品信息", {}) or {}
     analysis = payload.get("ai_analysis", {}) or {}
@@ -273,7 +273,7 @@ async def save_task_result_record(record: dict, keyword: str, task_id: int) -> b
 def load_processed_link_keys(keyword: str) -> set[str]:
     """Load only legacy processed links for a keyword-owned config task."""
     bootstrap_sqlite_storage()
-    filename = build_result_filename(keyword)
+    filename = build_legacy_result_filename(keyword)
     with sqlite_connection() as conn:
         rows = conn.execute(
             "SELECT link_unique_key FROM result_items "
@@ -281,6 +281,20 @@ def load_processed_link_keys(keyword: str) -> set[str]:
             (filename,),
         ).fetchall()
     return {str(row["link_unique_key"]) for row in rows if row["link_unique_key"]}
+
+
+def load_legacy_result_keyword(filename: str) -> str | None:
+    """Read the keyword recorded for an exact legacy-owned result set."""
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        row = conn.execute(
+            "SELECT keyword FROM result_items "
+            "WHERE task_id IS NULL AND result_filename = ? "
+            "AND keyword IS NOT NULL AND keyword <> '' "
+            "ORDER BY id DESC LIMIT 1",
+            (filename,),
+        ).fetchone()
+    return str(row["keyword"]) if row is not None else None
 
 
 def load_task_processed_link_keys(task_id: int) -> set[str]:

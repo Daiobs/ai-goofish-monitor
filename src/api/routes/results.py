@@ -33,6 +33,7 @@ from src.services.result_storage_service import (
     list_result_filenames,
     load_all_result_records,
     load_all_task_result_records,
+    load_legacy_result_keyword,
     load_result_blacklist_keywords,
     load_task_result_blacklist_keywords,
     load_visible_result_item_ids,
@@ -329,7 +330,9 @@ async def get_result_file_insights(filename: str):
                 task_id,
                 visible_item_ids=visible_item_ids,
             )
-        keyword = filename.replace("_full_data.jsonl", "")
+        keyword = load_legacy_result_keyword(filename)
+        if keyword is None:
+            raise HTTPException(status_code=404, detail="结果文件未找到")
         visible_item_ids = load_visible_result_item_ids(filename)
         return build_price_history_insights(keyword, visible_item_ids=visible_item_ids)
     except ValueError as exc:
