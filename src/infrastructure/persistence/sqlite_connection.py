@@ -429,6 +429,13 @@ def _migrate_task_owned_data(conn: sqlite3.Connection) -> None:
     if marker is not None and not result_rebuilt and not snapshots_rebuilt:
         return
 
+    assign_legacy_task_ownership(conn)
+
+
+def assign_legacy_task_ownership(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, int]]:
+    """Assign unowned rows and refresh ownership migration statistics."""
     result_stats = _assign_legacy_rows_to_tasks(conn, "result_items")
     snapshot_stats = _assign_legacy_rows_to_tasks(conn, "price_snapshots")
     totals = {
@@ -449,6 +456,7 @@ def _migrate_task_owned_data(conn: sqlite3.Connection) -> None:
         f"assigned={totals['assigned']} unassigned={totals['unassigned']} "
         f"ambiguous={totals['ambiguous']} failed={totals['failed']}"
     )
+    return payload
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
