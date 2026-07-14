@@ -391,6 +391,7 @@ def _query_records_sync(
 
 
 async def query_result_records(filename: str, **kwargs) -> tuple[int, list[dict]]:
+    kwargs.setdefault("include_hidden", False)
     return await asyncio.to_thread(
         _query_records_sync,
         filename=filename,
@@ -400,6 +401,7 @@ async def query_result_records(filename: str, **kwargs) -> tuple[int, list[dict]
 
 
 async def query_task_result_records(task_id: int, **kwargs) -> tuple[int, list[dict]]:
+    kwargs.setdefault("include_hidden", False)
     return await asyncio.to_thread(
         _query_records_sync,
         filename=None,
@@ -433,6 +435,7 @@ def _load_all_records_sync(
 
 
 async def load_all_result_records(filename: str, **kwargs) -> list[dict]:
+    kwargs.setdefault("include_hidden", False)
     return await asyncio.to_thread(
         _load_all_records_sync,
         filename=filename,
@@ -442,6 +445,7 @@ async def load_all_result_records(filename: str, **kwargs) -> list[dict]:
 
 
 async def load_all_task_result_records(task_id: int, **kwargs) -> list[dict]:
+    kwargs.setdefault("include_hidden", False)
     return await asyncio.to_thread(
         _load_all_records_sync,
         filename=None,

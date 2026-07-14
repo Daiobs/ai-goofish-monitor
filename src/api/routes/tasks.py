@@ -248,8 +248,6 @@ async def delete_task(
                 f"{type(exc).__name__}"
             )
 
-    await _reload_scheduler_if_needed(service, scheduler_service)
-
     try:
         log_file_path = resolve_task_log_path(task_id, task.task_name)
         if os.path.exists(log_file_path):
@@ -259,6 +257,7 @@ async def delete_task(
             f"删除任务 {task_id} 的日志文件时出错: "
             f"{type(exc).__name__}"
         )
+    await _reload_scheduler_if_needed(service, scheduler_service)
     return {"message": "任务删除成功"}
 @router.post("/start/{task_id}", response_model=dict)
 async def start_task(
