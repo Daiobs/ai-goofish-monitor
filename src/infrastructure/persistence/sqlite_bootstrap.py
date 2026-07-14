@@ -8,6 +8,7 @@ import json
 import threading
 from pathlib import Path
 
+from src.keyword_rule_engine import build_search_text, normalize_text
 from src.infrastructure.persistence.sqlite_connection import (
     assign_legacy_task_ownership,
     init_schema,
@@ -321,14 +322,15 @@ def _insert_result_record(
         keyword_hit_count = int(keyword_hit_count)
     except (TypeError, ValueError):
         keyword_hit_count = 0
+    search_text = normalize_text(build_search_text(record))
 
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO result_items (
             result_filename, keyword, task_name, crawl_time, publish_time, price,
             price_display, item_id, title, link, link_unique_key, seller_nickname,
-            is_recommended, analysis_source, keyword_hit_count, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_recommended, analysis_source, keyword_hit_count, search_text, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             result_filename,
@@ -346,6 +348,7 @@ def _insert_result_record(
             _as_int(analysis.get("is_recommended", False)),
             analysis.get("analysis_source"),
             keyword_hit_count,
+            search_text,
             json.dumps(record, ensure_ascii=False),
         ),
     )

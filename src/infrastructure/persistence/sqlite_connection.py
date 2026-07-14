@@ -7,15 +7,20 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
+from src.keyword_rule_engine import build_search_text, normalize_text
 from src.infrastructure.persistence.storage_names import (
     DEFAULT_DATABASE_PATH,
     build_legacy_result_filename,
     build_result_filename,
 )
-from src.services.result_blacklist_service import normalize_blacklist_keywords
+from src.services.result_blacklist_service import (
+    match_blacklist_search_text,
+    normalize_blacklist_keywords,
+)
 
 
 BUSY_TIMEOUT_MS = 5000
@@ -72,6 +77,7 @@ SCHEMA_STATEMENTS = (
         analysis_source TEXT,
         keyword_hit_count INTEGER NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
+        search_text TEXT NOT NULL DEFAULT '',
         raw_json TEXT NOT NULL
     )
     """,
@@ -151,6 +157,7 @@ SCHEMA_STATEMENTS = (
 
 TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
 RESULT_STATUS_MIGRATION_KEY = "migration:result_items_status"
+RESULT_SEARCH_TEXT_MIGRATION_KEY = "migration:result_search_text_v1"
 RESULT_STATUS_INDEX_NAME = "idx_results_filename_status_crawl"
 TASK_OWNED_DATA_MIGRATION_KEY = "migration:task_owned_results_v1"
 TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY = (
@@ -161,6 +168,101 @@ LEGACY_RESULT_NAMESPACE_MIGRATION_KEY = (
 )
 LEGACY_RESULT_ITEMS_UNIQUE = ("result_filename", "link_unique_key")
 LEGACY_PRICE_SNAPSHOTS_UNIQUE = ("keyword_slug", "run_id", "item_id")
+PAGINATION_INDEX_STATEMENTS = (
+    (
+        "idx_result_items_task_status_crawl",
+        """
+        CREATE INDEX idx_result_items_task_status_crawl
+        ON result_items(
+            task_id, status, crawl_time DESC, id DESC
+        ) WHERE task_id IS NOT NULL
+        """,
+    ),
+    (
+        "idx_result_items_task_status_publish",
+        """
+        CREATE INDEX idx_result_items_task_status_publish
+        ON result_items(
+            task_id, status, COALESCE(publish_time, '') DESC, id DESC
+        ) WHERE task_id IS NOT NULL
+        """,
+    ),
+    (
+        "idx_result_items_task_status_price",
+        """
+        CREATE INDEX idx_result_items_task_status_price
+        ON result_items(
+            task_id, status, COALESCE(price, 0) DESC, id DESC
+        ) WHERE task_id IS NOT NULL
+        """,
+    ),
+    (
+        "idx_result_items_task_status_keyword_hit_count",
+        """
+        CREATE INDEX idx_result_items_task_status_keyword_hit_count
+        ON result_items(
+            task_id, status, keyword_hit_count DESC, id DESC
+        ) WHERE task_id IS NOT NULL
+        """,
+    ),
+    (
+        "idx_result_items_task_status_recommended",
+        """
+        CREATE INDEX idx_result_items_task_status_recommended
+        ON result_items(
+            task_id, status, is_recommended, analysis_source,
+            crawl_time DESC, id DESC
+        ) WHERE task_id IS NOT NULL
+        """,
+    ),
+    (
+        "idx_result_items_legacy_status_crawl",
+        """
+        CREATE INDEX idx_result_items_legacy_status_crawl
+        ON result_items(
+            result_filename, status, crawl_time DESC, id DESC
+        ) WHERE task_id IS NULL
+        """,
+    ),
+    (
+        "idx_result_items_legacy_status_publish",
+        """
+        CREATE INDEX idx_result_items_legacy_status_publish
+        ON result_items(
+            result_filename, status, COALESCE(publish_time, '') DESC, id DESC
+        ) WHERE task_id IS NULL
+        """,
+    ),
+    (
+        "idx_result_items_legacy_status_price",
+        """
+        CREATE INDEX idx_result_items_legacy_status_price
+        ON result_items(
+            result_filename, status, COALESCE(price, 0) DESC, id DESC
+        ) WHERE task_id IS NULL
+        """,
+    ),
+    (
+        "idx_result_items_legacy_status_keyword_hit_count",
+        """
+        CREATE INDEX idx_result_items_legacy_status_keyword_hit_count
+        ON result_items(
+            result_filename, status, keyword_hit_count DESC, id DESC
+        ) WHERE task_id IS NULL
+        """,
+    ),
+    (
+        "idx_result_items_legacy_status_recommended",
+        """
+        CREATE INDEX idx_result_items_legacy_status_recommended
+        ON result_items(
+            result_filename, status, is_recommended, analysis_source,
+            crawl_time DESC, id DESC
+        ) WHERE task_id IS NULL
+        """,
+    ),
+)
+PAGINATION_INDEXES = {name for name, _ in PAGINATION_INDEX_STATEMENTS}
 TASK_OWNED_INDEXES = {
     "idx_result_items_task_link_unique",
     "idx_result_items_legacy_file_link_unique",
@@ -168,6 +270,7 @@ TASK_OWNED_INDEXES = {
     "idx_price_snapshots_task_run_item_unique",
     "idx_price_snapshots_legacy_run_item_unique",
     "idx_price_snapshots_task_time",
+    *PAGINATION_INDEXES,
 }
 REQUIRED_TABLES = {
     "app_metadata",
@@ -223,6 +326,47 @@ def _prepare_database_file(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+@lru_cache(maxsize=128)
+def _parse_blacklist_rules_json(rules_json: str) -> tuple[str, ...] | None:
+    try:
+        decoded = json.loads(rules_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if decoded is None:
+        return ()
+    if not isinstance(decoded, (list, str)):
+        return None
+    return tuple(normalize_blacklist_keywords(decoded))
+
+
+def _result_blacklist_match(search_text, rules_json) -> int:
+    """SQLite adapter: malformed inputs and unexpected failures hide the row."""
+    try:
+        if rules_json is None:
+            return 0
+        rules_text = str(rules_json).strip()
+        if rules_text in {"", "[]", "null"}:
+            return 0
+        keywords = _parse_blacklist_rules_json(rules_text)
+        if keywords is None:
+            return 1
+        if not keywords:
+            return 0
+        matched = match_blacklist_search_text(str(search_text or ""), keywords)
+        return 1 if matched else 0
+    except Exception:
+        return 1
+
+
+def _register_sqlite_functions(conn: sqlite3.Connection) -> None:
+    conn.create_function(
+        "result_blacklist_match",
+        2,
+        _result_blacklist_match,
+        deterministic=True,
+    )
+
+
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -249,6 +393,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _migrate_tasks_autoincrement(conn)
         _migrate_result_items_status(conn)
         _migrate_task_owned_data(conn)
+        _migrate_result_search_text(conn)
         migrate_task_owned_blacklist_rules(conn)
         migrate_legacy_result_filename_namespace(conn)
         conn.commit()
@@ -280,7 +425,7 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(price_snapshots)").fetchall()
     }
-    if "status" not in result_columns or "task_id" not in result_columns:
+    if not {"status", "task_id", "search_text"}.issubset(result_columns):
         return False
     if "task_id" not in snapshot_columns:
         return False
@@ -298,10 +443,11 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
 
     migration_rows = conn.execute(
-        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?, ?, ?)",
+        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?, ?, ?, ?)",
         (
             TASK_IDENTITY_MIGRATION_KEY,
             RESULT_STATUS_MIGRATION_KEY,
+            RESULT_SEARCH_TEXT_MIGRATION_KEY,
             TASK_OWNED_DATA_MIGRATION_KEY,
             TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,
             LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
@@ -311,6 +457,7 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     return completed == {
         TASK_IDENTITY_MIGRATION_KEY,
         RESULT_STATUS_MIGRATION_KEY,
+        RESULT_SEARCH_TEXT_MIGRATION_KEY,
         TASK_OWNED_DATA_MIGRATION_KEY,
         TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,
         LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
@@ -444,6 +591,61 @@ def _write_result_status_migration_marker(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, 'done')",
         (RESULT_STATUS_MIGRATION_KEY,),
+    )
+
+
+def _migrate_result_search_text(conn: sqlite3.Connection) -> None:
+    """Add and backfill normalized blacklist-search text without touching raw JSON."""
+    columns = _table_columns(conn, "result_items")
+    marker = conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = ?",
+        (RESULT_SEARCH_TEXT_MIGRATION_KEY,),
+    ).fetchone()
+    if "search_text" in columns and marker is not None:
+        return
+
+    if "search_text" not in columns:
+        conn.execute(
+            "ALTER TABLE result_items "
+            "ADD COLUMN search_text TEXT NOT NULL DEFAULT ''"
+        )
+
+    stats = {"rows": 0, "invalid_json": 0}
+    cursor = conn.execute("SELECT id, raw_json FROM result_items ORDER BY id")
+    while True:
+        rows = cursor.fetchmany(500)
+        if not rows:
+            break
+        updates: list[tuple[str, int]] = []
+        for row in rows:
+            stats["rows"] += 1
+            try:
+                record = json.loads(row["raw_json"])
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                stats["invalid_json"] += 1
+                search_text = ""
+            else:
+                if not isinstance(record, dict):
+                    stats["invalid_json"] += 1
+                    search_text = ""
+                else:
+                    try:
+                        search_text = normalize_text(build_search_text(record))
+                    except AttributeError:
+                        stats["invalid_json"] += 1
+                        search_text = ""
+            updates.append((search_text, int(row["id"])))
+        conn.executemany(
+            "UPDATE result_items SET search_text = ? WHERE id = ?",
+            updates,
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, ?)",
+        (
+            RESULT_SEARCH_TEXT_MIGRATION_KEY,
+            json.dumps(stats, sort_keys=True, separators=(",", ":")),
+        ),
     )
 
 
@@ -927,6 +1129,7 @@ def _rebuild_result_items_for_task_ownership(conn: sqlite3.Connection) -> bool:
             analysis_source TEXT,
             keyword_hit_count INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
+            search_text TEXT NOT NULL DEFAULT '',
             raw_json TEXT NOT NULL
         )
         """
@@ -948,18 +1151,23 @@ def _copy_result_items_for_task_ownership(
     conn: sqlite3.Connection,
     task_id_expression: str,
 ) -> None:
+    source_columns = _table_columns(conn, "result_items")
+    search_text_expression = (
+        "COALESCE(search_text, '')" if "search_text" in source_columns else "''"
+    )
     conn.execute(
         f"""
         INSERT INTO result_items__task_owner_migration (
             id, task_id, result_filename, keyword, task_name, crawl_time,
             publish_time, price, price_display, item_id, title, link,
             link_unique_key, seller_nickname, is_recommended, analysis_source,
-            keyword_hit_count, status, raw_json
+            keyword_hit_count, status, search_text, raw_json
         )
         SELECT id, {task_id_expression}, result_filename, keyword, task_name,
                crawl_time, publish_time, price, price_display, item_id, title,
                link, link_unique_key, seller_nickname, is_recommended,
-               analysis_source, keyword_hit_count, status, raw_json
+               analysis_source, keyword_hit_count, status,
+               {search_text_expression}, raw_json
         FROM result_items
         """
     )
@@ -1043,6 +1251,7 @@ def _ensure_task_owned_indexes(conn: sqlite3.Connection) -> None:
         ("idx_result_items_task_link_unique", "CREATE UNIQUE INDEX idx_result_items_task_link_unique ON result_items(task_id, link_unique_key) WHERE task_id IS NOT NULL"),
         ("idx_result_items_legacy_file_link_unique", "CREATE UNIQUE INDEX idx_result_items_legacy_file_link_unique ON result_items(result_filename, link_unique_key) WHERE task_id IS NULL"),
         ("idx_result_items_task_crawl", "CREATE INDEX idx_result_items_task_crawl ON result_items(task_id, crawl_time DESC)"),
+        *PAGINATION_INDEX_STATEMENTS,
         ("idx_snapshots_keyword_time", "CREATE INDEX idx_snapshots_keyword_time ON price_snapshots(keyword_slug, snapshot_time DESC)"),
         ("idx_snapshots_keyword_item_time", "CREATE INDEX idx_snapshots_keyword_item_time ON price_snapshots(keyword_slug, item_id, snapshot_time DESC)"),
         ("idx_price_snapshots_task_run_item_unique", "CREATE UNIQUE INDEX idx_price_snapshots_task_run_item_unique ON price_snapshots(task_id, run_id, item_id) WHERE task_id IS NOT NULL"),
@@ -1111,6 +1320,7 @@ def sqlite_connection(
         conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
+        _register_sqlite_functions(conn)
         if read_only:
             _apply_read_only_pragmas(conn)
         else:

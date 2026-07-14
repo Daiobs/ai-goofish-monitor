@@ -64,13 +64,27 @@ def _keyword_matches(keyword: str, normalized_text: str) -> bool:
     return re.search(pattern, normalized_text) is not None
 
 
-def match_blacklist_keywords(record: dict[str, Any], keywords: Iterable[str] | str | None) -> list[str]:
+def match_blacklist_search_text(
+    normalized_search_text: str,
+    keywords: Iterable[str] | str | None,
+) -> list[str]:
     normalized_keywords = normalize_blacklist_keywords(keywords)
     if not normalized_keywords:
         return []
 
-    search_text = normalize_text(build_search_text(record))
-    if not search_text:
+    if not normalized_search_text:
         return []
 
-    return [keyword for keyword in normalized_keywords if _keyword_matches(keyword, search_text)]
+    return [
+        keyword
+        for keyword in normalized_keywords
+        if _keyword_matches(keyword, normalized_search_text)
+    ]
+
+
+def match_blacklist_keywords(
+    record: dict[str, Any],
+    keywords: Iterable[str] | str | None,
+) -> list[str]:
+    search_text = normalize_text(build_search_text(record))
+    return match_blacklist_search_text(search_text, keywords)
