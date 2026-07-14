@@ -1,16 +1,19 @@
-"""
-结果数据的 SQLite 读写服务。
-"""
+"""Task-owned and legacy-compatible SQLite result storage."""
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from datetime import datetime
 
 from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
 from src.infrastructure.persistence.sqlite_connection import sqlite_connection
-from src.infrastructure.persistence.storage_names import build_result_filename
+from src.infrastructure.persistence.storage_names import (
+    build_result_filename,
+    build_task_result_filename,
+    try_parse_task_result_filename,
+)
 from src.services.price_history_service import parse_price_value
 from src.services.result_blacklist_service import (
     match_blacklist_keywords,
@@ -24,6 +27,12 @@ SORT_COLUMN_MAP = {
     "price": "COALESCE(price, 0)",
     "keyword_hit_count": "keyword_hit_count",
 }
+VALID_ITEM_STATUSES = {"active", "hidden", "expired"}
+
+
+def _normalize_task_id(task_id: int) -> int:
+    build_task_result_filename(task_id)
+    return int(task_id)
 
 
 def _get_link_unique_key(link: str) -> str:
@@ -47,40 +56,53 @@ def _parse_raw_record(raw_json: str, *, status: str | None = None) -> dict:
     return record
 
 
+def _ownership_clause(
+    *,
+    task_id: int | None = None,
+    filename: str | None = None,
+) -> tuple[str, list, int | None]:
+    if task_id is not None:
+        normalized = _normalize_task_id(task_id)
+        return "task_id = ?", [normalized], normalized
+    if filename is None:
+        raise ValueError("task_id or filename is required")
+    parsed_task_id = try_parse_task_result_filename(filename)
+    if parsed_task_id is not None:
+        return "task_id = ?", [parsed_task_id], parsed_task_id
+    return "task_id IS NULL AND result_filename = ?", [filename], None
+
+
 def _build_query_conditions(
     *,
-    filename: str,
+    task_id: int | None = None,
+    filename: str | None = None,
     ai_recommended_only: bool,
     keyword_recommended_only: bool,
-) -> tuple[str, list]:
-    conditions = ["result_filename = ?"]
-    params: list = [filename]
+) -> tuple[str, list, int | None]:
+    ownership, params, resolved_task_id = _ownership_clause(
+        task_id=task_id,
+        filename=filename,
+    )
+    conditions = [ownership]
     if ai_recommended_only:
-        conditions.append("is_recommended = 1")
-        conditions.append("analysis_source = ?")
+        conditions.extend(("is_recommended = 1", "analysis_source = ?"))
         params.append("ai")
     if keyword_recommended_only:
-        conditions.append("is_recommended = 1")
-        conditions.append("analysis_source = ?")
+        conditions.extend(("is_recommended = 1", "analysis_source = ?"))
         params.append("keyword")
-    return " AND ".join(conditions), params
+    return " AND ".join(conditions), params, resolved_task_id
 
 
 def _sort_expression(sort_by: str, sort_order: str) -> str:
     column = SORT_COLUMN_MAP.get(sort_by, SORT_COLUMN_MAP["crawl_time"])
     direction = "ASC" if sort_order == "asc" else "DESC"
-    return f"(CASE WHEN status = 'active' THEN 0 ELSE 1 END), {column} {direction}, id {direction}"
+    return (
+        "(CASE WHEN status = 'active' THEN 0 ELSE 1 END), "
+        f"{column} {direction}, id {direction}"
+    )
 
 
-def _load_blacklist_keywords_from_conn(conn, filename: str) -> list[str]:
-    row = conn.execute(
-        """
-        SELECT blacklist_keywords_json
-        FROM result_blacklist_rules
-        WHERE result_filename = ?
-        """,
-        (filename,),
-    ).fetchone()
+def _decode_blacklist_payload(row) -> list[str]:
     if row is None:
         return []
     try:
@@ -90,7 +112,33 @@ def _load_blacklist_keywords_from_conn(conn, filename: str) -> list[str]:
     return normalize_blacklist_keywords(payload)
 
 
-def _decorate_record_visibility(record: dict, status: str | None, blacklist_keywords: list[str]) -> dict:
+def _load_blacklist_keywords_from_conn(
+    conn,
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> list[str]:
+    _, _, resolved_task_id = _ownership_clause(task_id=task_id, filename=filename)
+    if resolved_task_id is not None:
+        row = conn.execute(
+            "SELECT blacklist_keywords_json FROM task_result_blacklist_rules "
+            "WHERE task_id = ?",
+            (resolved_task_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT blacklist_keywords_json FROM result_blacklist_rules "
+            "WHERE result_filename = ?",
+            (filename,),
+        ).fetchone()
+    return _decode_blacklist_payload(row)
+
+
+def _decorate_record_visibility(
+    record: dict,
+    status: str | None,
+    blacklist_keywords: list[str],
+) -> dict:
     matched_keywords = match_blacklist_keywords(record, blacklist_keywords)
     hidden_reason = None
     if status == "expired":
@@ -107,76 +155,88 @@ def _decorate_record_visibility(record: dict, status: str | None, blacklist_keyw
     return record
 
 
-def _is_record_visible(record: dict) -> bool:
-    return record.get("_effective_hidden") is not True
-
-
 def _load_filtered_records_from_conn(
     conn,
     *,
-    filename: str,
+    filename: str | None = None,
+    task_id: int | None = None,
     ai_recommended_only: bool,
     keyword_recommended_only: bool,
     sort_by: str,
     sort_order: str,
     include_hidden: bool,
 ) -> list[dict]:
-    where_clause, params = _build_query_conditions(
+    where_clause, params, resolved_task_id = _build_query_conditions(
+        task_id=task_id,
         filename=filename,
         ai_recommended_only=ai_recommended_only,
         keyword_recommended_only=keyword_recommended_only,
     )
-    order_clause = _sort_expression(sort_by, sort_order)
     rows = conn.execute(
-        f"""
-        SELECT raw_json, status
-        FROM result_items
-        WHERE {where_clause}
-        ORDER BY {order_clause}
-        """,
+        f"SELECT raw_json, status FROM result_items WHERE {where_clause} "
+        f"ORDER BY {_sort_expression(sort_by, sort_order)}",
         tuple(params),
     ).fetchall()
-    blacklist_keywords = _load_blacklist_keywords_from_conn(conn, filename)
+    blacklist_keywords = _load_blacklist_keywords_from_conn(
+        conn,
+        task_id=resolved_task_id,
+        filename=filename if resolved_task_id is None else None,
+    )
 
     records: list[dict] = []
     for row in rows:
         record = _parse_raw_record(str(row["raw_json"]), status=row["status"])
-        decorated = _decorate_record_visibility(record, row["status"], blacklist_keywords)
-        if include_hidden or _is_record_visible(decorated):
+        decorated = _decorate_record_visibility(
+            record,
+            row["status"],
+            blacklist_keywords,
+        )
+        if include_hidden or decorated.get("_effective_hidden") is not True:
             records.append(decorated)
     return records
 
 
-async def save_result_record(record: dict, keyword: str) -> bool:
-    return await asyncio.to_thread(_save_result_record_sync, record, keyword)
-
-
-def _save_result_record_sync(record: dict, keyword: str) -> bool:
+def _save_result_record_sync(
+    record: dict,
+    keyword: str,
+    task_id: int | None,
+) -> bool:
     bootstrap_sqlite_storage()
-    item = record.get("商品信息", {}) or {}
-    analysis = record.get("ai_analysis", {}) or {}
+    payload = copy.deepcopy(record)
+    if task_id is not None:
+        task_id = _normalize_task_id(task_id)
+        payload["任务ID"] = task_id
+        result_filename = build_task_result_filename(task_id)
+    else:
+        result_filename = build_result_filename(keyword)
+
+    item = payload.get("商品信息", {}) or {}
+    analysis = payload.get("ai_analysis", {}) or {}
     link = str(item.get("商品链接") or "")
-    link_unique_key = _get_link_unique_key(link) if link else _fallback_unique_key(record, item)
-    keyword_hit_count = analysis.get("keyword_hit_count", 0)
+    link_unique_key = (
+        _get_link_unique_key(link) if link else _fallback_unique_key(payload, item)
+    )
     try:
-        keyword_hit_count = int(keyword_hit_count)
+        keyword_hit_count = int(analysis.get("keyword_hit_count", 0))
     except (TypeError, ValueError):
         keyword_hit_count = 0
 
     with sqlite_connection() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT OR IGNORE INTO result_items (
-                result_filename, keyword, task_name, crawl_time, publish_time, price,
-                price_display, item_id, title, link, link_unique_key, seller_nickname,
-                is_recommended, analysis_source, keyword_hit_count, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                task_id, result_filename, keyword, task_name, crawl_time,
+                publish_time, price, price_display, item_id, title, link,
+                link_unique_key, seller_nickname, is_recommended,
+                analysis_source, keyword_hit_count, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                build_result_filename(keyword),
-                record.get("搜索关键字", keyword),
-                record.get("任务名称", ""),
-                record.get("爬取时间", ""),
+                task_id,
+                result_filename,
+                payload.get("搜索关键字", keyword),
+                payload.get("任务名称", ""),
+                payload.get("爬取时间", ""),
                 item.get("发布时间"),
                 parse_price_value(item.get("当前售价")),
                 item.get("当前售价"),
@@ -184,24 +244,52 @@ def _save_result_record_sync(record: dict, keyword: str) -> bool:
                 item.get("商品标题"),
                 link,
                 link_unique_key,
-                (record.get("卖家信息", {}) or {}).get("卖家昵称") or item.get("卖家昵称"),
+                (payload.get("卖家信息", {}) or {}).get("卖家昵称")
+                or item.get("卖家昵称"),
                 1 if analysis.get("is_recommended") else 0,
                 analysis.get("analysis_source"),
                 keyword_hit_count,
-                json.dumps(record, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
             ),
         )
         conn.commit()
-    return True
+    return int(cursor.rowcount or 0) > 0
+
+
+async def save_result_record(record: dict, keyword: str) -> bool:
+    """Write a legacy result with NULL task ownership."""
+    return await asyncio.to_thread(_save_result_record_sync, record, keyword, None)
+
+
+async def save_task_result_record(record: dict, keyword: str, task_id: int) -> bool:
+    return await asyncio.to_thread(
+        _save_result_record_sync,
+        record,
+        keyword,
+        _normalize_task_id(task_id),
+    )
 
 
 def load_processed_link_keys(keyword: str) -> set[str]:
+    """Load only legacy processed links for a keyword-owned config task."""
     bootstrap_sqlite_storage()
     filename = build_result_filename(keyword)
     with sqlite_connection() as conn:
         rows = conn.execute(
-            "SELECT link_unique_key FROM result_items WHERE result_filename = ?",
+            "SELECT link_unique_key FROM result_items "
+            "WHERE task_id IS NULL AND result_filename = ?",
             (filename,),
+        ).fetchall()
+    return {str(row["link_unique_key"]) for row in rows if row["link_unique_key"]}
+
+
+def load_task_processed_link_keys(task_id: int) -> set[str]:
+    bootstrap_sqlite_storage()
+    normalized = _normalize_task_id(task_id)
+    with sqlite_connection() as conn:
+        rows = conn.execute(
+            "SELECT link_unique_key FROM result_items WHERE task_id = ?",
+            (normalized,),
         ).fetchall()
     return {str(row["link_unique_key"]) for row in rows if row["link_unique_key"]}
 
@@ -215,70 +303,68 @@ def _list_result_filenames_sync() -> list[str]:
     with sqlite_connection() as conn:
         rows = conn.execute(
             """
-            SELECT result_filename, MAX(crawl_time) AS latest_crawl_time
+            SELECT task_id, result_filename, MAX(crawl_time) AS latest_crawl_time
             FROM result_items
-            GROUP BY result_filename
-            ORDER BY latest_crawl_time DESC, result_filename DESC
+            GROUP BY task_id,
+                     CASE WHEN task_id IS NULL THEN result_filename ELSE '' END
+            ORDER BY latest_crawl_time DESC
             """
         ).fetchall()
-    return [str(row["result_filename"]) for row in rows]
+    return [
+        build_task_result_filename(int(row["task_id"]))
+        if row["task_id"] is not None
+        else str(row["result_filename"])
+        for row in rows
+    ]
 
 
-async def result_file_exists(filename: str) -> bool:
-    return await asyncio.to_thread(_result_file_exists_sync, filename)
-
-
-def _result_file_exists_sync(filename: str) -> bool:
+def _result_exists_sync(*, filename: str | None = None, task_id: int | None = None) -> bool:
     bootstrap_sqlite_storage()
+    clause, params, _ = _ownership_clause(task_id=task_id, filename=filename)
     with sqlite_connection() as conn:
         row = conn.execute(
-            "SELECT 1 FROM result_items WHERE result_filename = ? LIMIT 1",
-            (filename,),
+            f"SELECT 1 FROM result_items WHERE {clause} LIMIT 1",
+            tuple(params),
         ).fetchone()
     return row is not None
 
 
-async def delete_result_file_records(filename: str) -> int:
-    return await asyncio.to_thread(_delete_result_file_records_sync, filename)
+async def result_file_exists(filename: str) -> bool:
+    return await asyncio.to_thread(_result_exists_sync, filename=filename)
 
 
-def _delete_result_file_records_sync(filename: str) -> int:
+async def task_result_records_exist(task_id: int) -> bool:
+    return await asyncio.to_thread(_result_exists_sync, task_id=task_id)
+
+
+def _delete_result_records_sync(
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> int:
     bootstrap_sqlite_storage()
+    clause, params, _ = _ownership_clause(task_id=task_id, filename=filename)
     with sqlite_connection() as conn:
         cursor = conn.execute(
-            "DELETE FROM result_items WHERE result_filename = ?",
-            (filename,),
+            f"DELETE FROM result_items WHERE {clause}",
+            tuple(params),
         )
         conn.commit()
     return int(cursor.rowcount or 0)
 
 
-async def query_result_records(
-    filename: str,
+async def delete_result_file_records(filename: str) -> int:
+    return await asyncio.to_thread(_delete_result_records_sync, filename=filename)
+
+
+async def delete_task_result_records(task_id: int) -> int:
+    return await asyncio.to_thread(_delete_result_records_sync, task_id=task_id)
+
+
+def _query_records_sync(
     *,
-    ai_recommended_only: bool,
-    keyword_recommended_only: bool,
-    sort_by: str,
-    sort_order: str,
-    page: int,
-    limit: int,
-    include_hidden: bool = False,
-) -> tuple[int, list[dict]]:
-    return await asyncio.to_thread(
-        _query_result_records_sync,
-        filename,
-        ai_recommended_only,
-        keyword_recommended_only,
-        sort_by,
-        sort_order,
-        page,
-        limit,
-        include_hidden,
-    )
-
-
-def _query_result_records_sync(
-    filename: str,
+    filename: str | None,
+    task_id: int | None,
     ai_recommended_only: bool,
     keyword_recommended_only: bool,
     sort_by: str,
@@ -288,11 +374,11 @@ def _query_result_records_sync(
     include_hidden: bool,
 ) -> tuple[int, list[dict]]:
     bootstrap_sqlite_storage()
-    offset = max(page - 1, 0) * limit
     with sqlite_connection() as conn:
         records = _load_filtered_records_from_conn(
             conn,
             filename=filename,
+            task_id=task_id,
             ai_recommended_only=ai_recommended_only,
             keyword_recommended_only=keyword_recommended_only,
             sort_by=sort_by,
@@ -300,31 +386,32 @@ def _query_result_records_sync(
             include_hidden=include_hidden,
         )
     total = len(records)
-    return total, records[offset: offset + limit]
+    offset = max(page - 1, 0) * limit
+    return total, records[offset : offset + limit]
 
 
-async def load_all_result_records(
-    filename: str,
-    *,
-    ai_recommended_only: bool,
-    keyword_recommended_only: bool,
-    sort_by: str,
-    sort_order: str,
-    include_hidden: bool = False,
-) -> list[dict]:
+async def query_result_records(filename: str, **kwargs) -> tuple[int, list[dict]]:
     return await asyncio.to_thread(
-        _load_all_result_records_sync,
-        filename,
-        ai_recommended_only,
-        keyword_recommended_only,
-        sort_by,
-        sort_order,
-        include_hidden,
+        _query_records_sync,
+        filename=filename,
+        task_id=None,
+        **kwargs,
     )
 
 
-def _load_all_result_records_sync(
-    filename: str,
+async def query_task_result_records(task_id: int, **kwargs) -> tuple[int, list[dict]]:
+    return await asyncio.to_thread(
+        _query_records_sync,
+        filename=None,
+        task_id=_normalize_task_id(task_id),
+        **kwargs,
+    )
+
+
+def _load_all_records_sync(
+    *,
+    filename: str | None,
+    task_id: int | None,
     ai_recommended_only: bool,
     keyword_recommended_only: bool,
     sort_by: str,
@@ -336,6 +423,7 @@ def _load_all_result_records_sync(
         return _load_filtered_records_from_conn(
             conn,
             filename=filename,
+            task_id=task_id,
             ai_recommended_only=ai_recommended_only,
             keyword_recommended_only=keyword_recommended_only,
             sort_by=sort_by,
@@ -344,132 +432,262 @@ def _load_all_result_records_sync(
         )
 
 
-async def build_result_ndjson(filename: str) -> str:
-    return await asyncio.to_thread(_build_result_ndjson_sync, filename)
+async def load_all_result_records(filename: str, **kwargs) -> list[dict]:
+    return await asyncio.to_thread(
+        _load_all_records_sync,
+        filename=filename,
+        task_id=None,
+        **kwargs,
+    )
 
 
-def _build_result_ndjson_sync(filename: str) -> str:
+async def load_all_task_result_records(task_id: int, **kwargs) -> list[dict]:
+    return await asyncio.to_thread(
+        _load_all_records_sync,
+        filename=None,
+        task_id=_normalize_task_id(task_id),
+        **kwargs,
+    )
+
+
+def _build_ndjson_sync(
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> str:
     bootstrap_sqlite_storage()
+    clause, params, _ = _ownership_clause(task_id=task_id, filename=filename)
     with sqlite_connection() as conn:
         rows = conn.execute(
-            "SELECT raw_json FROM result_items WHERE result_filename = ? ORDER BY id ASC",
-            (filename,),
+            f"SELECT raw_json FROM result_items WHERE {clause} ORDER BY id ASC",
+            tuple(params),
         ).fetchall()
     return "\n".join(str(row["raw_json"]) for row in rows)
 
 
-async def load_result_summary(filename: str) -> dict | None:
-    return await asyncio.to_thread(_load_result_summary_sync, filename)
+async def build_result_ndjson(filename: str) -> str:
+    return await asyncio.to_thread(_build_ndjson_sync, filename=filename)
 
 
-def _load_result_summary_sync(filename: str) -> dict | None:
-    bootstrap_sqlite_storage()
-    with sqlite_connection() as conn:
-        visible_records = _load_filtered_records_from_conn(
-            conn,
-            filename=filename,
-            ai_recommended_only=False,
-            keyword_recommended_only=False,
-            sort_by="crawl_time",
-            sort_order="desc",
-            include_hidden=False,
-        )
+async def build_task_result_ndjson(task_id: int) -> str:
+    return await asyncio.to_thread(_build_ndjson_sync, task_id=task_id)
+
+
+def _summarize_visible_records(visible_records: list[dict]) -> dict | None:
     if not visible_records:
         return None
-
-    recommended_records = [
+    recommended = [
         record
         for record in visible_records
         if (record.get("ai_analysis", {}) or {}).get("is_recommended") is True
     ]
-    ai_recommended_items = 0
-    keyword_recommended_items = 0
-    for record in recommended_records:
-        source = (record.get("ai_analysis", {}) or {}).get("analysis_source")
-        if source == "ai":
-            ai_recommended_items += 1
-        elif source == "keyword":
-            keyword_recommended_items += 1
-
+    ai_count = sum(
+        1
+        for record in recommended
+        if (record.get("ai_analysis", {}) or {}).get("analysis_source") == "ai"
+    )
+    keyword_count = sum(
+        1
+        for record in recommended
+        if (record.get("ai_analysis", {}) or {}).get("analysis_source") == "keyword"
+    )
     return {
         "total_items": len(visible_records),
-        "recommended_items": len(recommended_records),
-        "ai_recommended_items": ai_recommended_items,
-        "keyword_recommended_items": keyword_recommended_items,
+        "recommended_items": len(recommended),
+        "ai_recommended_items": ai_count,
+        "keyword_recommended_items": keyword_count,
         "latest_crawl_time": visible_records[0].get("爬取时间"),
         "latest_record": visible_records[0],
-        "latest_recommendation": recommended_records[0] if recommended_records else None,
+        "latest_recommendation": recommended[0] if recommended else None,
     }
 
 
-async def update_item_status(filename: str, item_id: str, status: str) -> bool:
-    valid = {"active", "hidden", "expired"}
-    if status not in valid:
-        raise ValueError(f"status must be one of {valid}")
-    return await asyncio.to_thread(_update_item_status_sync, filename, item_id, status)
+def _load_summary_sync(
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> dict | None:
+    records = _load_all_records_sync(
+        filename=filename,
+        task_id=task_id,
+        ai_recommended_only=False,
+        keyword_recommended_only=False,
+        sort_by="crawl_time",
+        sort_order="desc",
+        include_hidden=False,
+    )
+    return _summarize_visible_records(records)
 
 
-def _update_item_status_sync(filename: str, item_id: str, status: str) -> bool:
+async def load_result_summary(filename: str) -> dict | None:
+    return await asyncio.to_thread(_load_summary_sync, filename=filename)
+
+
+async def load_task_result_summary(task_id: int) -> dict | None:
+    return await asyncio.to_thread(_load_summary_sync, task_id=task_id)
+
+
+def _update_item_status_sync(
+    *,
+    item_id: str,
+    status: str,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> bool:
+    if status not in VALID_ITEM_STATUSES:
+        raise ValueError(f"status must be one of {VALID_ITEM_STATUSES}")
     bootstrap_sqlite_storage()
+    clause, params, _ = _ownership_clause(task_id=task_id, filename=filename)
     with sqlite_connection() as conn:
         cursor = conn.execute(
-            "UPDATE result_items SET status = ? WHERE result_filename = ? AND item_id = ?",
-            (status, filename, item_id),
+            f"UPDATE result_items SET status = ? WHERE {clause} AND item_id = ?",
+            (status, *params, item_id),
         )
         conn.commit()
-        return cursor.rowcount > 0
+    return int(cursor.rowcount or 0) > 0
+
+
+async def update_item_status(filename: str, item_id: str, status: str) -> bool:
+    return await asyncio.to_thread(
+        _update_item_status_sync,
+        filename=filename,
+        item_id=item_id,
+        status=status,
+    )
+
+
+async def update_task_result_item_status(
+    task_id: int,
+    item_id: str,
+    status: str,
+) -> bool:
+    return await asyncio.to_thread(
+        _update_item_status_sync,
+        task_id=task_id,
+        item_id=item_id,
+        status=status,
+    )
+
+
+def _load_blacklist_sync(
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> list[str]:
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        return _load_blacklist_keywords_from_conn(
+            conn,
+            filename=filename,
+            task_id=task_id,
+        )
 
 
 async def load_result_blacklist_keywords(filename: str) -> list[str]:
-    return await asyncio.to_thread(_load_result_blacklist_keywords_sync, filename)
+    return await asyncio.to_thread(_load_blacklist_sync, filename=filename)
 
 
-def _load_result_blacklist_keywords_sync(filename: str) -> list[str]:
+async def load_task_result_blacklist_keywords(task_id: int) -> list[str]:
+    return await asyncio.to_thread(_load_blacklist_sync, task_id=task_id)
+
+
+def _save_blacklist_sync(
+    keywords: list[str],
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> list[str]:
     bootstrap_sqlite_storage()
-    with sqlite_connection() as conn:
-        return _load_blacklist_keywords_from_conn(conn, filename)
-
-
-async def save_result_blacklist_keywords(filename: str, keywords: list[str]) -> list[str]:
-    return await asyncio.to_thread(_save_result_blacklist_keywords_sync, filename, keywords)
-
-
-def _save_result_blacklist_keywords_sync(filename: str, keywords: list[str]) -> list[str]:
-    bootstrap_sqlite_storage()
-    normalized_keywords = normalize_blacklist_keywords(keywords)
+    normalized = normalize_blacklist_keywords(keywords)
     now = datetime.now().isoformat()
+    _, _, resolved_task_id = _ownership_clause(task_id=task_id, filename=filename)
     with sqlite_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO result_blacklist_rules (
-                result_filename, blacklist_keywords_json, updated_at
-            ) VALUES (?, ?, ?)
-            ON CONFLICT(result_filename) DO UPDATE SET
-                blacklist_keywords_json = excluded.blacklist_keywords_json,
-                updated_at = excluded.updated_at
-            """,
-            (filename, json.dumps(normalized_keywords, ensure_ascii=False), now),
+        if resolved_task_id is not None:
+            conn.execute(
+                """
+                INSERT INTO task_result_blacklist_rules (
+                    task_id, blacklist_keywords_json, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    blacklist_keywords_json = excluded.blacklist_keywords_json,
+                    updated_at = excluded.updated_at
+                """,
+                (resolved_task_id, json.dumps(normalized, ensure_ascii=False), now),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO result_blacklist_rules (
+                    result_filename, blacklist_keywords_json, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(result_filename) DO UPDATE SET
+                    blacklist_keywords_json = excluded.blacklist_keywords_json,
+                    updated_at = excluded.updated_at
+                """,
+                (filename, json.dumps(normalized, ensure_ascii=False), now),
+            )
+        conn.commit()
+    return normalized
+
+
+async def save_result_blacklist_keywords(
+    filename: str,
+    keywords: list[str],
+) -> list[str]:
+    return await asyncio.to_thread(
+        _save_blacklist_sync,
+        keywords,
+        filename=filename,
+    )
+
+
+async def save_task_result_blacklist_keywords(
+    task_id: int,
+    keywords: list[str],
+) -> list[str]:
+    return await asyncio.to_thread(
+        _save_blacklist_sync,
+        keywords,
+        task_id=task_id,
+    )
+
+
+def delete_task_result_blacklist_rules(task_id: int) -> int:
+    bootstrap_sqlite_storage()
+    normalized = _normalize_task_id(task_id)
+    with sqlite_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM task_result_blacklist_rules WHERE task_id = ?",
+            (normalized,),
         )
         conn.commit()
-    return normalized_keywords
+    return int(cursor.rowcount or 0)
+
+
+def _load_visible_item_ids_sync(
+    *,
+    filename: str | None = None,
+    task_id: int | None = None,
+) -> set[str]:
+    records = _load_all_records_sync(
+        filename=filename,
+        task_id=task_id,
+        ai_recommended_only=False,
+        keyword_recommended_only=False,
+        sort_by="crawl_time",
+        sort_order="desc",
+        include_hidden=False,
+    )
+    return {
+        str((record.get("商品信息", {}) or {}).get("商品ID") or "").strip()
+        for record in records
+        if str((record.get("商品信息", {}) or {}).get("商品ID") or "").strip()
+    }
 
 
 def load_visible_result_item_ids(filename: str) -> set[str]:
-    bootstrap_sqlite_storage()
-    with sqlite_connection() as conn:
-        visible_records = _load_filtered_records_from_conn(
-            conn,
-            filename=filename,
-            ai_recommended_only=False,
-            keyword_recommended_only=False,
-            sort_by="crawl_time",
-            sort_order="desc",
-            include_hidden=False,
-        )
-    item_ids: set[str] = set()
-    for record in visible_records:
-        product = record.get("商品信息", {}) or {}
-        item_id = str(product.get("商品ID") or "").strip()
-        if item_id:
-            item_ids.add(item_id)
-    return item_ids
+    return _load_visible_item_ids_sync(filename=filename)
+
+
+def load_visible_task_result_item_ids(task_id: int) -> set[str]:
+    return _load_visible_item_ids_sync(task_id=task_id)

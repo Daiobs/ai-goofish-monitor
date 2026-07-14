@@ -26,6 +26,18 @@ def normalize_keyword_slug(keyword: str) -> str:
     return text or "unknown"
 
 
+def _normalize_task_id(task_id: int) -> int:
+    if isinstance(task_id, bool):
+        raise ValueError("task_id must be a non-negative integer")
+    try:
+        normalized = int(task_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task_id must be a non-negative integer") from exc
+    if normalized < 0:
+        raise ValueError("task_id must be a non-negative integer")
+    return normalized
+
+
 def build_price_history_path(keyword: str) -> str:
     return os.path.join(
         PRICE_HISTORY_DIR,
@@ -62,6 +74,7 @@ def _to_day(iso_text: str) -> str:
 
 def _build_snapshot_record(
     *,
+    task_id: Optional[int],
     keyword: str,
     task_name: str,
     item: dict,
@@ -76,6 +89,7 @@ def _build_snapshot_record(
         return None
 
     return {
+        "task_id": task_id,
         "snapshot_time": snapshot_time,
         "snapshot_day": _to_day(snapshot_time),
         "run_id": run_id,
@@ -99,15 +113,18 @@ def record_market_snapshots(
     task_name: str,
     items: Iterable[dict],
     run_id: str,
+    task_id: Optional[int] = None,
     snapshot_time: Optional[str] = None,
     seen_item_ids: Optional[set[str]] = None,
 ) -> list[dict]:
+    normalized_task_id = None if task_id is None else _normalize_task_id(task_id)
     snapshot_time = _safe_iso_datetime(snapshot_time)
     seen = seen_item_ids if seen_item_ids is not None else set()
     records: list[dict] = []
 
     for item in items:
         record = _build_snapshot_record(
+            task_id=normalized_task_id,
             keyword=keyword,
             task_name=task_name,
             item=item,
@@ -129,12 +146,13 @@ def record_market_snapshots(
             conn.execute(
                 """
                 INSERT OR IGNORE INTO price_snapshots (
-                    keyword_slug, keyword, task_name, snapshot_time, snapshot_day,
-                    run_id, item_id, title, price, price_display, tags_json, region,
-                    seller, publish_time, link
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_id, keyword_slug, keyword, task_name, snapshot_time,
+                    snapshot_day, run_id, item_id, title, price, price_display,
+                    tags_json, region, seller, publish_time, link
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    normalized_task_id,
                     keyword_slug,
                     record.get("keyword", keyword),
                     record.get("task_name", task_name),
@@ -156,22 +174,44 @@ def record_market_snapshots(
     return records
 
 
-def load_price_snapshots(keyword: str) -> list[dict]:
+def _snapshot_ownership_clause(
+    *,
+    keyword: Optional[str],
+    task_id: Optional[int],
+) -> tuple[str, tuple]:
+    if task_id is not None:
+        return "task_id = ?", (_normalize_task_id(task_id),)
+    return (
+        "task_id IS NULL AND keyword_slug = ?",
+        (normalize_keyword_slug(keyword or ""),),
+    )
+
+
+def load_price_snapshots(
+    keyword: Optional[str] = None,
+    *,
+    task_id: Optional[int] = None,
+) -> list[dict]:
     bootstrap_sqlite_storage()
+    ownership_clause, params = _snapshot_ownership_clause(
+        keyword=keyword,
+        task_id=task_id,
+    )
     with sqlite_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM price_snapshots
-            WHERE keyword_slug = ?
+            WHERE {ownership_clause}
             ORDER BY snapshot_time ASC, id ASC
             """,
-            (normalize_keyword_slug(keyword),),
+            params,
         ).fetchall()
     snapshots: list[dict] = []
     for row in rows:
         snapshots.append(
             {
+                "task_id": row["task_id"],
                 "snapshot_time": row["snapshot_time"],
                 "snapshot_day": row["snapshot_day"],
                 "run_id": row["run_id"],
@@ -191,15 +231,31 @@ def load_price_snapshots(keyword: str) -> list[dict]:
     return snapshots
 
 
-def delete_price_snapshots(keyword: str) -> int:
+def load_task_price_snapshots(task_id: int) -> list[dict]:
+    return load_price_snapshots(task_id=task_id)
+
+
+def delete_price_snapshots(
+    keyword: Optional[str] = None,
+    *,
+    task_id: Optional[int] = None,
+) -> int:
     bootstrap_sqlite_storage()
+    ownership_clause, params = _snapshot_ownership_clause(
+        keyword=keyword,
+        task_id=task_id,
+    )
     with sqlite_connection() as conn:
         cursor = conn.execute(
-            "DELETE FROM price_snapshots WHERE keyword_slug = ?",
-            (normalize_keyword_slug(keyword),),
+            f"DELETE FROM price_snapshots WHERE {ownership_clause}",
+            params,
         )
         conn.commit()
     return int(cursor.rowcount or 0)
+
+
+def delete_task_price_snapshots(task_id: int) -> int:
+    return delete_price_snapshots(task_id=task_id)
 
 
 def _dedupe_latest(records: Iterable[dict], group_key: str) -> list[dict]:
@@ -362,12 +418,13 @@ def build_market_reference(
 
 
 def build_price_history_insights(
-    keyword: str,
+    keyword: Optional[str] = None,
     *,
+    task_id: Optional[int] = None,
     window_days: int = DEFAULT_HISTORY_WINDOW_DAYS,
     visible_item_ids: Optional[set[str]] = None,
 ) -> dict:
-    snapshots = load_price_snapshots(keyword)
+    snapshots = load_price_snapshots(keyword, task_id=task_id)
     if visible_item_ids is not None:
         snapshots = [
             snapshot
@@ -402,3 +459,16 @@ def build_price_history_insights(
         "daily_trend": _build_daily_trend(recent_snapshots),
         "latest_snapshot_at": snapshots[-1].get("snapshot_time"),
     }
+
+
+def build_task_price_history_insights(
+    task_id: int,
+    *,
+    window_days: int = DEFAULT_HISTORY_WINDOW_DAYS,
+    visible_item_ids: Optional[set[str]] = None,
+) -> dict:
+    return build_price_history_insights(
+        task_id=task_id,
+        window_days=window_days,
+        visible_item_ids=visible_item_ids,
+    )
