@@ -37,6 +37,15 @@ def test_process_service_marks_task_stopped_when_process_exits(
 
     async def run_scenario():
         service = ProcessService()
+        monkeypatch.setattr(
+            "src.services.process_service.find_task_by_id_sync",
+            lambda task_id: SimpleNamespace(
+                id=task_id,
+                task_name="task-a",
+                enabled=True,
+                account_state_file=None,
+            ),
+        )
         service.failure_guard.should_skip_start = lambda *args, **kwargs: SimpleNamespace(
             skip=False,
             should_notify=False,
@@ -104,7 +113,12 @@ def test_process_service_uses_task_id_for_guard_and_account_lookup(monkeypatch):
 
     monkeypatch.setattr(
         "src.services.process_service.find_task_by_id_sync",
-        lambda task_id: SimpleNamespace(account_state_file=f"state/{task_id}.json"),
+        lambda task_id: SimpleNamespace(
+            id=task_id,
+            task_name="database-name",
+            enabled=True,
+            account_state_file=f"state/{task_id}.json",
+        ),
     )
 
     def should_skip(task_key, *, cookie_path):

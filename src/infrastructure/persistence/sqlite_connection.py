@@ -15,6 +15,7 @@ from src.infrastructure.persistence.storage_names import (
     build_legacy_result_filename,
     build_result_filename,
 )
+from src.services.result_blacklist_service import normalize_blacklist_keywords
 
 
 BUSY_TIMEOUT_MS = 5000
@@ -152,6 +153,9 @@ TASK_IDENTITY_MIGRATION_KEY = "migration:tasks_autoincrement_v1"
 RESULT_STATUS_MIGRATION_KEY = "migration:result_items_status"
 RESULT_STATUS_INDEX_NAME = "idx_results_filename_status_crawl"
 TASK_OWNED_DATA_MIGRATION_KEY = "migration:task_owned_results_v1"
+TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY = (
+    "migration:task_owned_blacklist_rules_v1"
+)
 LEGACY_RESULT_NAMESPACE_MIGRATION_KEY = (
     "migration:legacy_result_filename_namespace_v1"
 )
@@ -245,6 +249,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _migrate_tasks_autoincrement(conn)
         _migrate_result_items_status(conn)
         _migrate_task_owned_data(conn)
+        migrate_task_owned_blacklist_rules(conn)
         migrate_legacy_result_filename_namespace(conn)
         conn.commit()
     except Exception:
@@ -293,11 +298,12 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
 
     migration_rows = conn.execute(
-        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?, ?)",
+        "SELECT key FROM app_metadata WHERE key IN (?, ?, ?, ?, ?)",
         (
             TASK_IDENTITY_MIGRATION_KEY,
             RESULT_STATUS_MIGRATION_KEY,
             TASK_OWNED_DATA_MIGRATION_KEY,
+            TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,
             LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
         ),
     ).fetchall()
@@ -306,6 +312,7 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         TASK_IDENTITY_MIGRATION_KEY,
         RESULT_STATUS_MIGRATION_KEY,
         TASK_OWNED_DATA_MIGRATION_KEY,
+        TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,
         LEGACY_RESULT_NAMESPACE_MIGRATION_KEY,
     }
 
@@ -483,6 +490,158 @@ def assign_legacy_task_ownership(
     return payload
 
 
+def migrate_task_owned_blacklist_rules(
+    conn: sqlite3.Connection,
+    *,
+    force: bool = False,
+) -> dict[str, int]:
+    """Copy filename rules to every task owner before legacy names are escaped."""
+    empty_stats = {
+        "task_rules_created": 0,
+        "task_rules_merged": 0,
+        "task_targets": 0,
+        "legacy_rules_preserved": 0,
+        "legacy_rules_moved": 0,
+        "failed": 0,
+    }
+    marker = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,),
+    ).fetchone()
+    if marker is not None and not force:
+        return empty_stats
+
+    stats = dict(empty_stats)
+    source_rows = conn.execute(
+        """
+        SELECT result_filename, blacklist_keywords_json, updated_at
+        FROM result_blacklist_rules
+        WHERE EXISTS (
+            SELECT 1
+            FROM result_items
+            WHERE result_items.result_filename =
+                  result_blacklist_rules.result_filename
+              AND result_items.task_id IS NOT NULL
+        )
+        ORDER BY result_filename
+        """
+    ).fetchall()
+    changed = False
+    for source_row in source_rows:
+        try:
+            source_filename = str(source_row["result_filename"] or "")
+            source_keywords = _decode_blacklist_keywords(
+                source_row["blacklist_keywords_json"]
+            )
+            source_updated_at = str(source_row["updated_at"] or "")
+            target_rows = conn.execute(
+                """
+                SELECT DISTINCT task_id
+                FROM result_items
+                WHERE result_filename = ? AND task_id IS NOT NULL
+                ORDER BY task_id
+                """,
+                (source_filename,),
+            ).fetchall()
+
+            for target_row in target_rows:
+                stats["task_targets"] += 1
+                outcome = _merge_task_blacklist_rule(
+                    conn,
+                    task_id=int(target_row["task_id"]),
+                    source_keywords=source_keywords,
+                    source_updated_at=source_updated_at,
+                )
+                if outcome == "created":
+                    stats["task_rules_created"] += 1
+                    changed = True
+                elif outcome == "changed":
+                    stats["task_rules_merged"] += 1
+                    changed = True
+
+            has_unowned_rows = conn.execute(
+                """
+                SELECT 1
+                FROM result_items
+                WHERE result_filename = ? AND task_id IS NULL
+                LIMIT 1
+                """,
+                (source_filename,),
+            ).fetchone()
+            if has_unowned_rows is not None or not target_rows:
+                stats["legacy_rules_preserved"] += 1
+                continue
+
+            cursor = conn.execute(
+                "DELETE FROM result_blacklist_rules WHERE result_filename = ?",
+                (source_filename,),
+            )
+            stats["legacy_rules_moved"] += int(cursor.rowcount or 0)
+            changed = changed or bool(cursor.rowcount)
+        except Exception:
+            stats["failed"] += 1
+            raise
+
+    marker_value = json.dumps(stats, sort_keys=True)
+    existing_value = str(marker["value"]) if marker is not None else None
+    existing_is_empty = marker is not None and all(
+        value == 0 for value in _decode_migration_stats(existing_value).values()
+    )
+    if marker is None or changed or (source_rows and existing_is_empty):
+        if existing_value != marker_value:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, ?)",
+                (TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY, marker_value),
+            )
+    return stats
+
+
+def _merge_task_blacklist_rule(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    source_keywords: list[str],
+    source_updated_at: str,
+) -> str:
+    target_row = conn.execute(
+        """
+        SELECT blacklist_keywords_json, updated_at
+        FROM task_result_blacklist_rules
+        WHERE task_id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    target_keywords = _decode_blacklist_keywords(
+        target_row["blacklist_keywords_json"] if target_row else None
+    )
+    merged = normalize_blacklist_keywords([*target_keywords, *source_keywords])
+    updated_at = max(
+        source_updated_at,
+        str(target_row["updated_at"] or "") if target_row else "",
+    )
+    if target_row is None:
+        conn.execute(
+            """
+            INSERT INTO task_result_blacklist_rules (
+                task_id, blacklist_keywords_json, updated_at
+            ) VALUES (?, ?, ?)
+            """,
+            (task_id, json.dumps(merged, ensure_ascii=False), updated_at),
+        )
+        return "created"
+    if merged == target_keywords and updated_at == str(target_row["updated_at"] or ""):
+        return "no-op"
+    conn.execute(
+        """
+        UPDATE task_result_blacklist_rules
+        SET blacklist_keywords_json = ?, updated_at = ?
+        WHERE task_id = ?
+        """,
+        (json.dumps(merged, ensure_ascii=False), updated_at, task_id),
+    )
+    return "changed"
+
+
 def migrate_legacy_result_filename_namespace(
     conn: sqlite3.Connection,
     *,
@@ -524,10 +683,11 @@ def migrate_legacy_result_filename_namespace(
         renamed_rows += int(cursor.rowcount or 0)
         targets_by_source.setdefault(source, set()).add(target)
 
-    renamed_rule_keys = _migrate_legacy_blacklist_rule_keys(
+    renamed_rule_keys, task_owned_rule_keys = _migrate_legacy_blacklist_rule_keys(
         conn,
         targets_by_source,
     )
+    _record_namespace_blacklist_moves(conn, task_owned_rule_keys)
     payload = {
         "renamed_rows": renamed_rows,
         "renamed_rule_keys": renamed_rule_keys,
@@ -545,8 +705,9 @@ def migrate_legacy_result_filename_namespace(
 def _migrate_legacy_blacklist_rule_keys(
     conn: sqlite3.Connection,
     targets_by_source: dict[str, set[str]],
-) -> int:
+) -> tuple[int, int]:
     migrated = 0
+    task_owned_migrated = 0
     for source, targets in targets_by_source.items():
         source_row = conn.execute(
             """
@@ -574,8 +735,9 @@ def _migrate_legacy_blacklist_rule_keys(
             target_keywords = _decode_blacklist_keywords(
                 target_row["blacklist_keywords_json"] if target_row else None
             )
-            merged = list(target_keywords)
-            merged.extend(value for value in source_keywords if value not in merged)
+            merged = normalize_blacklist_keywords(
+                [*target_keywords, *source_keywords]
+            )
             updated_at = max(
                 source_updated_at,
                 str(target_row["updated_at"] or "") if target_row else "",
@@ -591,20 +753,83 @@ def _migrate_legacy_blacklist_rule_keys(
                 """,
                 (target, json.dumps(merged, ensure_ascii=False), updated_at),
             )
-        conn.execute(
-            "DELETE FROM result_blacklist_rules WHERE result_filename = ?",
+        source_has_unowned_rows = conn.execute(
+            """
+            SELECT 1
+            FROM result_items
+            WHERE result_filename = ? AND task_id IS NULL
+            LIMIT 1
+            """,
             (source,),
-        )
-        migrated += 1
-    return migrated
+        ).fetchone()
+        if source_has_unowned_rows is None:
+            source_has_task_owned_rows = conn.execute(
+                """
+                SELECT 1
+                FROM result_items
+                WHERE result_filename = ? AND task_id IS NOT NULL
+                LIMIT 1
+                """,
+                (source,),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM result_blacklist_rules WHERE result_filename = ?",
+                (source,),
+            )
+            migrated += 1
+            task_owned_migrated += int(source_has_task_owned_rows is not None)
+    return migrated, task_owned_migrated
 
 
-def _decode_blacklist_keywords(raw_value) -> list:
+def _record_namespace_blacklist_moves(
+    conn: sqlite3.Connection,
+    moved_count: int,
+) -> None:
+    if moved_count <= 0:
+        return
+    marker = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?",
+        (TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,),
+    ).fetchone()
+    if marker is None:
+        return
+    stats = _decode_migration_stats(marker["value"])
+    adjusted = min(moved_count, stats.get("legacy_rules_preserved", 0))
+    if adjusted <= 0:
+        return
+    stats["legacy_rules_preserved"] -= adjusted
+    stats["legacy_rules_moved"] += adjusted
+    conn.execute(
+        "UPDATE app_metadata SET value = ? WHERE key = ?",
+        (
+            json.dumps(stats, sort_keys=True),
+            TASK_OWNED_BLACKLIST_RULES_MIGRATION_KEY,
+        ),
+    )
+
+
+def _decode_migration_stats(raw_value) -> dict[str, int]:
+    try:
+        decoded = json.loads(str(raw_value or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {
+        str(key): int(value)
+        for key, value in decoded.items()
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+
+
+def _decode_blacklist_keywords(raw_value) -> list[str]:
     try:
         decoded = json.loads(str(raw_value or "[]"))
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
-    return decoded if isinstance(decoded, list) else []
+    if not isinstance(decoded, (list, str)):
+        return []
+    return normalize_blacklist_keywords(decoded)
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:

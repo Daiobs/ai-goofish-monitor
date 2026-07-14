@@ -40,6 +40,32 @@ def _log_delete_failure(task_id: int, resource: str, exc: BaseException) -> None
     )
 
 
+async def _delete_task_record_cancellation_safe(
+    service: TaskService,
+    task_id: int,
+) -> bool:
+    """Keep the lifecycle lock until the durable delete has settled."""
+    operation = asyncio.create_task(service.delete_task_record(task_id))
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+
+    if cancellation is not None:
+        try:
+            operation.result()
+        except BaseException:
+            pass
+        raise cancellation
+    return bool(operation.result())
+
+
 async def _delete_task_log(task_id: int, task_name: str) -> None:
     log_file_path = resolve_task_log_path(task_id, task_name)
     if os.path.exists(log_file_path):
@@ -233,37 +259,41 @@ async def delete_task(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
 ):
     """删除任务"""
-    task = await service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务未找到")
+    async with process_service.task_lifecycle_guard(task_id):
+        task = await service.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务未找到")
 
-    try:
-        await process_service.stop_task(task_id)
-    except Exception as exc:
-        _log_delete_failure(task_id, "process_stop", exc)
-    try:
-        process_is_running = process_service.is_running(task_id)
-    except Exception as exc:
-        _log_delete_failure(task_id, "process_status", exc)
-        raise HTTPException(status_code=500, detail="无法确认任务进程已停止，删除已取消") from None
-    if process_is_running:
-        print(
-            f"[TaskDeletion] task_id={task_id} resource=process "
-            "error=StillRunning"
-        )
-        raise HTTPException(status_code=409, detail="任务进程仍在运行，删除已取消")
+        try:
+            await process_service._stop_task_locked(task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "process_stop", exc)
+        try:
+            process_is_running = process_service.is_running(task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "process_status", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="无法确认任务进程已停止，删除已取消",
+            ) from None
+        if process_is_running:
+            print(
+                f"[TaskDeletion] task_id={task_id} resource=process "
+                "error=StillRunning"
+            )
+            raise HTTPException(status_code=409, detail="任务进程仍在运行，删除已取消")
 
-    try:
-        success = await service.delete_task_record(task_id)
-    except Exception as exc:
-        _log_delete_failure(task_id, "task_record", exc)
-        raise HTTPException(status_code=500, detail="任务记录删除失败") from None
-    if not success:
-        print(
-            f"[TaskDeletion] task_id={task_id} resource=task_record "
-            "error=DeleteRejected"
-        )
-        raise HTTPException(status_code=500, detail="任务记录删除失败")
+        try:
+            success = await _delete_task_record_cancellation_safe(service, task_id)
+        except Exception as exc:
+            _log_delete_failure(task_id, "task_record", exc)
+            raise HTTPException(status_code=500, detail="任务记录删除失败") from None
+        if not success:
+            print(
+                f"[TaskDeletion] task_id={task_id} resource=task_record "
+                "error=DeleteRejected"
+            )
+            raise HTTPException(status_code=500, detail="任务记录删除失败")
 
     cleanup_steps = (
         ("prompt", lambda: service.delete_task_prompt(task_id)),

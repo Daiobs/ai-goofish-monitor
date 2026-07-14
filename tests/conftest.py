@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -61,6 +62,7 @@ class FakeProcessService:
         self.running = set()
         self.stop_result = True
         self.keep_running_after_stop = False
+        self._task_lifecycle_locks = {}
         self._on_started = None
         self._on_stopped = None
 
@@ -68,7 +70,14 @@ class FakeProcessService:
         self._on_started = on_started
         self._on_stopped = on_stopped
 
+    def task_lifecycle_guard(self, task_id: int):
+        return self._task_lifecycle_locks.setdefault(task_id, asyncio.Lock())
+
     async def start_task(self, task_id: int, task_name: str) -> bool:
+        async with self.task_lifecycle_guard(task_id):
+            return await self._start_task_locked(task_id, task_name)
+
+    async def _start_task_locked(self, task_id: int, task_name: str) -> bool:
         self.started.append((task_id, task_name))
         self.running.add(task_id)
         if self._on_started:
@@ -76,6 +85,10 @@ class FakeProcessService:
         return True
 
     async def stop_task(self, task_id: int):
+        async with self.task_lifecycle_guard(task_id):
+            return await self._stop_task_locked(task_id)
+
+    async def _stop_task_locked(self, task_id: int):
         self.stopped.append(task_id)
         if not self.keep_running_after_stop:
             self.running.discard(task_id)

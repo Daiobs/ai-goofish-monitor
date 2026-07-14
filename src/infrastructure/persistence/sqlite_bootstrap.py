@@ -12,6 +12,7 @@ from src.infrastructure.persistence.sqlite_connection import (
     assign_legacy_task_ownership,
     init_schema,
     migrate_legacy_result_filename_namespace,
+    migrate_task_owned_blacklist_rules,
     sqlite_connection,
     sync_tasks_autoincrement_sequence,
 )
@@ -54,6 +55,7 @@ def bootstrap_sqlite_storage(
                 )
                 if any(imported):
                     assign_legacy_task_ownership(conn)
+                    migrate_task_owned_blacklist_rules(conn, force=True)
                     migrate_legacy_result_filename_namespace(conn, force=True)
                 if conn.in_transaction:
                     conn.commit()

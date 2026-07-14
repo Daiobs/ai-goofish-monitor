@@ -31,6 +31,7 @@ class ProcessService:
         self.log_handles: Dict[int, TextIO] = {}
         self.task_names: Dict[int, str] = {}
         self.exit_watchers: Dict[int, asyncio.Task] = {}
+        self._task_lifecycle_locks: Dict[int, asyncio.Lock] = {}
         self.failure_guard = FailureGuard()
         self._on_started: LifecycleHook | None = None
         self._on_stopped: LifecycleHook | None = None
@@ -51,14 +52,31 @@ class ProcessService:
         if asyncio.iscoroutine(result):
             await result
 
-    def _resolve_cookie_path(self, task_id: int) -> str | None:
-        """Best-effort cookie/state path for a task."""
-        try:
-            task = find_task_by_id_sync(task_id)
-            if task and isinstance(task.account_state_file, str) and task.account_state_file.strip():
-                return task.account_state_file.strip()
-        except Exception:
-            pass
+    @staticmethod
+    async def _complete_cleanup(awaitable: Awaitable[None]) -> None:
+        """Finish critical cleanup even if the caller receives another cancel."""
+        cleanup_task = asyncio.create_task(awaitable)
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        cleanup_task.result()
+
+    def task_lifecycle_guard(self, task_id: int) -> asyncio.Lock:
+        """Return the persistent per-task lock used by start, stop, and delete."""
+        lock = self._task_lifecycle_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._task_lifecycle_locks[task_id] = lock
+        return lock
+
+    @staticmethod
+    def _resolve_cookie_path(task) -> str | None:
+        """Best-effort cookie/state path from the freshly loaded task."""
+        account_state_file = getattr(task, "account_state_file", None)
+        if isinstance(account_state_file, str) and account_state_file.strip():
+            return account_state_file.strip()
 
         return STATE_FILE if os.path.exists(STATE_FILE) else None
 
@@ -71,14 +89,7 @@ class ProcessService:
         process = self.processes.get(task_id)
         if process is None or process.returncode is None:
             return
-
-        watcher = self.exit_watchers.get(task_id)
-        if watcher is not None:
-            await asyncio.shield(watcher)
-            return
-
-        self._cleanup_runtime(task_id, process)
-        await self._invoke_hook(self._on_stopped, task_id)
+        await self._finalize_process_exit_locked(task_id, process)
 
     def _open_log_file(self, task_id: int, task_name: str) -> tuple[str, TextIO]:
         os.makedirs("logs", exist_ok=True)
@@ -123,15 +134,39 @@ class ProcessService:
         process: asyncio.subprocess.Process,
         log_file_path: str,
         log_file_handle: TextIO,
+        startup_complete: asyncio.Event,
     ) -> None:
         self.processes[task_id] = process
         self.log_paths[task_id] = log_file_path
         self.log_handles[task_id] = log_file_handle
         self.task_names[task_id] = task_name
-        self.exit_watchers[task_id] = asyncio.create_task(self._watch_process_exit(process))
+        self.exit_watchers[task_id] = asyncio.create_task(
+            self._watch_process_exit(task_id, process, startup_complete)
+        )
 
-    async def start_task(self, task_id: int, task_name: str) -> bool:
-        """启动任务进程"""
+    async def start_task(self, task_id: int, task_name: str | None = None) -> bool:
+        """Start a task while serializing its complete lifecycle transition."""
+        async with self.task_lifecycle_guard(task_id):
+            return await self._start_task_locked(task_id)
+
+    async def _start_task_locked(self, task_id: int) -> bool:
+        """Start a task while its lifecycle lock is already held."""
+        try:
+            task = await asyncio.to_thread(find_task_by_id_sync, task_id)
+        except Exception as exc:
+            print(
+                f"任务 ID {task_id} 启动前读取失败 "
+                f"({type(exc).__name__})"
+            )
+            return False
+        if task is None:
+            print(f"任务 ID {task_id} 已不存在，拒绝启动")
+            return False
+        if not task.enabled:
+            print(f"任务 ID {task_id} 已禁用，拒绝启动")
+            return False
+
+        task_name = task.task_name
         await self._drain_finished_process(task_id)
         if self.is_running(task_id):
             print(f"任务 '{task_name}' (ID: {task_id}) 已在运行中")
@@ -139,7 +174,7 @@ class ProcessService:
 
         decision = self.failure_guard.should_skip_start(
             canonical_task_key(task_id),
-            cookie_path=self._resolve_cookie_path(task_id),
+            cookie_path=self._resolve_cookie_path(task),
         )
         if decision.skip:
             await self._notify_skip(task_name, decision)
@@ -147,18 +182,81 @@ class ProcessService:
 
         log_file_path = ""
         log_file_handle = None
+        process = None
+        startup_complete = asyncio.Event()
+        started_hook_invoked = False
         try:
             log_file_path, log_file_handle = self._open_log_file(task_id, task_name)
             process = await self._spawn_process(task_id, log_file_handle)
-        except Exception as exc:
-            self._close_log_handle(log_file_handle)
-            print(f"启动任务 '{task_name}' 失败: {exc}")
+            self._register_runtime(
+                task_id,
+                task_name,
+                process,
+                log_file_path,
+                log_file_handle,
+                startup_complete,
+            )
+            print(f"启动任务 '{task_name}' (PID: {process.pid})")
+            started_hook_invoked = True
+            await self._invoke_hook(self._on_started, task_id)
+            startup_complete.set()
+            return True
+        except BaseException as exc:
+            try:
+                await self._complete_cleanup(
+                    self._compensate_failed_start(
+                        task_id,
+                        process,
+                        log_file_handle,
+                        notify_stopped=started_hook_invoked,
+                    )
+                )
+            except BaseException as cleanup_exc:
+                print(
+                    f"任务 ID {task_id} 启动补偿失败 "
+                    f"({type(cleanup_exc).__name__})"
+                )
+            finally:
+                startup_complete.set()
+            if not isinstance(exc, Exception):
+                raise
+            print(
+                f"启动任务 '{task_name}' 失败 "
+                f"({type(exc).__name__})"
+            )
             return False
 
-        self._register_runtime(task_id, task_name, process, log_file_path, log_file_handle)
-        print(f"启动任务 '{task_name}' (PID: {process.pid})")
-        await self._invoke_hook(self._on_started, task_id)
-        return True
+    async def _compensate_failed_start(
+        self,
+        task_id: int,
+        process: asyncio.subprocess.Process | None,
+        log_file_handle: TextIO | None,
+        *,
+        notify_stopped: bool,
+    ) -> None:
+        if process is not None and process.returncode is None:
+            try:
+                await self._terminate_process(process, task_id)
+            except Exception as cleanup_exc:
+                print(
+                    f"任务 ID {task_id} 启动补偿终止失败 "
+                    f"({type(cleanup_exc).__name__})"
+                )
+
+        if process is not None and process.returncode is not None:
+            if self.processes.get(task_id) is process:
+                self._cleanup_runtime(task_id, process)
+                if notify_stopped:
+                    try:
+                        await self._invoke_hook(self._on_stopped, task_id)
+                    except Exception as cleanup_exc:
+                        print(
+                            f"任务 ID {task_id} 启动补偿状态收尾失败 "
+                            f"({type(cleanup_exc).__name__})"
+                        )
+
+        if self.log_handles.get(task_id) is not log_file_handle:
+            self._close_log_handle(log_file_handle)
 
     async def _notify_skip(self, task_name: str, decision) -> None:
         print(
@@ -183,19 +281,26 @@ class ProcessService:
         except Exception as exc:
             print(f"发送任务暂停通知失败: {exc}")
 
-    async def _watch_process_exit(self, process: asyncio.subprocess.Process) -> None:
+    async def _watch_process_exit(
+        self,
+        task_id: int,
+        process: asyncio.subprocess.Process,
+        startup_complete: asyncio.Event,
+    ) -> None:
         await process.wait()
-        task_id = self._find_task_id_by_process(process)
-        if task_id is None:
+        await startup_complete.wait()
+        async with self.task_lifecycle_guard(task_id):
+            await self._finalize_process_exit_locked(task_id, process)
+
+    async def _finalize_process_exit_locked(
+        self,
+        task_id: int,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        if self.processes.get(task_id) is not process:
             return
         self._cleanup_runtime(task_id, process)
         await self._invoke_hook(self._on_stopped, task_id)
-
-    def _find_task_id_by_process(self, process: asyncio.subprocess.Process) -> int | None:
-        for task_id, current_process in self.processes.items():
-            if current_process is process:
-                return task_id
-        return None
 
     def _cleanup_runtime(
         self,
@@ -227,21 +332,26 @@ class ProcessService:
             print(f"写入任务终止标记失败: {exc}")
 
     async def stop_task(self, task_id: int) -> bool:
-        """停止任务进程"""
+        """Stop a task while serializing its complete lifecycle transition."""
+        async with self.task_lifecycle_guard(task_id):
+            return await self._stop_task_locked(task_id)
+
+    async def _stop_task_locked(self, task_id: int) -> bool:
+        """Stop a task while its lifecycle lock is already held."""
         await self._drain_finished_process(task_id)
         process = self.processes.get(task_id)
         if process is None:
             print(f"任务 ID {task_id} 没有正在运行的进程")
             return False
         if process.returncode is not None:
-            await self._await_exit_watcher(task_id)
+            await self._finalize_process_exit_locked(task_id, process)
             print(f"任务进程 {process.pid} (ID: {task_id}) 已退出，略过停止")
             return False
 
         try:
             await self._terminate_process(process, task_id)
             self._append_stop_marker(self.log_paths.get(task_id))
-            await self._await_exit_watcher(task_id)
+            await self._finalize_process_exit_locked(task_id, process)
             print(f"任务进程 {process.pid} (ID: {task_id}) 已终止")
             return True
         except ProcessLookupError:
@@ -276,12 +386,6 @@ class ProcessService:
         else:
             process.kill()
         await process.wait()
-
-    async def _await_exit_watcher(self, task_id: int) -> None:
-        watcher = self.exit_watchers.get(task_id)
-        if watcher is None:
-            return
-        await asyncio.shield(watcher)
 
     async def stop_all(self) -> None:
         """停止所有任务进程"""
