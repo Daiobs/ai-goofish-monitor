@@ -29,9 +29,12 @@ const enUSExtra = {
       status: { completed: 'Completed', failed: 'Failed', running: 'Running', queued: 'Queued' },
     },
     preflight: {
+      action: 'Run environment preflight only',
       running: 'Checking the account, network, and search environment...',
       runningShort: 'Preflight',
       passed: 'Preflight passed and the task started.',
+      passedOnly: 'Preflight passed. The task can be started.',
+      failed: 'Preflight failed.',
       direct: 'Direct browser connection',
     },
     search: {

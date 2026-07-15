@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -113,11 +114,19 @@ def _filter_goofish_cookies(cookies: Any) -> list[dict[str, Any]]:
     if not isinstance(cookies, list):
         raise BrowserSessionError("登录状态的 Cookie 结构无效")
     filtered: list[dict[str, Any]] = []
+    now = time.time()
     for cookie in cookies:
         if not isinstance(cookie, dict):
             raise BrowserSessionError("登录状态包含无效 Cookie 条目")
         domain = str(cookie.get("domain") or "").lstrip(".")
-        if _is_goofish_host(domain):
+        expires = cookie.get("expires")
+        is_expired = (
+            isinstance(expires, (int, float))
+            and not isinstance(expires, bool)
+            and expires > 0
+            and expires <= now
+        )
+        if _is_goofish_host(domain) and not is_expired:
             filtered.append(cookie)
     if not filtered:
         raise BrowserSessionError("登录状态中没有可恢复的 Goofish Cookie")

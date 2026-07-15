@@ -30,6 +30,7 @@ const {
   fetchTasks,
   removeTask,
   updateTask,
+  preflightTask,
   startTask,
   stopTask,
   stoppingTaskIds,
@@ -163,6 +164,19 @@ async function handleStartTask(taskId: number) {
   } catch (e) {
     toast({
       title: t('tasks.toasts.startFailed'),
+      description: (e as Error).message,
+      variant: 'destructive',
+    })
+  }
+}
+
+async function handlePreflightTask(taskId: number) {
+  try {
+    await preflightTask(taskId)
+    toast({ title: t('tasks.preflight.passedOnly') })
+  } catch (e) {
+    toast({
+      title: t('tasks.preflight.failed'),
       description: (e as Error).message,
       variant: 'destructive',
     })
@@ -329,6 +343,7 @@ onMounted(fetchAccountOptions)
       :is-loading="isLoading"
       :stopping-ids="stoppingTaskIds"
       :preflighting-ids="preflightingTaskIds"
+      @preflight-task="handlePreflightTask"
       @delete-task="handleDeleteTask"
       @edit-task="handleEditTask"
       @run-task="handleStartTask"

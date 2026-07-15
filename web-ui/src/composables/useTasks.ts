@@ -100,10 +100,8 @@ export function useTasks() {
     }
   }
 
-  async function startTask(taskId: number): Promise<MonitoringPreflightReport> {
+  async function preflightTask(taskId: number): Promise<MonitoringPreflightReport> {
     error.value = null
-    const task = tasks.value.find((t) => t.id === taskId)
-    const previous = task?.is_running
     const pending = new Set(preflightingTaskIds.value)
     pending.add(taskId)
     preflightingTaskIds.value = pending
@@ -113,6 +111,23 @@ export function useTasks() {
       if (!preflight.success) {
         throw new Error(`${preflight.reason} ${preflight.suggestion}`.trim())
       }
+      return preflight
+    } catch (e) {
+      if (e instanceof Error) error.value = e
+      throw e
+    } finally {
+      const cleaned = new Set(preflightingTaskIds.value)
+      cleaned.delete(taskId)
+      preflightingTaskIds.value = cleaned
+    }
+  }
+
+  async function startTask(taskId: number): Promise<MonitoringPreflightReport> {
+    error.value = null
+    const task = tasks.value.find((t) => t.id === taskId)
+    const previous = task?.is_running
+    try {
+      const preflight = await preflightTask(taskId)
       if (task) task.is_running = true
       await taskApi.startTask(taskId)
       return preflight
@@ -122,10 +137,6 @@ export function useTasks() {
       }
       if (e instanceof Error) error.value = e
       throw e
-    } finally {
-      const cleaned = new Set(preflightingTaskIds.value)
-      cleaned.delete(taskId)
-      preflightingTaskIds.value = cleaned
     }
   }
 
@@ -158,6 +169,7 @@ export function useTasks() {
     createTask,
     updateTask,
     removeTask,
+    preflightTask,
     startTask,
     stopTask,
     stoppingTaskIds,

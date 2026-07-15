@@ -147,6 +147,47 @@ def test_standard_snapshot_restores_only_goofish_cookies_and_local_storage(
     assert build_session_storage_script(plan) is None
 
 
+def test_snapshot_ignores_expired_goofish_cookies(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("src.services.browser_runtime.time.time", lambda: 2_000.0)
+    session_cookie = _goofish_cookie("session-cookie", "session-value")
+    expired_cookie = {
+        **_goofish_cookie("expired-cookie", "expired-value"),
+        "expires": 1_999.0,
+    }
+    current_cookie = {
+        **_goofish_cookie("current-cookie", "current-value"),
+        "expires": 2_001.0,
+    }
+    snapshot = {
+        "cookies": [expired_cookie, current_cookie, session_cookie],
+        "origins": [],
+    }
+
+    plan = load_browser_session(_write_snapshot(tmp_path, snapshot))
+
+    assert plan.storage_state["cookies"] == [current_cookie, session_cookie]
+    assert plan.cookie_count == 2
+
+
+def test_snapshot_rejects_when_all_goofish_cookies_are_expired(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("src.services.browser_runtime.time.time", lambda: 2_000.0)
+    snapshot = {
+        "cookies": [
+            {
+                **_goofish_cookie("expired-cookie", "expired-value"),
+                "expires": 1_999.0,
+            }
+        ],
+        "origins": [],
+    }
+
+    with pytest.raises(BrowserSessionError, match="没有可恢复"):
+        load_browser_session(_write_snapshot(tmp_path, snapshot))
+
+
 def test_enhanced_snapshot_restores_all_storage_with_desktop_context(
     tmp_path: Path,
 ) -> None:

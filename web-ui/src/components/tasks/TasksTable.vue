@@ -25,7 +25,8 @@ import {
   Layers,
   MapPin,
   RefreshCcw,
-  Search
+  Search,
+  ShieldCheck
 } from 'lucide-vue-next'
 import { formatCountdown, formatNextRunAbsolute } from '@/lib/taskSchedule'
 
@@ -88,6 +89,7 @@ const resolveNextRunLabel = (task: Task) => {
 
 const emit = defineEmits<{
   (e: 'delete-task', taskId: number): void
+  (e: 'preflight-task', taskId: number): void
   (e: 'run-task', taskId: number): void
   (e: 'stop-task', taskId: number): void
   (e: 'edit-task', task: Task): void
@@ -239,6 +241,19 @@ const emit = defineEmits<{
           </div>
 
           <div class="mt-4 flex flex-wrap gap-2">
+            <Button
+              v-if="!task.is_running"
+              size="icon"
+              variant="outline"
+              class="size-10"
+              :disabled="isPreflighting(task.id)"
+              :aria-label="`${t('tasks.preflight.action')} ${task.task_name}`"
+              :title="`${t('tasks.preflight.action')} ${task.task_name}`"
+              @click="emit('preflight-task', task.id)"
+            >
+              <RefreshCcw v-if="isPreflighting(task.id)" class="h-4 w-4 animate-spin" />
+              <ShieldCheck v-else class="h-4 w-4" />
+            </Button>
             <Button
               v-if="!task.is_running"
               size="sm"
@@ -467,6 +482,19 @@ const emit = defineEmits<{
             <!-- Column 6: Actions -->
             <TableCell class="px-6 align-middle text-right">
               <div class="flex justify-end items-center gap-2">
+                  <Button
+                    v-if="!task.is_running"
+                    size="icon"
+                    variant="ghost"
+                    class="h-8 w-8 rounded-lg text-slate-400 hover:bg-emerald-50 hover:text-emerald-600"
+                    :disabled="isPreflighting(task.id)"
+                    :aria-label="`${t('tasks.preflight.action')} ${task.task_name}`"
+                    :title="`${t('tasks.preflight.action')} ${task.task_name}`"
+                    @click="emit('preflight-task', task.id)"
+                  >
+                    <RefreshCcw v-if="isPreflighting(task.id)" class="h-3.5 w-3.5 animate-spin" />
+                    <ShieldCheck v-else class="h-3.5 w-3.5" />
+                  </Button>
                   <Button
                     v-if="!task.is_running"
                     size="sm" 
