@@ -1,0 +1,7 @@
+# Existing project UI assets. New binary exceptions require an exact path here.
+static/img.png	project documentation asset
+static/img_1.png	project documentation asset
+static/img_2.png	project documentation asset
+static/img_3.png	project documentation asset
+web-ui/public/vite.svg	frontend scaffold asset
+web-ui/src/assets/vue.svg	frontend scaffold asset
