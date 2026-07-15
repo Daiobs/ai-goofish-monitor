@@ -33,6 +33,30 @@ BINARY_ARTIFACT_EXTENSIONS = {
     ".webm",
 }
 TRUSTED_ACTION_OWNERS = {"actions", "anthropics", "docker", "oven-sh"}
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+UNTRUSTED_PUBLIC_EVENTS = frozenset(
+    {
+        "discussion",
+        "discussion_comment",
+        "issue_comment",
+        "issues",
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+    }
+)
+ASSOCIATION_FIELDS = {
+    "discussion": "github.event.discussion.author_association",
+    "discussion_comment": "github.event.comment.author_association",
+    "issue_comment": "github.event.comment.author_association",
+    "issues": "github.event.issue.author_association",
+    "pull_request": "github.event.pull_request.author_association",
+    "pull_request_review": "github.event.review.author_association",
+    "pull_request_review_comment": "github.event.comment.author_association",
+}
+SENSITIVE_WRITE_PERMISSIONS = frozenset(
+    {"actions", "contents", "id-token", "issues", "packages", "pull-requests"}
+)
 RUNTIME_DIRECTORIES = {
     "browser-profile",
     "cookies",
@@ -260,6 +284,210 @@ def inspect_tracked_file(
     return issues
 
 
+def _workflow_trigger_names(triggers: object) -> frozenset[str]:
+    if isinstance(triggers, str):
+        return frozenset({triggers})
+    if isinstance(triggers, list):
+        return frozenset(str(trigger) for trigger in triggers)
+    if isinstance(triggers, dict):
+        return frozenset(str(trigger) for trigger in triggers)
+    return frozenset()
+
+
+def _contains_repository_secret(value: object) -> bool:
+    return bool(re.search(r"\$\{\{\s*secrets(?:\.|\[)", str(value), re.IGNORECASE))
+
+
+def _split_top_level(expression: str, operator: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and expression.startswith(operator, index):
+            parts.append(expression[start:index].strip())
+            index += len(operator)
+            start = index
+            continue
+        index += 1
+    parts.append(expression[start:].strip())
+    return parts
+
+
+def _outer_parentheses_wrap(expression: str) -> bool:
+    if not expression.startswith("(") or not expression.endswith(")"):
+        return False
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(expression):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0 and index != len(expression) - 1:
+                return False
+    return depth == 0 and not quote
+
+
+def _strip_expression_wrapper(expression: str) -> str:
+    expression = expression.strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    while _outer_parentheses_wrap(expression):
+        expression = expression[1:-1].strip()
+    return expression
+
+
+def trusted_association_gate_issues(
+    condition: object,
+    event_names: Iterable[str],
+) -> list[str]:
+    if not isinstance(condition, str) or not condition.strip():
+        return ["missing trusted author association gate"]
+
+    branches = _split_top_level(_strip_expression_wrapper(condition), "||")
+    problems: list[str] = []
+    for event_name in sorted(set(event_names)):
+        expected_event = re.compile(
+            rf"^github\.event_name==(['\"]){re.escape(event_name)}\1$"
+        )
+        expected_field = ASSOCIATION_FIELDS[event_name]
+        trusted_values = '["' + '","'.join(TRUSTED_ASSOCIATIONS) + '"]'
+        expected_gate = (
+            f"contains(fromJSON('{trusted_values}'),"
+            f"{expected_field})"
+        )
+        matching_branches: list[list[str]] = []
+        for branch in branches:
+            branch = _strip_expression_wrapper(branch)
+            if len(_split_top_level(branch, "||")) != 1:
+                continue
+            conjuncts = [
+                _strip_expression_wrapper(part)
+                for part in _split_top_level(branch, "&&")
+            ]
+            compact = [re.sub(r"\s+", "", part) for part in conjuncts]
+            if any(expected_event.fullmatch(part) for part in compact):
+                matching_branches.append(compact)
+        if len(matching_branches) != 1 or expected_gate not in matching_branches[0]:
+            problems.append(
+                f"{event_name} must fail closed to OWNER, MEMBER, or COLLABORATOR"
+            )
+    return problems
+
+
+def _job_has_sensitive_write(job: dict) -> bool:
+    permissions = job.get("permissions", {})
+    if isinstance(permissions, str):
+        return permissions.lower() == "write-all"
+    if not isinstance(permissions, dict):
+        return False
+    return any(
+        str(name).lower() in SENSITIVE_WRITE_PERMISSIONS
+        and str(value).lower() == "write"
+        for name, value in permissions.items()
+    )
+
+
+def _job_run_steps(job: dict) -> tuple[dict, ...]:
+    steps = job.get("steps", [])
+    if not isinstance(steps, list):
+        return ()
+    return tuple(
+        step
+        for step in steps
+        if isinstance(step, dict) and isinstance(step.get("run"), str)
+    )
+
+
+def _has_frozen_local_binary_install(job: dict, repo_root: Path) -> bool:
+    default_working_directory = ""
+    defaults = job.get("defaults", {})
+    if isinstance(defaults, dict) and isinstance(defaults.get("run"), dict):
+        default_working_directory = str(defaults["run"].get("working-directory", ""))
+
+    for step in _job_run_steps(job):
+        if not re.search(r"(?m)(?:^|\s)npm\s+ci(?:\s|$)", step["run"]):
+            continue
+        working_directory = str(
+            step.get("working-directory", default_working_directory)
+        )
+        lock_path = repo_root / working_directory / "package-lock.json"
+        if lock_path.is_file():
+            return True
+    return False
+
+
+def _dynamic_package_execution_issues(
+    job: dict,
+    repo_root: Path,
+    relative_path: str,
+) -> list[SafetyIssue]:
+    issues: list[SafetyIssue] = []
+    uses_local_binary = False
+    for step in _job_run_steps(job):
+        run = step["run"]
+        if re.search(r"(?m)(?:^|\s)(?:bunx|npx|pnpx)(?:\s|$)", run):
+            issues.append(
+                SafetyIssue(
+                    "workflow-dynamic-package-exec",
+                    relative_path,
+                    "secret-bearing jobs may not use dynamic package executors",
+                )
+            )
+        for line in run.splitlines():
+            if re.search(r"(?:^|\s)npm\s+exec(?:\s|$)", line) and not re.search(
+                r"(?:^|\s)--(?:offline|no-install)(?:\s|$)", line
+            ):
+                issues.append(
+                    SafetyIssue(
+                        "workflow-dynamic-package-exec",
+                        relative_path,
+                        "npm exec in a secret-bearing job must prohibit downloads",
+                    )
+                )
+        if re.search(r"(?:^|\s)(?:\./)?node_modules/\.bin/", run):
+            uses_local_binary = True
+    if uses_local_binary and not _has_frozen_local_binary_install(job, repo_root):
+        issues.append(
+            SafetyIssue(
+                "workflow-local-binary-lock",
+                relative_path,
+                "local package binaries require npm ci and a committed package-lock.json",
+            )
+        )
+    return issues
+
+
 def _load_workflow(path: Path) -> dict | None:
     try:
         data = yaml.load(path.read_text(encoding="utf-8"), Loader=WorkflowLoader)
@@ -310,27 +538,49 @@ def inspect_workflow(path: Path, relative_path: str) -> list[SafetyIssue]:
         elif not version_comment:
             issues.append(SafetyIssue("workflow-action-comment", relative_path, f"pinned action lacks version comment on line {line_number}"))
 
-    pull_request_workflow = isinstance(triggers, dict) and "pull_request" in triggers
-    workflow_env = data.get("env", {})
+    trigger_names = _workflow_trigger_names(triggers)
+    untrusted_events = trigger_names & UNTRUSTED_PUBLIC_EVENTS
+    pull_request_workflow = "pull_request" in trigger_names
     jobs = data.get("jobs", {})
     if isinstance(jobs, dict):
         for job in jobs.values():
             if not isinstance(job, dict):
                 continue
-            job_env = job.get("env", {})
-            for step in job.get("steps", []):
-                if not isinstance(step, dict) or not isinstance(step.get("run"), str):
-                    continue
-                run = step["run"]
-                if "${{ secrets." in run:
-                    issues.append(SafetyIssue("workflow-secret-shell", relative_path, "shell commands may not interpolate repository secrets"))
-                secret_env = (
-                    "${{ secrets." in str(workflow_env)
-                    or "${{ secrets." in str(job_env)
-                    or "${{ secrets." in str(step.get("env", {}))
+            secret_job = _contains_repository_secret(job)
+            write_job = _job_has_sensitive_write(job)
+            if pull_request_workflow and secret_job:
+                issues.append(
+                    SafetyIssue(
+                        "workflow-pr-secret",
+                        relative_path,
+                        "pull_request jobs may not receive repository secrets",
+                    )
                 )
-                if pull_request_workflow and secret_env:
-                    issues.append(SafetyIssue("workflow-pr-secret-command", relative_path, "pull request shell commands may not receive repository secrets"))
+            if untrusted_events and (secret_job or write_job):
+                gate_problems = trusted_association_gate_issues(
+                    job.get("if"),
+                    untrusted_events,
+                )
+                for problem in gate_problems:
+                    issues.append(
+                        SafetyIssue(
+                            "workflow-untrusted-trigger-gate",
+                            relative_path,
+                            problem,
+                        )
+                    )
+            if secret_job:
+                issues.extend(
+                    _dynamic_package_execution_issues(
+                        job,
+                        path.resolve().parents[2],
+                        relative_path,
+                    )
+                )
+            for step in _job_run_steps(job):
+                run = step["run"]
+                if _contains_repository_secret(run):
+                    issues.append(SafetyIssue("workflow-secret-shell", relative_path, "shell commands may not interpolate repository secrets"))
 
     if re.search(r"(?im)\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba|z|k)?sh\b", text):
         issues.append(SafetyIssue("workflow-remote-shell", relative_path, "unverified remote shell execution is forbidden"))

@@ -1,0 +1,12 @@
+{
+  "name": "ai-goofish-monitor-claude-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked Claude Code Router runtime for the trusted GitHub workflow",
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "@musistudio/claude-code-router": "1.0.8"
+  }
+}

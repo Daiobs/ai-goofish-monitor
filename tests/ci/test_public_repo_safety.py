@@ -5,6 +5,7 @@ from scripts.ci.check_public_repo_safety import (
     inspect_workflow,
     load_secret_allowlist,
     scan_text_secrets,
+    trusted_association_gate_issues,
 )
 
 
@@ -74,6 +75,23 @@ def _write_workflow(tmp_path: Path, text: str) -> Path:
     workflow.parent.mkdir(parents=True)
     workflow.write_text(text, encoding="utf-8")
     return workflow
+
+
+TRUSTED_COMMENT_GATE = """
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+""".strip()
+
+
+def _comment_workflow(job: str) -> str:
+    return f"""name: Test
+on: {{issue_comment: {{types: [created]}}}}
+permissions: {{contents: read}}
+jobs:
+  secure:
+{job}
+"""
 
 
 def test_floating_action_is_rejected(tmp_path):
@@ -147,3 +165,168 @@ def test_oversized_binary_is_rejected(tmp_path):
     )
 
     assert {"binary-artifact", "large-file"} <= _codes(issues)
+
+
+def test_issue_comment_secret_without_association_gate_is_rejected(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            """    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.TEST_TOKEN }}
+    steps: []"""
+        ),
+    )
+
+    assert "workflow-untrusted-trigger-gate" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_body_only_comment_gate_is_rejected(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            """    if: contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.TEST_TOKEN }}
+    steps: []"""
+        ),
+    )
+
+    assert "workflow-untrusted-trigger-gate" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_trusted_owner_member_collaborator_gate_is_allowed(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            f"""    if: |
+      {TRUSTED_COMMENT_GATE}
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{{{ secrets.TEST_TOKEN }}}}
+    steps: []"""
+        ),
+    )
+
+    assert trusted_association_gate_issues(
+        TRUSTED_COMMENT_GATE,
+        {"issue_comment"},
+    ) == []
+    assert inspect_workflow(workflow, ".github/workflows/test.yml") == []
+
+
+def test_contributor_association_is_not_a_trusted_gate(tmp_path):
+    contributor_gate = TRUSTED_COMMENT_GATE.replace(
+        "COLLABORATOR\"]",
+        "COLLABORATOR\",\"CONTRIBUTOR\"]",
+    )
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            f"""    if: |
+      {contributor_gate}
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{{{ secrets.TEST_TOKEN }}}}
+    steps: []"""
+        ),
+    )
+
+    assert "workflow-untrusted-trigger-gate" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_comment_id_token_write_without_gate_is_rejected(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            """    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps: []"""
+        ),
+    )
+
+    assert "workflow-untrusted-trigger-gate" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_dynamic_bunx_in_secret_bearing_job_is_rejected(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            f"""    if: |
+      {TRUSTED_COMMENT_GATE}
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{{{ secrets.TEST_TOKEN }}}}
+    steps:
+      - run: bunx fictional-package start"""
+        ),
+    )
+
+    assert "workflow-dynamic-package-exec" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_locked_local_binary_in_secret_bearing_job_is_allowed(tmp_path):
+    lock = tmp_path / "ci" / "router" / "package-lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    workflow = _write_workflow(
+        tmp_path,
+        _comment_workflow(
+            f"""    if: |
+      {TRUSTED_COMMENT_GATE}
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{{{ secrets.TEST_TOKEN }}}}
+    steps:
+      - working-directory: ci/router
+        run: npm ci --ignore-scripts
+      - working-directory: ci/router
+        run: ./node_modules/.bin/router start"""
+        ),
+    )
+
+    assert inspect_workflow(workflow, ".github/workflows/test.yml") == []
+
+
+def test_pull_request_job_may_not_receive_repository_secret(tmp_path):
+    workflow = _write_workflow(
+        tmp_path,
+        """name: Test
+on: {pull_request: {}}
+permissions: {contents: read}
+jobs:
+  unsafe:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.TEST_TOKEN }}
+    steps: []
+""",
+    )
+
+    assert "workflow-pr-secret" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_repository_claude_workflow_is_gated_locked_and_has_no_oidc():
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow = repo_root / ".github" / "workflows" / "claude.yml"
+    text = workflow.read_text(encoding="utf-8")
+
+    assert inspect_workflow(workflow, ".github/workflows/claude.yml") == []
+    assert "id-token: write" not in text
+    assert "bunx " not in text
+    assert "./node_modules/.bin/ccr start" in text
