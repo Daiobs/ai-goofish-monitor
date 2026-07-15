@@ -13,6 +13,16 @@ _ASCII_TOKEN_KEYWORD_PATTERN = re.compile(r"^[a-z0-9 ]+$")
 _ASCII_TOKEN_BOUNDARY = r"[a-z0-9]"
 _KEYWORD_SPLIT_PATTERN = re.compile(r"[\n,，]+")
 _REGEX_PREFIX = "re:"
+_RESULT_MAPPING_FIELDS = ("商品信息", "卖家信息", "ai_analysis")
+
+
+def is_valid_result_record_structure(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    return all(
+        record.get(field) is None or isinstance(record.get(field), dict)
+        for field in _RESULT_MAPPING_FIELDS
+    )
 
 
 def normalize_blacklist_keywords(values: Iterable[str] | str | None) -> list[str]:
@@ -64,13 +74,30 @@ def _keyword_matches(keyword: str, normalized_text: str) -> bool:
     return re.search(pattern, normalized_text) is not None
 
 
-def match_blacklist_keywords(record: dict[str, Any], keywords: Iterable[str] | str | None) -> list[str]:
+def match_blacklist_search_text(
+    normalized_search_text: str,
+    keywords: Iterable[str] | str | None,
+) -> list[str]:
     normalized_keywords = normalize_blacklist_keywords(keywords)
     if not normalized_keywords:
         return []
 
-    search_text = normalize_text(build_search_text(record))
-    if not search_text:
+    if not normalized_search_text:
         return []
 
-    return [keyword for keyword in normalized_keywords if _keyword_matches(keyword, search_text)]
+    return [
+        keyword
+        for keyword in normalized_keywords
+        if _keyword_matches(keyword, normalized_search_text)
+    ]
+
+
+def match_blacklist_keywords(
+    record: dict[str, Any],
+    keywords: Iterable[str] | str | None,
+) -> list[str]:
+    normalized_keywords = normalize_blacklist_keywords(keywords)
+    if not normalized_keywords or not is_valid_result_record_structure(record):
+        return []
+    search_text = normalize_text(build_search_text(record))
+    return match_blacklist_search_text(search_text, normalized_keywords)

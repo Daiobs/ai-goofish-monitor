@@ -88,6 +88,18 @@ def _result_status_index_exists(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _drop_result_status_indexes(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type = 'index' AND tbl_name = 'result_items' AND sql IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        if "status" not in str(row["sql"] or "").lower():
+            continue
+        name = str(row["name"]).replace('"', '""')
+        conn.execute(f'DROP INDEX "{name}"')
+
+
 def _assert_schema_trace_is_read_only(statements: list[str]) -> None:
     normalized = [statement.strip().upper() for statement in statements]
     assert not any(
@@ -318,7 +330,7 @@ def test_result_status_missing_column_preserves_data_and_repairs_once(tmp_path):
     conn.row_factory = sqlite3.Row
     init_schema(conn)
     _insert_result_item(conn, "preserved-item")
-    conn.execute("DROP INDEX idx_results_filename_status_crawl")
+    _drop_result_status_indexes(conn)
     conn.execute("ALTER TABLE result_items DROP COLUMN status")
     conn.commit()
     marker = conn.execute(
@@ -391,7 +403,7 @@ def test_result_status_repair_failure_rolls_back_structure_and_marker(
     conn.row_factory = sqlite3.Row
     init_schema(conn)
     _insert_result_item(conn, "rollback-item")
-    conn.execute("DROP INDEX idx_results_filename_status_crawl")
+    _drop_result_status_indexes(conn)
     conn.execute("ALTER TABLE result_items DROP COLUMN status")
     conn.execute(
         "DELETE FROM app_metadata WHERE key = ?",

@@ -8,6 +8,7 @@ import json
 import threading
 from pathlib import Path
 
+from src.keyword_rule_engine import build_search_text, normalize_text
 from src.infrastructure.persistence.sqlite_connection import (
     assign_legacy_task_ownership,
     init_schema,
@@ -21,6 +22,7 @@ from src.infrastructure.persistence.storage_names import (
     normalize_keyword_from_filename,
     normalize_keyword_slug,
 )
+from src.services.result_blacklist_service import is_valid_result_record_structure
 from src.services.task_prompt_service import TaskPromptStore
 
 
@@ -296,13 +298,19 @@ def _import_price_snapshots_if_needed(conn, legacy_price_history_dir: str) -> bo
 
 def _insert_result_record(
     conn,
-    record: dict,
+    record: object,
     *,
     keyword: str,
     filename: str,
 ) -> bool:
-    item = record.get("商品信息", {}) or {}
-    analysis = record.get("ai_analysis", {}) or {}
+    record_mapping = record if isinstance(record, dict) else {}
+    item_value = record_mapping.get("商品信息")
+    analysis_value = record_mapping.get("ai_analysis")
+    seller_value = record_mapping.get("卖家信息")
+    item = item_value if isinstance(item_value, dict) else {}
+    analysis = analysis_value if isinstance(analysis_value, dict) else {}
+    seller = seller_value if isinstance(seller_value, dict) else {}
+    raw_json = json.dumps(record, ensure_ascii=False)
     link = str(item.get("商品链接") or "")
     if link:
         link_unique_key = link.split("&", 1)[0]
@@ -314,27 +322,32 @@ def _insert_result_record(
             link_unique_key = "hash:" + hashlib.sha1(
                 json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()
-    final_keyword = str(record.get("搜索关键字") or keyword)
+    final_keyword = str(record_mapping.get("搜索关键字") or keyword)
     result_filename = filename or build_result_filename(final_keyword)
     keyword_hit_count = analysis.get("keyword_hit_count", 0)
     try:
         keyword_hit_count = int(keyword_hit_count)
     except (TypeError, ValueError):
         keyword_hit_count = 0
+    search_text = (
+        normalize_text(build_search_text(record_mapping))
+        if is_valid_result_record_structure(record)
+        else ""
+    )
 
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO result_items (
             result_filename, keyword, task_name, crawl_time, publish_time, price,
             price_display, item_id, title, link, link_unique_key, seller_nickname,
-            is_recommended, analysis_source, keyword_hit_count, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_recommended, analysis_source, keyword_hit_count, search_text, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             result_filename,
             final_keyword,
-            record.get("任务名称", ""),
-            record.get("爬取时间", ""),
+            record_mapping.get("任务名称", ""),
+            record_mapping.get("爬取时间", ""),
             item.get("发布时间"),
             _parse_price(item.get("当前售价")),
             item.get("当前售价"),
@@ -342,11 +355,12 @@ def _insert_result_record(
             item.get("商品标题"),
             link,
             link_unique_key,
-            (record.get("卖家信息", {}) or {}).get("卖家昵称") or item.get("卖家昵称"),
+            seller.get("卖家昵称") or item.get("卖家昵称"),
             _as_int(analysis.get("is_recommended", False)),
             analysis.get("analysis_source"),
             keyword_hit_count,
-            json.dumps(record, ensure_ascii=False),
+            search_text,
+            raw_json,
         ),
     )
     return cursor.rowcount > 0

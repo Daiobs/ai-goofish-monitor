@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from src.api import dependencies as deps
 from src.api.routes import dashboard
 from src.domain.models.task import TaskCreate
+from src.infrastructure.persistence.sqlite_connection import sqlite_connection
+from src.infrastructure.persistence.storage_names import build_task_result_filename
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.services.result_storage_service import save_task_result_record
 from src.services.task_service import TaskService
@@ -203,3 +205,66 @@ def test_dashboard_maps_task_owned_results_by_id_for_duplicate_tasks(
     assert all(item["keyword"] == "camera" for item in summaries.values())
     assert payload["summary"]["result_files"] == 2
     assert payload["summary"]["scanned_items"] == 2
+
+
+def test_dashboard_handles_structurally_malformed_latest_result(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    database_path = tmp_path / "app.sqlite3"
+    monkeypatch.setenv("APP_DATABASE_FILE", str(database_path))
+    repository = SqliteTaskRepository(
+        db_path=str(database_path),
+        legacy_config_file=None,
+    )
+    task_service = TaskService(repository)
+    task = asyncio.run(
+        task_service.create_ai_task_with_criteria(
+            TaskCreate(
+                task_name="Malformed result task",
+                keyword="fictional",
+                description="Fictional criteria only.",
+                max_pages=1,
+                personal_only=True,
+            ),
+            "fictional criteria",
+        )
+    )
+    malformed = {"商品信息": [], "ai_analysis": {"is_recommended": True}}
+    with sqlite_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO result_items (
+                task_id, result_filename, keyword, task_name, crawl_time,
+                item_id, title, link_unique_key, is_recommended,
+                analysis_source, keyword_hit_count, status, search_text, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'ai', 0, 'active', '', ?)
+            """,
+            (
+                task.id,
+                build_task_result_filename(task.id),
+                task.keyword,
+                task.task_name,
+                "2026-07-14T12:00:00",
+                "malformed-latest",
+                "Structured fallback title",
+                "item:malformed-latest",
+                json.dumps(malformed, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    app = FastAPI()
+    app.include_router(dashboard.router)
+    app.dependency_overrides[deps.get_task_service] = lambda: task_service
+    with TestClient(app) as client:
+        response = client.get("/api/dashboard/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    summary = next(item for item in payload["task_summaries"] if item["task_id"] == task.id)
+    assert summary["total_items"] == 1
+    assert summary["recommended_items"] == 1
+    assert summary["latest_recommended_title"] is None
+    assert payload["summary"]["scanned_items"] == 1
