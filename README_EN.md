@@ -27,8 +27,8 @@ A Playwright and AI-powered multi-task real-time monitoring tool for Xianyu (闲
 
 ### Requirements
 
-- Python 3.10+
-- Node.js + npm (`Node v20.18.3` has been verified to complete the frontend build)
+- Python 3.11 (supported CI/runtime version; Python 3.9 is unsupported)
+- Node.js 22 + npm
 - Playwright CLI and Chromium. Before the first local run, install them with `python3 -m pip install playwright && python3 -m playwright install chromium`
 - Chrome or Edge on desktop systems. On Linux, Chromium also works. `start.sh` checks this prerequisite before continuing
 
@@ -163,10 +163,7 @@ npm run dev
 
 ### Validation
 
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest
-cd web-ui && npm run build
-```
+See [CI and required quality gates](docs/ci.md) for required checks, local reproduction, dependency locking, and branch protection guidance.
 
 ### Task Creation API
 

@@ -1,0 +1,121 @@
+name: Quality
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-tests:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install system dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libzbar0
+
+      - name: Install locked Python dependencies
+        run: python -m pip install --require-hashes -r requirements-ci.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q src spider_v2.py
+
+      - name: Test CI helpers
+        run: |
+          python -m pytest tests/ci \
+            -p scripts.ci.pytest_network_guard \
+            --disable-socket \
+            --allow-hosts=localhost,127.0.0.1,::1 \
+            --allow-unix-socket
+
+      - name: Run complete non-live pytest baseline
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          set +e
+          python -m pytest \
+            -m "not live and not live_slow" \
+            -o xfail_strict=true \
+            -p scripts.ci.pytest_network_guard \
+            --disable-socket \
+            --allow-hosts=localhost,127.0.0.1,::1 \
+            --allow-unix-socket \
+            --junitxml=artifacts/pytest-results.xml
+          pytest_exit_code=$?
+          set -e
+          python scripts/ci/check_pytest_baseline.py \
+            --junit artifacts/pytest-results.xml \
+            --allowlist ci/known-test-failures.txt \
+            --pytest-exit-code "$pytest_exit_code" \
+            --summary artifacts/pytest-summary.txt
+
+      - name: Upload sanitized pytest baseline summary
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pytest-baseline-summary
+          path: artifacts/pytest-summary.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web-ui
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build frontend
+        run: npm run build
+
+  quality:
+    name: Quality
+    if: always()
+    needs:
+      - python-tests
+      - frontend-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful quality jobs
+        env:
+          PYTHON_RESULT: ${{ needs.python-tests.result }}
+          FRONTEND_RESULT: ${{ needs.frontend-build.result }}
+        run: |
+          test "$PYTHON_RESULT" = "success"
+          test "$FRONTEND_RESULT" = "success"

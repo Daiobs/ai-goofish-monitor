@@ -10,48 +10,79 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions:
+  contents: read
+
 jobs:
   claude:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       contains(github.event.comment.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+       contains(github.event.review.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' &&
+       (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
       issues: read
-      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ci/claude-router/package-lock.json
+
+      - name: Install locked Claude Code Router
+        working-directory: ci/claude-router
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Prepare Environment
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          curl -fsSL https://bun.sh/install | bash
-          mkdir -p $HOME/.claude-code-router
-          cat << 'EOF' > $HOME/.claude-code-router/config.json
-          {
-            "log": true,
-            "NON_INTERACTIVE_MODE": true,
-            "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}",
-            "OPENAI_BASE_URL": "https://api-inference.modelscope.cn/v1",
-            "OPENAI_MODEL": "MiniMax/MiniMax-M2.5"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config_dir = Path.home() / ".claude-code-router"
+          config_dir.mkdir(parents=True, exist_ok=True)
+          config = {
+              "log": True,
+              "NON_INTERACTIVE_MODE": True,
+              "OPENAI_API_KEY": os.environ["OPENAI_API_KEY"],
+              "OPENAI_BASE_URL": "https://api-inference.modelscope.cn/v1",
+              "OPENAI_MODEL": "MiniMax/MiniMax-M2.5",
           }
-          EOF
+          (config_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+          PY
         shell: bash
 
       - name: Start Claude Code Router
+        working-directory: ci/claude-router
         run: |
-          nohup ~/.bun/bin/bunx @musistudio/claude-code-router@1.0.8 start &
+          nohup ./node_modules/.bin/ccr start >/dev/null 2>&1 &
         shell: bash
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1
         env:
           ANTHROPIC_BASE_URL: http://localhost:3456
         with:
