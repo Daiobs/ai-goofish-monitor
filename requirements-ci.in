@@ -1,0 +1,8 @@
+# CI resolves the existing application and test dependencies without changing
+# the runtime Docker dependency contract.
+-r requirements.txt
+
+# CI-only quality and public-repository safety tooling.
+detect-secrets==1.5.0
+pytest-socket==0.7.0
+PyYAML==6.0.3
