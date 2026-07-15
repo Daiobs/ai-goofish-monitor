@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -19,8 +20,23 @@ class BaselineContractError(RuntimeError):
 class JUnitReport:
     failures: frozenset[str]
     errors: frozenset[str]
+    skipped: frozenset[str]
     tests: int
-    skipped: int
+
+
+DIAGNOSTIC_SECRET_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"(?i)\b(?:api[-_]?key|access[-_]?token|password|secret)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@"),
+)
+
+
+def sanitize_diagnostic(value: str) -> str:
+    sanitized = value
+    for pattern in DIAGNOSTIC_SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED]", sanitized)
+    return sanitized
 
 
 def load_allowlist(path: Path) -> frozenset[str]:
@@ -73,7 +89,7 @@ def parse_junit(path: Path, repo_root: Path) -> JUnitReport:
         ) from exc
 
     tests = 0
-    skipped = 0
+    skipped: set[str] = set()
     failures: set[str] = set()
     errors: set[str] = set()
 
@@ -92,7 +108,7 @@ def parse_junit(path: Path, repo_root: Path) -> JUnitReport:
         elif testcase.find("failure") is not None:
             failures.add(nodeid)
         if testcase.find("skipped") is not None:
-            skipped += 1
+            skipped.add(nodeid)
 
     if tests == 0:
         raise BaselineContractError("JUnit report contains no test cases")
@@ -100,8 +116,8 @@ def parse_junit(path: Path, repo_root: Path) -> JUnitReport:
     return JUnitReport(
         failures=frozenset(failures),
         errors=frozenset(errors),
+        skipped=frozenset(skipped),
         tests=tests,
-        skipped=skipped,
     )
 
 
@@ -115,6 +131,11 @@ def evaluate_baseline(
         problems.append(f"pytest exited with unsupported status {pytest_exit_code}")
     if report.errors:
         problems.append("pytest collection, fixture, or internal errors: " + ", ".join(sorted(report.errors)))
+    if report.skipped:
+        problems.append(
+            "skipped or xfailed tests are forbidden in required CI: "
+            + ", ".join(sorted(report.skipped))
+        )
 
     unknown = sorted(report.failures - allowlist)
     stale = sorted(allowlist - report.failures)
@@ -148,14 +169,16 @@ def _write_summary(
         lines.extend(
             [
                 f"tests={report.tests}",
-                f"skipped={report.skipped}",
+                f"skipped={len(report.skipped)}",
                 f"failures={len(report.failures)}",
                 f"errors={len(report.errors)}",
             ]
         )
         lines.extend(f"failure_nodeid={nodeid}" for nodeid in sorted(report.failures))
         lines.extend(f"error_nodeid={nodeid}" for nodeid in sorted(report.errors))
-    lines.extend(f"problem={problem}" for problem in problems)
+        lines.extend(f"skipped_nodeid={nodeid}" for nodeid in sorted(report.skipped))
+    lines = [sanitize_diagnostic(line) for line in lines]
+    lines.extend(f"problem={sanitize_diagnostic(problem)}" for problem in problems)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -184,12 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     _write_summary(args.summary, report, args.pytest_exit_code, problems)
     if problems:
         for problem in problems:
-            print(f"baseline contract: {problem}", file=sys.stderr)
+            print(f"baseline contract: {sanitize_diagnostic(problem)}", file=sys.stderr)
         return 1
 
     print(
         "baseline contract passed: "
-        f"{report.tests} tests, {report.skipped} skipped, "
+        f"{report.tests} tests, {len(report.skipped)} skipped, "
         f"{len(report.failures)} expected failures"
     )
     return 0

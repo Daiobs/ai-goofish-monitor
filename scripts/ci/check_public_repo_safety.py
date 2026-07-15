@@ -257,30 +257,48 @@ def inspect_tracked_file(
     if not file_path.is_file():
         return [SafetyIssue("missing-tracked-file", path, "tracked path is not a regular file")]
 
+    return inspect_blob(
+        path,
+        file_path.read_bytes(),
+        file_allowlisted=path in file_allowlist,
+        secret_rules=secret_rules,
+        max_bytes=max_bytes,
+    )
+
+
+def inspect_blob(
+    path: str,
+    content: bytes,
+    *,
+    file_allowlisted: bool = False,
+    secret_rules: Iterable[SecretAllowRule] = (),
+    max_bytes: int = MAX_TRACKED_FILE_BYTES,
+    scan_secrets: bool = True,
+) -> list[SafetyIssue]:
+    """Apply public file policy to an in-memory Git blob without exposing content."""
+
     issues = _path_policy_issues(path)
-    is_exception = path in file_allowlist
-    if is_exception:
+    if file_allowlisted:
         issues = [issue for issue in issues if issue.code not in {"binary-asset"}]
 
-    size = file_path.stat().st_size
-    if size > max_bytes and not is_exception:
+    if len(content) > max_bytes and not file_allowlisted:
         issues.append(
             SafetyIssue("large-file", path, f"tracked file exceeds {max_bytes} bytes")
         )
         return issues
 
-    sample = file_path.read_bytes()
-    if b"\x00" in sample[:8192] and not is_exception:
+    if b"\x00" in content[:8192] and not file_allowlisted:
         issues.append(SafetyIssue("binary-file", path, "binary content requires an exact exception"))
         return issues
 
     try:
-        text = sample.decode("utf-8")
+        text = content.decode("utf-8")
     except UnicodeDecodeError:
-        if not is_exception:
+        if not file_allowlisted:
             issues.append(SafetyIssue("binary-file", path, "non-UTF-8 content requires an exact exception"))
         return issues
-    issues.extend(scan_text_secrets(path, text, secret_rules))
+    if scan_secrets:
+        issues.extend(scan_text_secrets(path, text, secret_rules))
     return issues
 
 
@@ -296,6 +314,14 @@ def _workflow_trigger_names(triggers: object) -> frozenset[str]:
 
 def _contains_repository_secret(value: object) -> bool:
     return bool(re.search(r"\$\{\{\s*secrets(?:\.|\[)", str(value), re.IGNORECASE))
+
+
+def _job_receives_repository_secret(job: dict, workflow_env: object) -> bool:
+    return (
+        _contains_repository_secret(workflow_env)
+        or _contains_repository_secret(job)
+        or str(job.get("secrets", "")).lower() == "inherit"
+    )
 
 
 def _split_top_level(expression: str, operator: str) -> list[str]:
@@ -541,12 +567,13 @@ def inspect_workflow(path: Path, relative_path: str) -> list[SafetyIssue]:
     trigger_names = _workflow_trigger_names(triggers)
     untrusted_events = trigger_names & UNTRUSTED_PUBLIC_EVENTS
     pull_request_workflow = "pull_request" in trigger_names
+    workflow_env = data.get("env", {})
     jobs = data.get("jobs", {})
     if isinstance(jobs, dict):
         for job in jobs.values():
             if not isinstance(job, dict):
                 continue
-            secret_job = _contains_repository_secret(job)
+            secret_job = _job_receives_repository_secret(job, workflow_env)
             write_job = _job_has_sensitive_write(job)
             if pull_request_workflow and secret_job:
                 issues.append(

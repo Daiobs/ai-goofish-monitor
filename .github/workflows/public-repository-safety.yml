@@ -46,6 +46,7 @@ jobs:
           python -m pytest \
             tests/ci/test_public_repo_safety.py \
             tests/ci/test_detect_secrets.py \
+            tests/ci/test_git_range_safety.py \
             -p scripts.ci.pytest_network_guard \
             --disable-socket \
             --allow-hosts=localhost,127.0.0.1,::1 \
@@ -53,6 +54,16 @@ jobs:
 
       - name: Check tracked files and workflow policy
         run: python scripts/ci/check_public_repo_safety.py --repo-root .
+
+      - name: Scan every commit in the event range
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'push' && github.sha || '' }}
+        run: |
+          python scripts/ci/check_git_range_safety.py \
+            --repo-root . \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA"
 
       - name: Scan tracked repository for secrets
         run: |
