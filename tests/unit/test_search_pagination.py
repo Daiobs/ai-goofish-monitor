@@ -7,15 +7,22 @@ from src.services.search_pagination import is_search_results_response
 
 
 class FakeRequest:
-    def __init__(self, method: str = "POST"):
+    def __init__(self, method: str = "POST", resource_type: str = "xhr"):
         self.method = method
+        self.resource_type = resource_type
 
 
 class FakeResponse:
-    def __init__(self, url: str, ok: bool = True, method: str = "POST"):
+    def __init__(
+        self,
+        url: str,
+        ok: bool = True,
+        method: str = "POST",
+        resource_type: str = "xhr",
+    ):
         self.url = url
         self.ok = ok
-        self.request = FakeRequest(method)
+        self.request = FakeRequest(method, resource_type)
 
 
 class FakeLocator:
@@ -201,19 +208,20 @@ def test_is_search_results_response_matches_exact_search_api() -> None:
     assert is_search_results_response(response) is True
 
 
-def test_is_search_results_response_rejects_search_shade_api() -> None:
+def test_is_search_results_response_accepts_search_shade_api() -> None:
     response = FakeResponse(
         url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search.shade/1.0/?foo=bar",
-        method="POST",
+        method="GET",
+        resource_type="fetch",
     )
 
-    assert is_search_results_response(response) is False
+    assert is_search_results_response(response) is True
 
 
-def test_is_search_results_response_rejects_non_post_request() -> None:
+def test_is_search_results_response_rejects_unsupported_method() -> None:
     response = FakeResponse(
         url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?foo=bar",
-        method="GET",
+        method="PUT",
     )
 
     assert is_search_results_response(response) is False

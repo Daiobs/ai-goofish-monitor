@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -32,9 +33,23 @@ def is_search_results_response(
     api_url_fragment: str = SEARCH_RESULTS_API_FRAGMENT,
 ) -> bool:
     request = getattr(response, "request", None)
-    request_method = getattr(request, "method", None)
-    response_url = getattr(response, "url", "")
-    return api_url_fragment in response_url and request_method == "POST"
+    request_method = str(getattr(request, "method", "") or "").upper()
+    response_url = str(getattr(response, "url", "") or "")
+    if api_url_fragment in response_url and request_method == "POST":
+        return True
+    try:
+        parsed = urlsplit(response_url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    is_goofish = hostname == "goofish.com" or hostname.endswith(".goofish.com")
+    resource_type = str(getattr(request, "resource_type", "") or "").lower()
+    return (
+        is_goofish
+        and request_method in {"GET", "POST"}
+        and resource_type in {"xhr", "fetch"}
+        and "search" in parsed.path.lower()
+    )
 
 
 async def advance_search_page(

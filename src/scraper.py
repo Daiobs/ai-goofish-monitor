@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import re
 import sys
@@ -69,6 +68,17 @@ from src.services.seller_profile_cache import SellerProfileCache
 from src.services.search_pagination import (
     advance_search_page,
     is_search_results_response,
+)
+from src.services.browser_runtime import (
+    browser_init_script,
+    browser_major,
+    build_session_storage_script,
+    load_browser_session,
+    resolve_browser_proxy,
+)
+from src.services.search_navigation import (
+    classify_page,
+    navigate_search_and_capture,
 )
 
 
@@ -282,7 +292,7 @@ async def _finalize_scrape_resources(
         try:
             log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
             await asyncio.sleep(5)
-            if debug_limit:
+            if debug_limit and sys.stdin is not None and sys.stdin.isatty():
                 input("按回车键关闭浏览器...")
         except BaseException as exc:
             secondary_error = exc
@@ -753,6 +763,18 @@ async def _scrape_xianyu_core(
         rotation_settings["proxy_blacklist_ttl"],
         "proxy",
     )
+    can_rotate_account = (
+        rotation_settings["account_enabled"]
+        and rotation_settings["account_mode"] == "on_failure"
+        and len(account_pool.items) > 1
+    )
+    static_proxy_configured = bool(os.getenv("SCRAPER_PROXY_URL", "").strip())
+    can_rotate_proxy = (
+        not static_proxy_configured
+        and rotation_settings["proxy_enabled"]
+        and rotation_settings["proxy_mode"] == "on_failure"
+        and len(proxy_pool.items) > 1
+    )
 
     selected_account: Optional[RotationItem] = None
     selected_proxy: Optional[RotationItem] = None
@@ -776,6 +798,8 @@ async def _scrape_xianyu_core(
 
     def _select_proxy(force_new: bool = False) -> Optional[RotationItem]:
         nonlocal selected_proxy
+        if static_proxy_configured:
+            return None
         if not rotation_settings["proxy_enabled"]:
             return None
         if (
@@ -794,18 +818,13 @@ async def _scrape_xianyu_core(
         attempt_processed_item_count = 0
         stop_scraping = False
 
-        if not os.path.exists(state_file):
-            raise FileNotFoundError(f"登录状态文件不存在: {state_file}")
-
-        snapshot_data = None
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                snapshot_data = json.load(f)
-        except Exception as e:
-            print(
-                "警告：读取登录状态文件失败，将直接按路径使用: "
-                f"{sanitize_failure_reason(e)}"
-            )
+        session_plan = load_browser_session(state_file)
+        configured_proxy = os.getenv("SCRAPER_PROXY_URL", "").strip()
+        browser_proxy = resolve_browser_proxy(configured_proxy or proxy_server)
+        if browser_proxy.configured:
+            print(f"浏览器网络：显式代理 {browser_proxy.display}")
+        else:
+            print("浏览器网络：直连")
 
         async with async_playwright() as p:
             # 反检测启动参数
@@ -819,39 +838,46 @@ async def _scrape_xianyu_core(
             ]
 
             launch_kwargs = {"headless": RUN_HEADLESS, "args": launch_args}
-            if proxy_server:
-                launch_kwargs["proxy"] = {"server": proxy_server}
+            proxy_options = browser_proxy.playwright_options()
+            if proxy_options:
+                launch_kwargs["proxy"] = proxy_options
 
             launch_kwargs["channel"] = _resolve_browser_channel()
 
             browser = await p.chromium.launch(**launch_kwargs)
+            runtime_browser_major = browser_major(browser.version)
+            if (
+                session_plan.snapshot_browser_major is not None
+                and runtime_browser_major is not None
+                and session_plan.snapshot_browser_major != runtime_browser_major
+            ):
+                print(
+                    "浏览器环境提示：快照与运行浏览器主版本不同 "
+                    f"({session_plan.snapshot_browser_major}/{runtime_browser_major})"
+                )
 
             context = None
             page = None
             analysis_dispatcher: Optional[ItemAnalysisDispatcher] = None
-            context_kwargs = _default_context_options()
-            storage_state_arg = state_file
-
-            if isinstance(snapshot_data, dict):
-                # 新版扩展导出的增强快照，包含环境和Header
-                if any(
-                    key in snapshot_data
-                    for key in ("env", "headers", "page", "storage")
-                ):
-                    print(f"检测到增强浏览器快照，应用环境参数: {state_file}")
-                    storage_state_arg = {"cookies": snapshot_data.get("cookies", [])}
-                    context_kwargs.update(_build_context_overrides(snapshot_data))
-                    extra_headers = _build_extra_headers(snapshot_data.get("headers"))
-                    if extra_headers:
-                        context_kwargs["extra_http_headers"] = extra_headers
-                else:
-                    storage_state_arg = snapshot_data
+            context_kwargs = dict(session_plan.context_options)
+            storage_state_arg = session_plan.storage_state
+            if session_plan.extra_headers:
+                context_kwargs["extra_http_headers"] = session_plan.extra_headers
+            print(
+                f"已恢复 {session_plan.snapshot_kind} 登录状态: "
+                f"Cookie={session_plan.cookie_count}, "
+                f"localStorage={session_plan.local_storage_count}, "
+                f"sessionStorage={session_plan.session_storage_count}"
+            )
 
             try:
                 context_kwargs = _clean_kwargs(context_kwargs)
                 context = await browser.new_context(
                     storage_state=storage_state_arg, **context_kwargs
                 )
+                session_storage_script = build_session_storage_script(session_plan)
+                if session_storage_script:
+                    await context.add_init_script(session_storage_script)
                 seller_profile_cache = SellerProfileCache(
                     ttl_seconds=_get_seller_profile_cache_ttl(task_config)
                 )
@@ -868,29 +894,7 @@ async def _scrape_xianyu_core(
                     saver=result_saver,
                 )
 
-                # 增强反检测脚本（模拟真实移动设备）
-                await context.add_init_script("""
-                    // 移除webdriver标识
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-
-                    // 模拟真实移动设备的navigator属性
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en-US', 'en']});
-
-                    // 添加chrome对象
-                    window.chrome = {runtime: {}, loadTimes: function() {}, csi: function() {}};
-
-                    // 模拟触摸支持
-                    Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
-
-                    // 覆盖permissions查询（避免暴露自动化）
-                    const originalQuery = window.navigator.permissions.query;
-                    window.navigator.permissions.query = (parameters) => (
-                        parameters.name === 'notifications' ?
-                            Promise.resolve({state: Notification.permission}) :
-                            originalQuery(parameters)
-                    );
-                """)
+                await context.add_init_script(browser_init_script())
 
                 page = await context.new_page()
             except BaseException as setup_error:
@@ -926,17 +930,24 @@ async def _scrape_xianyu_core(
                 search_url = f"https://www.goofish.com/search?{urlencode(params)}"
                 log_time(f"目标URL: {search_url}")
 
-                # 先监听搜索接口响应，再执行导航，避免错过首次请求
-                async with page.expect_response(
-                    is_search_results_response, timeout=30000
-                ) as initial_response_info:
-                    await page.goto(
-                        search_url, wait_until="domcontentloaded", timeout=60000
+                search_navigation = await navigate_search_and_capture(
+                    page,
+                    search_url,
+                    timeout_ms=30000,
+                )
+                if not search_navigation.success:
+                    reason = search_navigation.reason
+                    if search_navigation.suggestion:
+                        log_time(f"搜索诊断建议: {search_navigation.suggestion}")
+                    if search_navigation.failure_kind == "login_required":
+                        raise LoginRequiredError(reason)
+                    if search_navigation.failure_kind == "risk_control":
+                        raise RiskControlError(reason)
+                    raise RuntimeError(
+                        f"{search_navigation.failure_kind}: {reason}"
                     )
-                _raise_if_login_redirect(page.url, "search navigation")
-
-                # 捕获初始搜索的API数据
-                initial_response = await initial_response_info.value
+                initial_response = search_navigation.response
+                log_time(f"搜索数据源: {search_navigation.source}")
 
                 # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
                 try:
@@ -946,7 +957,12 @@ async def _scrape_xianyu_core(
                         raise _login_redirect_error(
                             page.url, "search results wait"
                         ) from e
-                    raise
+                    classification = await classify_page(page)
+                    if classification.failure_kind == "login_required":
+                        raise LoginRequiredError(classification.reason) from e
+                    if classification.failure_kind == "risk_control":
+                        raise RiskControlError(classification.reason) from e
+                    log_time("搜索筛选控件未出现，继续使用已捕获的商品数据。")
 
                 # 模拟真实用户行为：页面加载后的初始停留和浏览
                 log_time("[反爬] 模拟用户查看页面...")
@@ -1515,13 +1531,16 @@ async def _scrape_xianyu_core(
         nonlocal attempt_processed_item_count, selected_account, selected_proxy
 
         processed_item_count = 0
-        attempt_limit = max(
-            rotation_settings["account_retry_limit"],
-            rotation_settings["proxy_retry_limit"],
-            1,
-        )
+        retry_limits = [1]
+        if can_rotate_account:
+            retry_limits.append(rotation_settings["account_retry_limit"])
+        if can_rotate_proxy:
+            retry_limits.append(rotation_settings["proxy_retry_limit"])
+        attempt_limit = max(retry_limits)
         last_error = ""
         failure_kind = "runtime_error"
+        first_error = ""
+        first_failure_kind = "runtime_error"
         last_state_path: Optional[str] = None
 
         pause_cookie_path = _best_effort_cookie_path(task_config)
@@ -1567,16 +1586,10 @@ async def _scrape_xianyu_core(
                 selected_account = _select_account()
                 selected_proxy = _select_proxy()
             else:
-                if (
-                    rotation_settings["account_enabled"]
-                    and rotation_settings["account_mode"] == "on_failure"
-                ):
+                if can_rotate_account:
                     account_pool.mark_bad(selected_account, last_error)
                     selected_account = _select_account(force_new=True)
-                if (
-                    rotation_settings["proxy_enabled"]
-                    and rotation_settings["proxy_mode"] == "on_failure"
-                ):
+                if can_rotate_proxy:
                     proxy_pool.mark_bad(selected_proxy, last_error)
                     selected_proxy = _select_proxy(force_new=True)
 
@@ -1584,7 +1597,11 @@ async def _scrape_xianyu_core(
                 last_error = "未找到可用的登录状态文件，无法继续执行任务。"
                 print(last_error)
                 break
-            if rotation_settings["proxy_enabled"] and not selected_proxy:
+            if (
+                rotation_settings["proxy_enabled"]
+                and not static_proxy_configured
+                and not selected_proxy
+            ):
                 last_error = "未找到可用的代理地址，无法继续执行任务。"
                 print(last_error)
                 break
@@ -1593,10 +1610,12 @@ async def _scrape_xianyu_core(
             last_state_path = state_path
             proxy_server = selected_proxy.value if selected_proxy else None
             if rotation_settings["account_enabled"]:
-                print(f"账号轮换：使用登录状态 {state_path}")
+                account_label = "账号轮换" if attempt > 1 else "账号"
+                print(f"{account_label}：使用登录状态 {state_path}")
             if rotation_settings["proxy_enabled"] and proxy_server:
+                proxy_label = "IP 轮换" if attempt > 1 else "浏览器代理"
                 print(
-                    "IP 轮换：使用代理 "
+                    f"{proxy_label}：使用代理 "
                     f"{_sanitize_url_for_display(proxy_server)}"
                 )
 
@@ -1614,6 +1633,8 @@ async def _scrape_xianyu_core(
                 attempt_processed_item_count = 0
                 failure_kind = "login_required"
                 last_error = sanitize_failure_reason(exc)
+                first_error = last_error
+                first_failure_kind = failure_kind
                 print(f"检测到登录失效/重定向: {last_error}")
                 break
             except RiskControlError as exc:
@@ -1621,6 +1642,8 @@ async def _scrape_xianyu_core(
                 attempt_processed_item_count = 0
                 failure_kind = "risk_control"
                 last_error = sanitize_failure_reason(exc)
+                first_error = last_error
+                first_failure_kind = failure_kind
                 print(f"检测到风控或验证触发: {last_error}")
                 break
             except Exception as exc:
@@ -1630,23 +1653,33 @@ async def _scrape_xianyu_core(
                 last_error = sanitize_failure_reason(
                     f"{type(exc).__name__}: {exc}"
                 )
+                if not first_error:
+                    first_error = last_error
+                    first_failure_kind = failure_kind
                 print(f"本次尝试失败: {last_error}")
                 if attempt < attempt_limit:
-                    print("将尝试轮换账号/IP 后重试...")
+                    targets = []
+                    if can_rotate_account:
+                        targets.append("账号")
+                    if can_rotate_proxy:
+                        targets.append("代理")
+                    print(f"检测到可用替代{'/'.join(targets)}，将切换后重试...")
 
         if not last_error:
             return processed_item_count
 
+        terminal_reason = first_error or last_error
+        terminal_kind = first_failure_kind if first_error else failure_kind
         terminal_failure = ScrapeTaskFailed(
             task_name=task_name_for_guard,
-            failure_kind=failure_kind,
-            reason=last_error,
+            failure_kind=terminal_kind,
+            reason=terminal_reason,
             processed_item_count=processed_item_count,
         )
         try:
             await _notify_task_failure(
                 task_config,
-                last_error,
+                terminal_reason,
                 cookie_path=last_state_path or pause_cookie_path,
             )
         except asyncio.CancelledError:
