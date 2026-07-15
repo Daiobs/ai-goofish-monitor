@@ -122,8 +122,8 @@ docker compose down
 
 ### 环境要求
 
-- Python 3.10+
-- Node.js + npm（本地验证 `Node v20.18.3` 可完成前端构建）
+- Python 3.11（CI 与受支持运行时；不支持 Python 3.9）
+- Node.js 22 + npm
 - Playwright CLI 与 Chromium，首次运行前建议执行 `python3 -m pip install playwright && python3 -m playwright install chromium`
 - Chrome / Edge 浏览器（Linux 环境也可使用 Chromium；`start.sh` 会先检查浏览器是否存在）
 
@@ -166,10 +166,7 @@ npm run dev
 
 ### 测试与校验
 
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest
-cd web-ui && npm run build
-```
+必需检查、本地复现、依赖锁和 branch protection 说明见 [CI 与必需质量门禁](docs/ci.md)。
 
 ### 任务创建 API
 
