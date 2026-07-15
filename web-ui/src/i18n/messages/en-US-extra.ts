@@ -28,6 +28,12 @@ const enUSExtra = {
       closeWindow: 'Close Window',
       status: { completed: 'Completed', failed: 'Failed', running: 'Running', queued: 'Queued' },
     },
+    preflight: {
+      running: 'Checking the account, network, and search environment...',
+      runningShort: 'Preflight',
+      passed: 'Preflight passed and the task started.',
+      direct: 'Direct browser connection',
+    },
     search: {
       matchingTasks: 'Matching Tasks',
       recentTasks: 'Recent Tasks',

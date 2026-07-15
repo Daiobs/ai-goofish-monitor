@@ -3,6 +3,8 @@ import type {
   TaskCreateResponse,
   TaskGenerateRequest,
   TaskGenerationJob,
+  MonitoringPreflightReport,
+  TaskStartResponse,
   TaskUpdate,
 } from '@/types/task.d.ts'
 import { http } from '@/lib/http'
@@ -37,8 +39,13 @@ export async function updateTask(taskId: number, data: TaskUpdate): Promise<Task
   return result.task
 }
 
-export async function startTask(taskId: number): Promise<void> {
-  await http(`/api/tasks/start/${taskId}`, { method: 'POST' })
+export async function preflightTask(taskId: number): Promise<MonitoringPreflightReport> {
+  const result = await http(`/api/tasks/preflight/${taskId}`, { method: 'POST' })
+  return result.preflight
+}
+
+export async function startTask(taskId: number): Promise<TaskStartResponse> {
+  return await http(`/api/tasks/start/${taskId}`, { method: 'POST' })
 }
 
 export async function stopTask(taskId: number): Promise<void> {

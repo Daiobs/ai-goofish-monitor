@@ -3,6 +3,7 @@ import type {
   Task,
   TaskCreateResponse,
   TaskGenerateRequest,
+  MonitoringPreflightReport,
   TaskUpdate,
 } from '@/types/task.d.ts'
 import * as taskApi from '@/api/tasks'
@@ -13,6 +14,8 @@ export function useTasks() {
   const isLoading = ref(false)
   const error = ref<Error | null>(null)
   const stoppingTaskIds = ref<Set<number>>(new Set())
+  const preflightingTaskIds = ref<Set<number>>(new Set())
+  const preflightReports = ref<Record<number, MonitoringPreflightReport>>({})
   const { on } = useWebSocket()
 
   async function fetchTasks(options?: { silent?: boolean }) {
@@ -97,16 +100,22 @@ export function useTasks() {
     }
   }
 
-  async function startTask(taskId: number) {
-    isLoading.value = true
+  async function startTask(taskId: number): Promise<MonitoringPreflightReport> {
+    error.value = null
     const task = tasks.value.find((t) => t.id === taskId)
     const previous = task?.is_running
-    if (task) {
-      task.is_running = true // 乐观更新：点击后立刻显示运行中
-    }
+    const pending = new Set(preflightingTaskIds.value)
+    pending.add(taskId)
+    preflightingTaskIds.value = pending
     try {
+      const preflight = await taskApi.preflightTask(taskId)
+      preflightReports.value = { ...preflightReports.value, [taskId]: preflight }
+      if (!preflight.success) {
+        throw new Error(`${preflight.reason} ${preflight.suggestion}`.trim())
+      }
+      if (task) task.is_running = true
       await taskApi.startTask(taskId)
-      // The websocket will update the status, but we can also optimistically update
+      return preflight
     } catch (e) {
       if (task && previous !== undefined) {
         task.is_running = previous
@@ -114,7 +123,9 @@ export function useTasks() {
       if (e instanceof Error) error.value = e
       throw e
     } finally {
-      isLoading.value = false
+      const cleaned = new Set(preflightingTaskIds.value)
+      cleaned.delete(taskId)
+      preflightingTaskIds.value = cleaned
     }
   }
 
@@ -150,5 +161,7 @@ export function useTasks() {
     startTask,
     stopTask,
     stoppingTaskIds,
+    preflightingTaskIds,
+    preflightReports,
   }
 }

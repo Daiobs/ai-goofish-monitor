@@ -28,6 +28,12 @@ const zhCNExtra = {
       closeWindow: '关闭窗口',
       status: { completed: '已完成', failed: '失败', running: '生成中', queued: '排队中' },
     },
+    preflight: {
+      running: '正在验证账号、网络和搜索环境...',
+      runningShort: '预检中',
+      passed: '环境预检通过，任务已启动',
+      direct: '浏览器直连',
+    },
     search: {
       matchingTasks: '匹配任务',
       recentTasks: '最近任务',

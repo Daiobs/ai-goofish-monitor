@@ -24,12 +24,14 @@ from src.api.dependencies import (
     set_process_service,
     set_scheduler_service,
     set_task_generation_service,
+    set_monitoring_preflight_service,
 )
 from src.services.task_service import TaskService
 from src.services.process_service import ProcessService
 from src.services.scheduler_service import SchedulerService
 from src.services.task_log_cleanup_service import cleanup_task_logs
 from src.services.task_generation_service import TaskGenerationService
+from src.services.monitoring_preflight import MonitoringPreflightService
 from src.infrastructure.persistence.sqlite_bootstrap import (
     bootstrap_sqlite_storage,
     migrate_task_prompts,
@@ -42,6 +44,7 @@ from src.infrastructure.config.settings import settings as app_settings
 process_service = ProcessService()
 scheduler_service = SchedulerService(process_service)
 task_generation_service = TaskGenerationService()
+monitoring_preflight_service = MonitoringPreflightService()
 
 
 async def _sync_task_runtime_status(task_id: int, is_running: bool) -> None:
@@ -60,11 +63,13 @@ process_service.set_lifecycle_hooks(
     on_started=lambda task_id: _sync_task_runtime_status(task_id, True),
     on_stopped=lambda task_id: _sync_task_runtime_status(task_id, False),
 )
+process_service.set_preflight_runner(monitoring_preflight_service.ensure)
 
 # 设置全局 ProcessService 实例供依赖注入使用
 set_process_service(process_service)
 set_scheduler_service(scheduler_service)
 set_task_generation_service(task_generation_service)
+set_monitoring_preflight_service(monitoring_preflight_service)
 
 
 @asynccontextmanager

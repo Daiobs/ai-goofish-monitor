@@ -25,6 +25,47 @@ export interface Task {
   is_running: boolean;
 }
 
+export type PreflightStageStatus = 'pending' | 'success' | 'failed' | 'skipped';
+
+export interface PreflightStage {
+  key: string;
+  label: string;
+  status: PreflightStageStatus;
+  message: string;
+}
+
+export interface MonitoringPreflightReport {
+  task_id: number;
+  task_name: string;
+  success: boolean;
+  failure_kind: string | null;
+  failed_stage: string | null;
+  reason: string;
+  suggestion: string;
+  checked_at: string;
+  network_mode: 'direct' | 'explicit_proxy';
+  proxy_endpoint: string;
+  state_file: string;
+  snapshot_kind: string | null;
+  cookie_count: number;
+  local_storage_count: number;
+  session_storage_count: number;
+  snapshot_browser_major: number | null;
+  runtime_browser_major: number | null;
+  browser_version_note: string;
+  search_source: string | null;
+  current_url: string;
+  page_title: string;
+  observed_requests: string[];
+  diagnostic_file: string | null;
+  stages: PreflightStage[];
+}
+
+export interface TaskStartResponse {
+  message: string;
+  preflight: MonitoringPreflightReport | null;
+}
+
 export type TaskGenerationStatus = 'queued' | 'running' | 'completed' | 'failed';
 export type TaskGenerationStepStatus = 'pending' | 'running' | 'completed' | 'failed';
 
