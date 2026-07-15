@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,9 @@ from fastapi.testclient import TestClient
 
 from src.api import dependencies as deps
 from src.api.routes import results
+from src.infrastructure.persistence.sqlite_bootstrap import bootstrap_sqlite_storage
+from src.infrastructure.persistence.sqlite_connection import sqlite_connection
+from src.infrastructure.persistence.storage_names import build_task_result_filename
 from src.services.price_history_service import (
     load_price_snapshots,
     load_task_price_snapshots,
@@ -137,6 +141,39 @@ def _seed_isolated_data():
     )
 
 
+def _insert_raw_task_result(
+    *,
+    task_id: int,
+    item_id: str,
+    crawl_time: str,
+    raw_record: dict,
+    is_recommended: bool = False,
+) -> None:
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO result_items (
+                task_id, result_filename, keyword, task_name, crawl_time,
+                item_id, title, link_unique_key, is_recommended,
+                analysis_source, keyword_hit_count, status, search_text, raw_json
+            ) VALUES (?, ?, 'camera', 'Same', ?, ?, ?, ?, ?, 'ai', 0,
+                      'active', '', ?)
+            """,
+            (
+                task_id,
+                build_task_result_filename(task_id),
+                crawl_time,
+                item_id,
+                f"Structured {item_id}",
+                f"item:{item_id}",
+                int(is_recommended),
+                json.dumps(raw_record, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+
 def test_task_scoped_api_and_canonical_filename_keep_same_keyword_tasks_isolated(
     task_results_client,
 ):
@@ -214,3 +251,68 @@ def test_delete_task_results_preserves_sibling_and_legacy_data(task_results_clie
     assert len(load_price_snapshots("camera")) == 1
     assert asyncio.run(load_task_result_blacklist_keywords(101)) == []
     assert asyncio.run(load_task_result_blacklist_keywords(102)) == ["private-b-rule"]
+
+
+def test_task_result_api_skips_structurally_malformed_rows_without_500(
+    task_results_client,
+):
+    client, _ = task_results_client
+    malformed_records = [
+        {"商品信息": []},
+        {"商品信息": "invalid"},
+        {"ai_analysis": []},
+        {"卖家信息": []},
+    ]
+    for index, record in enumerate(malformed_records):
+        _insert_raw_task_result(
+            task_id=101,
+            item_id=f"malformed-{index}",
+            crawl_time=f"2026-07-14T10:00:0{index}",
+            raw_record=record,
+            is_recommended=index == len(malformed_records) - 1,
+        )
+
+    for include_hidden in (False, True):
+        response = client.get(
+            "/api/results/tasks/101",
+            params={"include_hidden": include_hidden},
+        )
+        assert response.status_code == 200
+        assert response.json()["total_items"] == 4
+        assert response.json()["items"] == []
+
+    export = client.get(
+        "/api/results/tasks/101/export",
+        params={"include_hidden": True},
+    )
+    assert export.status_code == 200
+    assert "任务名称,搜索关键字,商品ID,商品标题" in export.text
+
+    download = client.get("/api/results/files/task_101_full_data.jsonl")
+    assert download.status_code == 200
+    assert download.text.splitlines() == [
+        json.dumps(record, ensure_ascii=False) for record in malformed_records
+    ]
+
+
+def test_task_result_api_returns_empty_page_for_huge_page_number(
+    task_results_client,
+):
+    client, _ = task_results_client
+    _seed_isolated_data()
+    huge_page = 10**19
+
+    response = client.get(
+        "/api/results/tasks/101",
+        params={"page": huge_page, "limit": 20},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "task_id": 101,
+        "filename": "task_101_full_data.jsonl",
+        "total_items": 1,
+        "page": huge_page,
+        "limit": 20,
+        "items": [],
+    }

@@ -18,6 +18,7 @@ from src.infrastructure.persistence.storage_names import (
     build_result_filename,
 )
 from src.services.result_blacklist_service import (
+    is_valid_result_record_structure,
     match_blacklist_search_text,
     normalize_blacklist_keywords,
 )
@@ -625,7 +626,7 @@ def _migrate_result_search_text(conn: sqlite3.Connection) -> None:
                 stats["invalid_json"] += 1
                 search_text = ""
             else:
-                if not isinstance(record, dict):
+                if not is_valid_result_record_structure(record):
                     stats["invalid_json"] += 1
                     search_text = ""
                 else:

@@ -136,7 +136,7 @@ def _production_page_plan(
         include_hidden=False,
     )
     sql = (
-        "SELECT raw_json, status FROM result_items "
+        "SELECT raw_json, status, search_text FROM result_items "
         f"WHERE {where_clause} ORDER BY {order_by} LIMIT ? OFFSET ?"
     )
     return _plan(conn, sql, (*params, 20, 0))
@@ -160,10 +160,19 @@ def _index_key_columns(
 def test_search_text_migration_backfills_bad_json_and_is_healthy_idempotent(tmp_path):
     valid_raw = json.dumps(_valid_record(), ensure_ascii=False, indent=2)
     invalid_raw = '{"商品信息":'
-    invalid_shape_raw = '{"商品信息": []}'
+    invalid_shape_raws = [
+        '{"商品信息": []}',
+        '{"商品信息": "invalid"}',
+        '{"ai_analysis": []}',
+        '{"卖家信息": []}',
+    ]
     conn = _create_pre_search_database(
         tmp_path / "app.sqlite3",
-        [(7, valid_raw), (8, invalid_raw), (9, invalid_shape_raw)],
+        [
+            (7, valid_raw),
+            (8, invalid_raw),
+            *((index + 9, raw) for index, raw in enumerate(invalid_shape_raws)),
+        ],
     )
 
     init_schema(conn)
@@ -191,13 +200,13 @@ def test_search_text_migration_backfills_bad_json_and_is_healthy_idempotent(tmp_
         build_search_text(json.loads(valid_raw))
     )
     assert rows[1]["search_text"] == ""
-    assert rows[2]["search_text"] == ""
+    assert all(row["search_text"] == "" for row in rows[2:])
     assert [row["raw_json"] for row in rows] == [
         valid_raw,
         invalid_raw,
-        invalid_shape_raw,
+        *invalid_shape_raws,
     ]
-    assert json.loads(marker["value"]) == {"invalid_json": 2, "rows": 3}
+    assert json.loads(marker["value"]) == {"invalid_json": 5, "rows": 6}
 
     traced: list[str] = []
     conn.set_trace_callback(traced.append)
@@ -377,6 +386,46 @@ def test_legacy_jsonl_import_writes_normalized_search_text(tmp_path):
     assert row is not None
     assert row["search_text"] == normalize_text(build_search_text(record))
     assert json.loads(row["raw_json"]) == record
+
+
+def test_legacy_jsonl_import_preserves_malformed_rows_and_continues(tmp_path):
+    malformed_records = [
+        {"商品信息": []},
+        {"商品信息": "invalid"},
+        {"ai_analysis": []},
+        {"卖家信息": []},
+    ]
+    valid_record = _valid_record()
+    legacy_dir = tmp_path / "legacy_results"
+    legacy_dir.mkdir()
+    (legacy_dir / "fiction_full_data.jsonl").write_text(
+        "\n".join(
+            json.dumps(record, ensure_ascii=False)
+            for record in [*malformed_records, valid_record]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "app.sqlite3"
+
+    bootstrap_sqlite_storage(
+        str(db_path),
+        legacy_config_file=None,
+        legacy_result_dir=str(legacy_dir),
+        legacy_price_history_dir=str(tmp_path / "missing_history"),
+    )
+
+    with sqlite_connection(str(db_path), read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT raw_json, search_text FROM result_items ORDER BY id"
+        ).fetchall()
+    assert len(rows) == 5
+    assert [json.loads(row["raw_json"]) for row in rows] == [
+        *malformed_records,
+        valid_record,
+    ]
+    assert all(row["search_text"] == "" for row in rows[:-1])
+    assert rows[-1]["search_text"] == normalize_text(build_search_text(valid_record))
 
 
 def test_task_result_write_helper_stores_normalized_search_text(tmp_path, monkeypatch):

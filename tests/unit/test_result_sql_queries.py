@@ -11,7 +11,10 @@ from src.infrastructure.persistence.storage_names import (
 )
 from src.keyword_rule_engine import build_search_text, normalize_text
 from src.services import result_storage_service as result_service
+from src.services.result_export_service import build_results_csv
 from src.services.result_storage_service import (
+    build_task_result_ndjson,
+    load_all_task_result_records,
     load_task_result_summary,
     load_visible_task_result_item_ids,
     query_result_records,
@@ -107,6 +110,41 @@ def _insert_structured_rows(conn, rows: list[tuple[int | None, str, dict, str]])
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         payloads,
+    )
+
+
+def _insert_raw_result_row(
+    conn,
+    *,
+    task_id: int,
+    item_id: str,
+    crawl_time: str,
+    raw_record: dict,
+    search_text: str = "",
+    is_recommended: bool = False,
+    analysis_source: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO result_items (
+            task_id, result_filename, keyword, task_name, crawl_time,
+            item_id, title, link_unique_key, is_recommended, analysis_source,
+            keyword_hit_count, status, search_text, raw_json
+        ) VALUES (?, ?, 'fictional camera', 'fictional task', ?, ?, ?, ?, ?, ?,
+                  0, 'active', ?, ?)
+        """,
+        (
+            task_id,
+            build_task_result_filename(task_id),
+            crawl_time,
+            item_id,
+            f"Structured {item_id}",
+            f"item:{item_id}",
+            int(is_recommended),
+            analysis_source,
+            search_text,
+            json.dumps(raw_record, ensure_ascii=False),
+        ),
     )
 
 
@@ -413,3 +451,170 @@ def test_corrupt_page_row_counts_but_is_skipped_without_api_failure(tmp_path, mo
     assert summary["total_items"] == 2
     assert summary["latest_crawl_time"] == "2026-07-14T11:00:00"
     assert summary["latest_record"] is None
+
+
+def test_structurally_malformed_rows_are_counted_but_skipped_safely(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    bootstrap_sqlite_storage()
+    malformed_records = [
+        {"商品信息": []},
+        {"商品信息": "invalid"},
+        {"ai_analysis": []},
+        {"卖家信息": []},
+    ]
+    with sqlite_connection() as conn:
+        for index, raw_record in enumerate(malformed_records):
+            _insert_raw_result_row(
+                conn,
+                task_id=402,
+                item_id=f"malformed-{index}",
+                crawl_time=f"2026-07-14T1{index}:00:00",
+                raw_record=raw_record,
+                is_recommended=index == len(malformed_records) - 1,
+                analysis_source="ai" if index == len(malformed_records) - 1 else None,
+            )
+        conn.commit()
+
+    for include_hidden in (False, True):
+        total, items = _query_task(
+            402,
+            include_hidden=include_hidden,
+            limit=100,
+        )
+        assert total == 4
+        assert items == []
+        all_records = asyncio.run(
+            load_all_task_result_records(
+                402,
+                ai_recommended_only=False,
+                keyword_recommended_only=False,
+                sort_by="crawl_time",
+                sort_order="desc",
+                include_hidden=include_hidden,
+            )
+        )
+        assert all_records == []
+        assert build_results_csv(all_records).startswith("任务名称,搜索关键字")
+
+    summary = asyncio.run(load_task_result_summary(402))
+    assert summary["total_items"] == 4
+    assert summary["recommended_items"] == 1
+    assert summary["latest_record"] is None
+    assert summary["latest_recommendation"] is None
+    assert load_visible_task_result_item_ids(402) == {
+        "malformed-0",
+        "malformed-1",
+        "malformed-2",
+        "malformed-3",
+    }
+    ndjson_records = [
+        json.loads(line)
+        for line in asyncio.run(build_task_result_ndjson(402)).splitlines()
+    ]
+    assert ndjson_records == malformed_records
+
+
+def test_visibility_decoration_uses_persisted_search_text(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    bootstrap_sqlite_storage()
+    with sqlite_connection() as conn:
+        _insert_raw_result_row(
+            conn,
+            task_id=403,
+            item_id="persisted-match",
+            crawl_time="2026-07-14T10:00:00",
+            raw_record=_record("persisted-match", title="Ordinary camera"),
+            search_text="persisted blocked marker",
+        )
+        _insert_raw_result_row(
+            conn,
+            task_id=403,
+            item_id="raw-only-match",
+            crawl_time="2026-07-14T11:00:00",
+            raw_record=_record("raw-only-match", title="Blocked in raw JSON"),
+            search_text="",
+        )
+        conn.commit()
+    asyncio.run(save_task_result_blacklist_keywords(403, ["blocked"]))
+
+    monkeypatch.setattr(
+        result_service,
+        "build_search_text",
+        lambda _record: (_ for _ in ()).throw(
+            AssertionError("reads must use persisted search_text")
+        ),
+    )
+
+    visible_total, visible = _query_task(403, limit=100)
+    assert visible_total == 1
+    assert visible[0]["商品信息"]["商品ID"] == "raw-only-match"
+    assert visible[0]["_matched_blacklist_keywords"] == []
+    assert visible[0]["_effective_hidden"] is False
+
+    all_total, all_items = _query_task(403, include_hidden=True, limit=100)
+    assert all_total == 2
+    by_id = {item["商品信息"]["商品ID"]: item for item in all_items}
+    assert by_id["persisted-match"]["_matched_blacklist_keywords"] == ["blocked"]
+    assert by_id["persisted-match"]["_hidden_reason"] == "rule"
+    assert by_id["raw-only-match"]["_matched_blacklist_keywords"] == []
+
+    loaded_items = asyncio.run(
+        load_all_task_result_records(
+            403,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            sort_by="crawl_time",
+            sort_order="desc",
+            include_hidden=True,
+        )
+    )
+    loaded_by_id = {
+        item["商品信息"]["商品ID"]: item for item in loaded_items
+    }
+    assert loaded_by_id["persisted-match"]["_matched_blacklist_keywords"] == [
+        "blocked"
+    ]
+    assert loaded_by_id["raw-only-match"]["_matched_blacklist_keywords"] == []
+
+    summary = asyncio.run(load_task_result_summary(403))
+    assert summary["latest_record"]["商品信息"]["商品ID"] == "raw-only-match"
+    assert summary["latest_record"]["_matched_blacklist_keywords"] == []
+
+
+def test_huge_page_short_circuits_before_sqlite_offset_binding(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert asyncio.run(save_task_result_record(_record("only"), "fictional camera", 404))
+    page_selects = 0
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def execute(self, sql, parameters=()):
+            nonlocal page_selects
+            if "LIMIT ? OFFSET ?" in sql:
+                page_selects += 1
+            return self._connection.execute(sql, parameters)
+
+    @contextmanager
+    def proxied_connection(*args, **kwargs):
+        with sqlite_connection(*args, **kwargs) as connection:
+            yield ConnectionProxy(connection)
+
+    monkeypatch.setattr(result_service, "sqlite_connection", proxied_connection)
+
+    total, items = _query_task(404, page=10**19)
+    assert total == 1
+    assert items == []
+    assert page_selects == 0
+
+    total, items = _query_task(404, limit=0)
+    assert total == 1
+    assert items == []
+    assert page_selects == 0

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -11,6 +12,72 @@ def _write_jsonl(path, records):
     with open(path, "w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _build_results_client() -> TestClient:
+    app = FastAPI()
+    app.include_router(results.router)
+    return TestClient(app)
+
+
+def test_filename_api_returns_empty_page_for_huge_page_number(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    jsonl_dir = tmp_path / "jsonl"
+    jsonl_dir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(
+        jsonl_dir / "demo_full_data.jsonl",
+        [
+            {
+                "爬取时间": "2026-01-01T01:00:00",
+                "搜索关键字": "demo",
+                "商品信息": {"商品ID": "one", "商品标题": "Demo"},
+            }
+        ],
+    )
+    huge_page = 10**19
+
+    with _build_results_client() as client:
+        response = client.get(
+            "/api/results/demo_full_data.jsonl",
+            params={"page": huge_page, "limit": 20},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["total_items"] == 1
+    assert response.json()["page"] == huge_page
+    assert response.json()["items"] == []
+
+
+@pytest.mark.parametrize("exception_type", [OverflowError, ValueError])
+def test_filename_api_does_not_expose_query_exception_details(
+    monkeypatch,
+    exception_type,
+):
+    async def fail_query(*args, **kwargs):
+        raise exception_type("fictional sqlite secret detail")
+
+    monkeypatch.setattr(results, "query_result_records", fail_query)
+    with _build_results_client() as client:
+        response = client.get("/api/results/demo_full_data.jsonl")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "读取结果文件时出错"}
+    assert "fictional sqlite secret detail" not in response.text
+
+
+def test_filename_export_does_not_expose_internal_value_error(monkeypatch):
+    async def fail_load(*args, **kwargs):
+        raise ValueError("fictional export secret detail")
+
+    monkeypatch.setattr(results, "load_all_result_records", fail_load)
+    with _build_results_client() as client:
+        response = client.get("/api/results/demo_full_data.jsonl/export")
+        invalid_filename = client.get("/api/results/not-json.txt")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "导出结果文件时出错"}
+    assert "fictional export secret detail" not in response.text
+    assert invalid_filename.status_code == 400
 
 
 def test_results_filter_and_sort_for_keyword_recommendations(tmp_path, monkeypatch):

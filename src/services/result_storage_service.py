@@ -17,7 +17,8 @@ from src.infrastructure.persistence.storage_names import (
 )
 from src.services.price_history_service import parse_price_value
 from src.services.result_blacklist_service import (
-    match_blacklist_keywords,
+    is_valid_result_record_structure,
+    match_blacklist_search_text,
     normalize_blacklist_keywords,
 )
 
@@ -52,8 +53,8 @@ def _fallback_unique_key(record: dict, item: dict) -> str:
 
 def _parse_raw_record(raw_json: str, *, status: str | None = None) -> dict:
     record = json.loads(raw_json)
-    if not isinstance(record, dict):
-        raise ValueError("result raw_json must contain an object")
+    if not is_valid_result_record_structure(record):
+        raise ValueError("result raw_json has an invalid record structure")
     if status is not None:
         record["_status"] = status
     return record
@@ -180,9 +181,13 @@ def _prepare_filtered_query(
 def _decorate_record_visibility(
     record: dict,
     status: str | None,
+    search_text: str,
     blacklist_keywords: list[str],
 ) -> dict:
-    matched_keywords = match_blacklist_keywords(record, blacklist_keywords)
+    matched_keywords = match_blacklist_search_text(
+        search_text,
+        blacklist_keywords,
+    )
     hidden_reason = None
     if status == "expired":
         hidden_reason = "expired"
@@ -209,6 +214,7 @@ def _parse_decorated_row(row, blacklist_keywords: list[str]) -> dict | None:
     return _decorate_record_visibility(
         record,
         row["status"],
+        str(row["search_text"] or ""),
         blacklist_keywords,
     )
 
@@ -238,7 +244,8 @@ def _load_filtered_records_from_conn(
         include_hidden=include_hidden,
     )
     rows = conn.execute(
-        f"SELECT raw_json, status FROM result_items WHERE {where_clause} "
+        f"SELECT raw_json, status, search_text FROM result_items "
+        f"WHERE {where_clause} "
         f"ORDER BY {order_by}",
         tuple(params),
     ).fetchall()
@@ -462,16 +469,25 @@ def _query_records_sync(
             tuple(params),
         ).fetchone()
         total = int(total_row["total"] if total_row is not None else 0)
-        offset = max(page - 1, 0) * safe_limit
+        if safe_limit <= 0 or total <= 0:
+            return total, []
+
+        page_index = max(int(page) - 1, 0)
+        if page_index > (total - 1) // safe_limit:
+            return total, []
+
+        offset = page_index * safe_limit
+        page_limit = min(safe_limit, total - offset)
         order_by = _sort_expression(
             sort_by,
             sort_order,
             include_hidden=include_hidden,
         )
         rows = conn.execute(
-            f"SELECT raw_json, status FROM result_items WHERE {where_clause} "
+            f"SELECT raw_json, status, search_text FROM result_items "
+            f"WHERE {where_clause} "
             f"ORDER BY {order_by} LIMIT ? OFFSET ?",
-            (*params, safe_limit, offset),
+            (*params, page_limit, offset),
         ).fetchall()
 
     records: list[dict] = []
@@ -643,12 +659,12 @@ def _load_summary_sync(
             include_hidden=False,
         )
         latest_row = conn.execute(
-            f"SELECT raw_json, status FROM result_items "
+            f"SELECT raw_json, status, search_text FROM result_items "
             f"WHERE {where_clause} ORDER BY {order_by} LIMIT 1",
             tuple(params),
         ).fetchone()
         latest_recommendation_row = conn.execute(
-            f"SELECT raw_json, status FROM result_items "
+            f"SELECT raw_json, status, search_text FROM result_items "
             f"WHERE {where_clause} AND is_recommended = 1 "
             f"ORDER BY {order_by} LIMIT 1",
             tuple(params),

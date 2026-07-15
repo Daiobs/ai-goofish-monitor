@@ -293,6 +293,10 @@ async def get_result_file_content(
 
     try:
         validate_result_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         total_items, items = await query_result_records(
             filename,
             ai_recommended_only=ai_recommended_only,
@@ -303,10 +307,8 @@ async def get_result_file_content(
             limit=limit,
             include_hidden=include_hidden,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取结果文件时出错: {exc}")
+        raise HTTPException(status_code=500, detail="读取结果文件时出错") from exc
     if total_items <= 0 and not await result_file_exists(filename):
         raise HTTPException(status_code=404, detail="结果文件未找到")
     paginated_results = enrich_records_with_price_insight(items, filename)
@@ -356,6 +358,10 @@ async def export_result_file_content(
 
     try:
         validate_result_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         results = await load_all_result_records(
             filename,
             ai_recommended_only=ai_recommended_only,
@@ -367,10 +373,8 @@ async def export_result_file_content(
         csv_text = build_results_csv(
             enrich_records_with_price_insight(results, filename)
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"导出结果文件时出错: {exc}")
+        raise HTTPException(status_code=500, detail="导出结果文件时出错") from exc
     if not results and not await result_file_exists(filename):
         raise HTTPException(status_code=404, detail="结果文件未找到")
 
