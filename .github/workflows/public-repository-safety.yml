@@ -63,7 +63,8 @@ jobs:
           python scripts/ci/check_git_range_safety.py \
             --repo-root . \
             --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA"
+            --head-sha "$HEAD_SHA" \
+            --file-allowlist ci/public-file-allowlist.txt
 
       - name: Scan tracked repository for secrets
         run: |

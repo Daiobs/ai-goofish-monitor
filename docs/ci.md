@@ -97,20 +97,33 @@ tests/unit/test_utils.py::test_save_to_jsonl
 ```bash
 python scripts/ci/check_public_repo_safety.py --repo-root .
 BASE_SHA=<reviewed-base-sha> HEAD_SHA=<candidate-head-sha> \
-  python scripts/ci/check_git_range_safety.py --repo-root .
+  python scripts/ci/check_git_range_safety.py \
+    --repo-root . \
+    --file-allowlist ci/public-file-allowlist.txt
 python scripts/ci/check_detect_secrets.py \
   --repo-root . \
   --baseline .secrets.baseline \
   --secret-allowlist ci/public-secret-allowlist.yml
 ```
 
-当前树检查范围来自 `git ls-files`。PR 使用 base/head SHA，master push 使用 `before`/`github.sha`，额外遍历范围内每个 commit 新增或修改的 blob；因此中间 commit 里添加后又删除的 secret、数据库、Cookie、私钥或大型二进制仍会失败。范围 secret 判定不读取当前 `.secrets.baseline` 或 allowlist，修改两者无法掩盖中间 commit。`workflow_dispatch` 没有事件范围时只运行当前树检查。
+当前树检查范围来自 `git ls-files`。PR 使用 base/head SHA，master push 使用 `before`/`github.sha`，额外遍历范围内每个 commit 新增或修改的 blob；因此中间 commit 里添加后又删除的 secret、数据库、Cookie、私钥或大型二进制仍会失败。文件例外只适用于 Head 中仍存在的同路径普通文件，并且扫描 blob 必须与 Head blob SHA 完全一致；同路径的中间 blob 不会继承例外。范围 secret 判定不读取当前 `.secrets.baseline`、secret allowlist 或 file allowlist，修改这些文件无法掩盖中间 commit。`workflow_dispatch` 没有事件范围时只运行当前树检查。
 
 门禁拒绝环境文件、数据库、Cookie、浏览器状态、日志、运行 JSONL、价格历史、私钥、本地代理配置、备份、大型文件和未审阅二进制。已有项目图片只通过 `ci/public-file-allowlist.txt` 中的逐文件例外保留。
 
 `detect-secrets` 使用 `--no-verify`，仓库内容不会上传到外部服务。`.secrets.baseline` 中每个误报还必须匹配 `ci/public-secret-allowlist.yml` 的精确路径和窄正则；禁止目录级或全局放行。
 
-所有 `.github/workflows/*.yml` 中的外部 action 必须固定到完整 40 位 commit SHA，并在同行注释人类可读版本。Docker action 必须固定 digest。安全检查同时拒绝 `pull_request_target`、默认 write 权限、未验证的远程 shell 管道，以及向 PR shell 命令传入 repository secret。任何由公开评论/讨论触发且拥有 secret 或写权限的 job，必须在 job 级 `if` 中按事件字段明确限定 `OWNER`、`MEMBER` 或 `COLLABORATOR`。Claude Router 使用 `ci/claude-router/package-lock.json` 和 `npm ci --ignore-scripts`，只执行本地 lock 的 `ccr` 二进制，不授予 OIDC。
+所有 `.github/workflows/*.yml` 中的外部 action 必须固定到完整 40 位 commit SHA，并在同行注释人类可读版本。Docker action 必须固定 digest。安全检查同时拒绝 `pull_request_target`、默认 write 权限、未验证的远程 shell 管道，以及向 PR shell 命令传入 repository secret。任何拥有 repository secret 或敏感 write 权限的 job，都必须为 workflow 声明的每个事件提供恰好一个顶层 `OR` 分支和明确的 `github.event_name` 判别；公开评论/讨论事件的每个分支还必须精确限定 `OWNER`、`MEMBER` 或 `COLLABORATOR`。无事件分支、重复事件、嵌套可选 association 或追加 `|| true` 都会失败。Claude Router 使用 `ci/claude-router/package-lock.json` 和 `npm ci --ignore-scripts`，只执行本地 lock 的 `ccr` 二进制，不授予 OIDC。
+
+## 手动镜像发布
+
+`.github/workflows/docker-image.yml` 不是 required check，也不会随 PR 或 `master` push 自动运行。它只保留 `workflow_dispatch`，由拥有仓库写权限的维护者在明确需要发布 GHCR 镜像时手动触发；`packages: write` 仅位于实际发布 job。自动镜像发布策略留给后续 PIPELINE/发布阶段设计。
+
+当前 required checks 仍只有：
+
+```text
+Quality
+Public repository safety
+```
 
 ## Live 测试
 

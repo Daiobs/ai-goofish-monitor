@@ -22,8 +22,10 @@ from scripts.ci.check_detect_secrets import (  # noqa: E402
 )
 from scripts.ci.check_public_repo_safety import (  # noqa: E402
     MAX_TRACKED_FILE_BYTES,
+    SafetyConfigError,
     SafetyIssue,
     inspect_blob,
+    load_file_allowlist,
 )
 
 
@@ -90,22 +92,33 @@ def _commit_parents(repo_root: Path, commit: str) -> tuple[str, ...]:
     return tuple(fields[1:]) or (EMPTY_TREE_SHA,)
 
 
-def _tree_blob(repo_root: Path, treeish: str, path: str) -> str:
+def _regular_tree_blob(repo_root: Path, treeish: str, path: str) -> str | None:
     output = _git(repo_root, "ls-tree", "-z", treeish, "--", path)
     entries = [entry for entry in output.split(b"\0") if entry]
     if len(entries) != 1 or b"\t" not in entries[0]:
-        raise GitRangeSafetyError("changed path does not resolve to one Git object")
+        return None
     metadata, listed_path = entries[0].split(b"\t", 1)
     fields = metadata.split()
-    if len(fields) != 3 or fields[1] != b"blob":
-        raise GitRangeSafetyError("changed path is not a regular Git blob")
+    if (
+        len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+    ):
+        return None
     try:
         decoded_path = listed_path.decode("utf-8")
         blob = fields[2].decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise GitRangeSafetyError("changed Git path or object is invalid") from exc
+    except UnicodeDecodeError:
+        return None
     if decoded_path != path or not re.fullmatch(r"[0-9a-f]{40,64}", blob):
-        raise GitRangeSafetyError("changed Git path or blob is inconsistent")
+        return None
+    return blob
+
+
+def _tree_blob(repo_root: Path, treeish: str, path: str) -> str:
+    blob = _regular_tree_blob(repo_root, treeish, path)
+    if blob is None:
+        raise GitRangeSafetyError("changed path is not one regular Git blob")
     return blob
 
 
@@ -258,17 +271,41 @@ def scan_commit_range(
     base_revision: str,
     head_revision: str,
     *,
+    file_allowlist_path: Path | None = None,
     max_bytes: int = MAX_TRACKED_FILE_BYTES,
 ) -> list[SafetyIssue]:
     repo_root = repo_root.resolve()
-    changes = changes_in_range(repo_root, base_revision, head_revision)
+    head = _resolve_commit(repo_root, head_revision)
+    file_allowlist = (
+        load_file_allowlist(file_allowlist_path)
+        if file_allowlist_path is not None
+        else frozenset()
+    )
+    head_allowlisted_blobs: dict[str, str] = {}
     issues: list[SafetyIssue] = []
+    for path in sorted(file_allowlist):
+        blob = _regular_tree_blob(repo_root, head, path)
+        if blob is None:
+            issues.append(
+                SafetyIssue(
+                    "stale-file-exception",
+                    path,
+                    "allowlisted path is not a regular blob in the Head tree",
+                )
+            )
+        else:
+            head_allowlisted_blobs[path] = blob
+
+    changes = changes_in_range(repo_root, base_revision, head_revision)
     scan_blobs: dict[str, tuple[str, bytes]] = {}
     content_cache: dict[str, bytes] = {}
 
     for change in changes:
+        file_allowlisted = (
+            head_allowlisted_blobs.get(change.new_path) == change.new_blob
+        )
         size = _blob_size(repo_root, change.new_blob)
-        if size > max_bytes:
+        if size > max_bytes and not file_allowlisted:
             policy_content = b"x" * (max_bytes + 1)
         else:
             policy_content = content_cache.setdefault(
@@ -290,6 +327,7 @@ def scan_commit_range(
             for issue in inspect_blob(
                 change.new_path,
                 policy_content,
+                file_allowlisted=file_allowlisted,
                 max_bytes=max_bytes,
                 scan_secrets=False,
             )
@@ -334,6 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--base-sha", default=os.environ.get("BASE_SHA", ""))
     parser.add_argument("--head-sha", default=os.environ.get("HEAD_SHA", ""))
+    parser.add_argument(
+        "--file-allowlist",
+        type=Path,
+        default=Path("ci/public-file-allowlist.txt"),
+    )
     return parser
 
 
@@ -350,8 +393,9 @@ def main(argv: list[str] | None = None) -> int:
             args.repo_root,
             args.base_sha,
             args.head_sha,
+            file_allowlist_path=args.repo_root.resolve() / args.file_allowlist,
         )
-    except (OSError, GitRangeSafetyError) as exc:
+    except (OSError, GitRangeSafetyError, SafetyConfigError) as exc:
         print(f"commit-range safety failed: {exc}", file=sys.stderr)
         return 1
     if issues:

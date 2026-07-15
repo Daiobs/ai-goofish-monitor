@@ -1,6 +1,10 @@
 from pathlib import Path
 
+import pytest
+import yaml
+
 from scripts.ci.check_public_repo_safety import (
+    WorkflowLoader,
     inspect_tracked_file,
     inspect_workflow,
     load_secret_allowlist,
@@ -81,6 +85,13 @@ TRUSTED_COMMENT_GATE = """
       (github.event_name == 'issue_comment' &&
        contains(github.event.comment.body, '@claude') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+""".strip()
+
+TRUSTED_ISSUE_GATE = """
+      (github.event_name == 'issues' &&
+       (contains(github.event.issue.body, '@claude') ||
+        contains(github.event.issue.title, '@claude')) &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
 """.strip()
 
 
@@ -220,6 +231,75 @@ def test_trusted_owner_member_collaborator_gate_is_allowed(tmp_path):
     assert inspect_workflow(workflow, ".github/workflows/test.yml") == []
 
 
+def test_multi_event_trusted_gate_is_allowed():
+    condition = f"{TRUSTED_COMMENT_GATE} || {TRUSTED_ISSUE_GATE}"
+
+    assert trusted_association_gate_issues(
+        condition,
+        {"issue_comment", "issues"},
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        f"{TRUSTED_COMMENT_GATE} || true",
+        (
+            f"{TRUSTED_COMMENT_GATE} || "
+            "contains(github.event.comment.body, '@claude')"
+        ),
+        (
+            "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
+            "github.event.comment.author_association)"
+        ),
+        f"{TRUSTED_COMMENT_GATE} || {TRUSTED_COMMENT_GATE}",
+        (
+            "github.event_name == 'issue_comment' && "
+            "github.event_name == 'issues' && "
+            "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
+            "github.event.comment.author_association)"
+        ),
+        (
+            "github.event_name == 'issue_comment' && "
+            "(contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
+            "github.event.comment.author_association) || "
+            "contains(github.event.comment.body, '@claude'))"
+        ),
+    ],
+)
+def test_trusted_gate_rejects_noncanonical_or_branches(condition):
+    assert trusted_association_gate_issues(condition, {"issue_comment"})
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "github.event_name == 'issue_comment' && (true",
+        "github.event_name == 'issue_comment' | true",
+        "${{ github.event_name == 'issue_comment'",
+        "github.event_name == 'unknown_event'",
+    ],
+)
+def test_trusted_gate_fails_closed_on_malformed_or_unknown_expressions(condition):
+    assert trusted_association_gate_issues(condition, {"issue_comment"})
+
+
+def test_workflow_dispatch_explicit_branch_needs_no_association():
+    assert trusted_association_gate_issues(
+        "github.event_name == 'workflow_dispatch'",
+        {"workflow_dispatch"},
+    ) == []
+
+
+def test_missing_association_is_rejected():
+    condition = (
+        "github.event_name == 'issue_comment' && "
+        "contains(github.event.comment.body, '@claude')"
+    )
+
+    assert trusted_association_gate_issues(condition, {"issue_comment"})
+
+
 def test_contributor_association_is_not_a_trusted_gate(tmp_path):
     contributor_gate = TRUSTED_COMMENT_GATE.replace(
         "COLLABORATOR\"]",
@@ -325,8 +405,66 @@ def test_repository_claude_workflow_is_gated_locked_and_has_no_oidc():
     repo_root = Path(__file__).resolve().parents[2]
     workflow = repo_root / ".github" / "workflows" / "claude.yml"
     text = workflow.read_text(encoding="utf-8")
+    data = yaml.load(text, Loader=WorkflowLoader)
 
     assert inspect_workflow(workflow, ".github/workflows/claude.yml") == []
+    assert trusted_association_gate_issues(
+        data["jobs"]["claude"]["if"],
+        data["on"].keys(),
+    ) == []
     assert "id-token: write" not in text
     assert "bunx " not in text
     assert "./node_modules/.bin/ccr start" in text
+
+
+def test_repository_claude_workflow_rejects_appended_ungated_branch(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / ".github" / "workflows" / "claude.yml").read_text(
+        encoding="utf-8"
+    )
+    mutated = text.replace(
+        "\n    runs-on: ubuntu-latest",
+        "\n      || contains(github.event.issue.body, '@claude')"
+        "\n    runs-on: ubuntu-latest",
+        1,
+    )
+    workflow = _write_workflow(tmp_path, mutated)
+
+    assert "workflow-untrusted-trigger-gate" in _codes(
+        inspect_workflow(workflow, ".github/workflows/test.yml")
+    )
+
+
+def test_docker_publish_workflow_is_manual_only_and_write_scoped():
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow = repo_root / ".github" / "workflows" / "docker-image.yml"
+    data = yaml.load(workflow.read_text(encoding="utf-8"), Loader=WorkflowLoader)
+
+    assert data["name"] == "Manual Docker image publish"
+    assert set(data["on"]) == {"workflow_dispatch"}
+    assert {"push", "pull_request", "schedule", "release"}.isdisjoint(data["on"])
+    assert set(data["jobs"]) == {"build-base", "build-and-push"}
+    for job in data["jobs"].values():
+        assert job["permissions"]["packages"] == "write"
+        assert "workflow_dispatch" in job["if"]
+    assert inspect_workflow(workflow, ".github/workflows/docker-image.yml") == []
+
+
+def test_required_workflows_have_no_package_write_permission():
+    repo_root = Path(__file__).resolve().parents[2]
+
+    for name in ("quality.yml", "public-repository-safety.yml"):
+        workflow = repo_root / ".github" / "workflows" / name
+        data = yaml.load(workflow.read_text(encoding="utf-8"), Loader=WorkflowLoader)
+        assert "packages: write" not in workflow.read_text(encoding="utf-8")
+        for job in data["jobs"].values():
+            assert job.get("permissions", {}).get("packages") != "write"
+
+
+def test_public_safety_workflow_passes_file_allowlist_to_range_scan():
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow = repo_root / ".github" / "workflows" / "public-repository-safety.yml"
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "check_git_range_safety.py" in text
+    assert "--file-allowlist ci/public-file-allowlist.txt" in text

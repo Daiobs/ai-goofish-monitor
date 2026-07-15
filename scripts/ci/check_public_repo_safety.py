@@ -34,17 +34,6 @@ BINARY_ARTIFACT_EXTENSIONS = {
 }
 TRUSTED_ACTION_OWNERS = {"actions", "anthropics", "docker", "oven-sh"}
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
-UNTRUSTED_PUBLIC_EVENTS = frozenset(
-    {
-        "discussion",
-        "discussion_comment",
-        "issue_comment",
-        "issues",
-        "pull_request",
-        "pull_request_review",
-        "pull_request_review_comment",
-    }
-)
 ASSOCIATION_FIELDS = {
     "discussion": "github.event.discussion.author_association",
     "discussion_comment": "github.event.comment.author_association",
@@ -358,6 +347,38 @@ def _split_top_level(expression: str, operator: str) -> list[str]:
     return parts
 
 
+def _expression_syntax_is_valid(expression: str) -> bool:
+    depth = 0
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif char in {"&", "|"}:
+            if index + 1 >= len(expression) or expression[index + 1] != char:
+                return False
+            index += 1
+        index += 1
+    return depth == 0 and not quote and not escaped
+
+
 def _outer_parentheses_wrap(expression: str) -> bool:
     if not expression.startswith("(") or not expression.endswith(")"):
         return False
@@ -400,34 +421,89 @@ def trusted_association_gate_issues(
     if not isinstance(condition, str) or not condition.strip():
         return ["missing trusted author association gate"]
 
-    branches = _split_top_level(_strip_expression_wrapper(condition), "||")
+    expression = condition.strip()
+    has_open_wrapper = expression.startswith("${{")
+    has_close_wrapper = expression.endswith("}}")
+    if has_open_wrapper != has_close_wrapper:
+        return ["trusted event gate expression is malformed"]
+    if has_open_wrapper:
+        expression = expression[3:-2].strip()
+        if "${{" in expression or "}}" in expression:
+            return ["trusted event gate expression is malformed"]
+    if not expression or not _expression_syntax_is_valid(expression):
+        return ["trusted event gate expression is malformed"]
+
+    expected_events = {str(event_name) for event_name in event_names}
+    if not expected_events:
+        return ["sensitive job has no declared trigger events"]
+
+    branches = _split_top_level(_strip_expression_wrapper(expression), "||")
     problems: list[str] = []
-    for event_name in sorted(set(event_names)):
-        expected_event = re.compile(
-            rf"^github\.event_name==(['\"]){re.escape(event_name)}\1$"
-        )
-        expected_field = ASSOCIATION_FIELDS[event_name]
-        trusted_values = '["' + '","'.join(TRUSTED_ASSOCIATIONS) + '"]'
+    seen_events: set[str] = set()
+    event_comparison = re.compile(
+        r"github\.event_name\s*==\s*(['\"])([A-Za-z0-9_]+)\1"
+    )
+    exact_event_conjunct = re.compile(
+        r"^github\.event_name==(['\"])([A-Za-z0-9_]+)\1$"
+    )
+    trusted_values = '["' + '","'.join(TRUSTED_ASSOCIATIONS) + '"]'
+
+    for branch_number, raw_branch in enumerate(branches, start=1):
+        branch = _strip_expression_wrapper(raw_branch)
+        if not branch:
+            problems.append(f"OR branch {branch_number} is empty")
+            continue
+        conjuncts = [
+            _strip_expression_wrapper(part)
+            for part in _split_top_level(branch, "&&")
+        ]
+        if any(not part for part in conjuncts):
+            problems.append(f"OR branch {branch_number} is malformed")
+            continue
+        compact_branch = re.sub(r"\s+", "", branch)
+        event_occurrences = list(event_comparison.finditer(branch))
+        event_conjuncts = [
+            match
+            for part in conjuncts
+            if (match := exact_event_conjunct.fullmatch(re.sub(r"\s+", "", part)))
+        ]
+        if (
+            len(event_occurrences) != 1
+            or compact_branch.count("github.event_name") != 1
+            or len(event_conjuncts) != 1
+        ):
+            problems.append(
+                f"OR branch {branch_number} must contain exactly one top-level event discriminator"
+            )
+            continue
+
+        event_name = event_conjuncts[0].group(2)
+        if event_name not in expected_events:
+            problems.append(f"OR branch {branch_number} references an unknown trigger event")
+            continue
+        if event_name in seen_events:
+            problems.append(f"{event_name} has more than one executable OR branch")
+            continue
+        seen_events.add(event_name)
+
+        expected_field = ASSOCIATION_FIELDS.get(event_name)
+        if expected_field is None:
+            continue
         expected_gate = (
             f"contains(fromJSON('{trusted_values}'),"
             f"{expected_field})"
         )
-        matching_branches: list[list[str]] = []
-        for branch in branches:
-            branch = _strip_expression_wrapper(branch)
-            if len(_split_top_level(branch, "||")) != 1:
-                continue
-            conjuncts = [
-                _strip_expression_wrapper(part)
-                for part in _split_top_level(branch, "&&")
-            ]
-            compact = [re.sub(r"\s+", "", part) for part in conjuncts]
-            if any(expected_event.fullmatch(part) for part in compact):
-                matching_branches.append(compact)
-        if len(matching_branches) != 1 or expected_gate not in matching_branches[0]:
+        compact_conjuncts = [re.sub(r"\s+", "", part) for part in conjuncts]
+        if (
+            compact_conjuncts.count(expected_gate) != 1
+            or compact_branch.count("author_association") != 1
+        ):
             problems.append(
                 f"{event_name} must fail closed to OWNER, MEMBER, or COLLABORATOR"
             )
+
+    for event_name in sorted(expected_events - seen_events):
+        problems.append(f"{event_name} must have exactly one executable OR branch")
     return problems
 
 
@@ -565,7 +641,6 @@ def inspect_workflow(path: Path, relative_path: str) -> list[SafetyIssue]:
             issues.append(SafetyIssue("workflow-action-comment", relative_path, f"pinned action lacks version comment on line {line_number}"))
 
     trigger_names = _workflow_trigger_names(triggers)
-    untrusted_events = trigger_names & UNTRUSTED_PUBLIC_EVENTS
     pull_request_workflow = "pull_request" in trigger_names
     workflow_env = data.get("env", {})
     jobs = data.get("jobs", {})
@@ -583,10 +658,10 @@ def inspect_workflow(path: Path, relative_path: str) -> list[SafetyIssue]:
                         "pull_request jobs may not receive repository secrets",
                     )
                 )
-            if untrusted_events and (secret_job or write_job):
+            if trigger_names and (secret_job or write_job):
                 gate_problems = trusted_association_gate_issues(
                     job.get("if"),
-                    untrusted_events,
+                    trigger_names,
                 )
                 for problem in gate_problems:
                     issues.append(
