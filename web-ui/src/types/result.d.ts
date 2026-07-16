@@ -38,6 +38,7 @@ export interface AiAnalysis {
   is_recommended: boolean;
   reason: string;
   analysis_source?: 'ai' | 'keyword';
+  analysis_status?: 'completed' | 'failed' | 'skipped';
   keyword_hit_count?: number;
   value_score?: number;
   value_summary?: string;
@@ -45,6 +46,7 @@ export interface AiAnalysis {
   risk_tags?: string[];
   criteria_analysis?: Record<string, any>;
   matched_keywords?: string[];
+  request_duration_seconds?: number;
   error?: string;
 }
 

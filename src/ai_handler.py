@@ -7,6 +7,7 @@ import sys
 import shutil
 import traceback
 from datetime import datetime, timedelta
+from time import monotonic
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import requests
@@ -373,6 +374,7 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
     api_mode = CHAT_COMPLETIONS_API_MODE
     use_response_format = ENABLE_RESPONSE_FORMAT
     use_temperature = True
+    request_started_at = monotonic()
     for attempt in range(max_retries):
         try:
             # 根据重试次数调整参数
@@ -422,7 +424,14 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
 
                 # 验证响应格式
                 if validate_ai_response_format(parsed_response):
-                    safe_print(f"   [AI分析] 第{attempt + 1}次尝试成功，响应格式验证通过")
+                    request_duration = round(
+                        max(0.0, monotonic() - request_started_at), 3
+                    )
+                    parsed_response["request_duration_seconds"] = request_duration
+                    safe_print(
+                        f"   [AI分析] 第{attempt + 1}次尝试成功，响应格式验证通过，"
+                        f"请求耗时 {request_duration:.3f} 秒"
+                    )
                     return parsed_response
                 safe_print(f"   [AI分析] 第{attempt + 1}次尝试格式验证失败")
                 if attempt < max_retries - 1:

@@ -203,6 +203,8 @@ const enUS = {
       curated: 'Curated',
       strongRecommend: 'Strong Buy',
       notRecommended: 'Skip',
+      aiFailed: 'AI analysis failed',
+      aiCompleted: 'AI complete',
       pending: 'Watch',
       analyzing: 'AI is still analyzing the potential value of this item...',
       collapse: 'Hide details',

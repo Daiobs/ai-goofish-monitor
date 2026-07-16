@@ -76,6 +76,87 @@ def test_item_analysis_dispatcher_uses_bounded_concurrency():
     assert len(notifications) == 3
     assert max_active_ai_calls == 2
     assert saved_records[0][1]["卖家信息"]["卖家ID"].startswith("seller-")
+    assert all(
+        record["ai_analysis"]["analysis_status"] == "completed"
+        for _, record in saved_records
+    )
+
+
+def test_item_analysis_failure_is_saved_and_does_not_stop_other_items():
+    saved_records = []
+    notifications = []
+
+    async def seller_loader(_user_id: str):
+        return {}
+
+    async def image_downloader(_product_id, _image_urls, _task_name):
+        return []
+
+    async def ai_analyzer(record: dict, _image_paths: list[str], _prompt_text: str):
+        if record["商品信息"]["商品ID"] == "failed-item":
+            raise RuntimeError("fictional AI outage")
+        return {
+            "analysis_source": "ai",
+            "is_recommended": True,
+            "reason": "通过验收规则",
+            "keyword_hit_count": 0,
+        }
+
+    async def notifier(item_data: dict, reason: str):
+        notifications.append((item_data["商品ID"], reason))
+
+    async def saver(record: dict, _keyword: str):
+        saved_records.append(record)
+        return True
+
+    async def run():
+        dispatcher = ItemAnalysisDispatcher(
+            concurrency=1,
+            skip_ai_analysis=False,
+            seller_loader=seller_loader,
+            image_downloader=image_downloader,
+            ai_analyzer=ai_analyzer,
+            notifier=notifier,
+            saver=saver,
+        )
+        for item_id in ("failed-item", "successful-item"):
+            dispatcher.submit(
+                ItemAnalysisJob(
+                    keyword="demo",
+                    task_name="Demo",
+                    decision_mode="ai",
+                    analyze_images=False,
+                    prompt_text="prompt",
+                    keyword_rules=(),
+                    final_record={
+                        "商品信息": {
+                            "商品ID": item_id,
+                            "商品标题": "演示商品",
+                            "商品图片列表": [],
+                        },
+                        "卖家信息": {},
+                    },
+                    seller_id=None,
+                    zhima_credit_text=None,
+                    registration_duration_text="",
+                )
+            )
+        await dispatcher.join()
+        return dispatcher
+
+    dispatcher = asyncio.run(run())
+
+    assert dispatcher.completed_count == 2
+    assert [record["商品信息"]["商品ID"] for record in saved_records] == [
+        "failed-item",
+        "successful-item",
+    ]
+    failed_analysis = saved_records[0]["ai_analysis"]
+    assert failed_analysis["analysis_status"] == "failed"
+    assert failed_analysis["is_recommended"] is False
+    assert failed_analysis["reason"].startswith("AI分析异常:")
+    assert saved_records[1]["ai_analysis"]["analysis_status"] == "completed"
+    assert notifications == [("successful-item", "通过验收规则")]
 
 
 def test_item_analysis_dispatcher_supports_keyword_mode_without_ai():

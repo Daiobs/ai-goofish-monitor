@@ -28,8 +28,13 @@ const seller = props.item.卖家信息
 const ai = props.item.ai_analysis
 const priceInsight = props.item.price_insight
 
-const isRecommended = ai?.is_recommended === true
+const isAiFailure = computed(() => (
+  ai?.analysis_source === 'ai'
+  && (ai?.analysis_status === 'failed' || Boolean(ai?.error))
+))
+const isRecommended = computed(() => ai?.is_recommended === true && !isAiFailure.value)
 const recommendationStatus = computed(() => {
+  if (isAiFailure.value) return { label: t('results.card.aiFailed'), color: 'bg-rose-500', icon: AlertCircle, text: 'text-rose-600', bg: 'bg-rose-50' }
   if (ai?.is_recommended === true) return { label: t('results.card.strongRecommend'), color: 'bg-emerald-500', icon: CheckCircle2, text: 'text-emerald-600', bg: 'bg-emerald-50' }
   if (ai?.is_recommended === false) return { label: t('results.card.notRecommended'), color: 'bg-rose-500', icon: XCircle, text: 'text-rose-600', bg: 'bg-rose-50' }
   return { label: t('results.card.pending'), color: 'bg-amber-500', icon: AlertCircle, text: 'text-amber-600', bg: 'bg-amber-50' }
@@ -122,13 +127,13 @@ const expanded = ref(false)
             <component :is="recommendationStatus.icon" class="w-4 h-4" :class="recommendationStatus.text" />
             <span class="text-sm font-bold" :class="recommendationStatus.text">{{ recommendationStatus.label }}</span>
           </div>
-          <div class="flex items-center gap-1">
-             <span class="text-[10px] font-medium uppercase tracking-wider text-slate-400">AI Match</span>
+          <div v-if="!isAiFailure" class="flex items-center gap-1">
+             <span class="text-[10px] font-medium uppercase tracking-wider text-slate-400">{{ ai?.analysis_status === 'completed' ? t('results.card.aiCompleted') : 'AI Match' }}</span>
              <span class="text-sm font-black" :class="recommendationStatus.text">{{ matchScore }}%</span>
           </div>
         </div>
         
-        <div class="w-full h-1.5 bg-white/50 rounded-full overflow-hidden mb-3">
+        <div v-if="!isAiFailure" class="w-full h-1.5 bg-white/50 rounded-full overflow-hidden mb-3">
           <div 
             class="h-full transition-all duration-1000 ease-out rounded-full" 
             :class="recommendationStatus.color"

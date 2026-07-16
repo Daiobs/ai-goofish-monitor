@@ -112,6 +112,7 @@ class ItemAnalysisDispatcher:
     def _build_skip_ai_result(self) -> dict:
         return {
             "analysis_source": "ai",
+            "analysis_status": "skipped",
             "is_recommended": True,
             "reason": "商品已跳过AI分析，直接通知",
             "keyword_hit_count": 0,
@@ -120,6 +121,7 @@ class ItemAnalysisDispatcher:
     def _build_ai_error_result(self, reason: str, *, error: str = "") -> dict:
         payload = {
             "analysis_source": "ai",
+            "analysis_status": "failed",
             "is_recommended": False,
             "reason": reason,
             "keyword_hit_count": 0,
@@ -142,6 +144,7 @@ class ItemAnalysisDispatcher:
                 )
             ai_result.setdefault("analysis_source", "ai")
             ai_result.setdefault("keyword_hit_count", 0)
+            ai_result["analysis_status"] = "completed"
             return ai_result
         except Exception as exc:
             return self._build_ai_error_result(

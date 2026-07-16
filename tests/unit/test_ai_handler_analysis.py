@@ -29,7 +29,6 @@ def test_get_ai_analysis_stops_after_internal_retries_when_content_is_none(
     monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
     monkeypatch.setattr(ai_handler, "ENABLE_RESPONSE_FORMAT", True)
     monkeypatch.setattr(app_config, "ENABLE_RESPONSE_FORMAT", True)
-
     with pytest.raises(ValueError, match="AI响应内容为空"):
         asyncio.run(
             ai_handler.get_ai_analysis(
@@ -59,6 +58,8 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
     monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
     monkeypatch.setattr(ai_handler, "ENABLE_RESPONSE_FORMAT", True)
     monkeypatch.setattr(app_config, "ENABLE_RESPONSE_FORMAT", True)
+    monotonic_values = iter((10.0, 12.3456))
+    monkeypatch.setattr(ai_handler, "monotonic", lambda: next(monotonic_values))
 
     result = asyncio.run(
         ai_handler.get_ai_analysis(
@@ -69,6 +70,7 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
     )
 
     assert result["is_recommended"] is True
+    assert result["request_duration_seconds"] == 2.346
     assert call_count["value"] == 1
 
 
