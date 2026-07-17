@@ -64,3 +64,89 @@ def test_extract_ai_response_content_raises_when_content_and_reasoning_content_a
 
     with pytest.raises(EmptyAIResponseError):
         extract_ai_response_content(response)
+
+
+def test_extract_ai_response_content_from_chat_function_arguments():
+    function = type("Function", (), {"arguments": '{"is_recommended":true}'})()
+    tool_call = type("ToolCall", (), {"function": function})()
+    message = type(
+        "Message",
+        (),
+        {"content": None, "reasoning_content": None, "tool_calls": [tool_call]},
+    )()
+    choice = type("Choice", (), {"message": message})()
+    response = type("Response", (), {"choices": [choice]})()
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"is_recommended":true}'
+
+
+def test_extract_ai_response_content_from_responses_function_call_arguments():
+    response = {
+        "output_text": "",
+        "output": [
+            {"type": "reasoning"},
+            {
+                "type": "function_call",
+                "arguments": '{"is_recommended":false}',
+            },
+        ],
+    }
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"is_recommended":false}'
+
+
+def test_extract_ai_response_content_prefers_chat_function_arguments_when_present():
+    message = {
+        "content": '{"source":"content"}',
+        "reasoning_content": None,
+        "tool_calls": [
+            {"function": {"arguments": '{"source":"tool"}'}}
+        ],
+    }
+    response = {"choices": [{"message": message}]}
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"source":"tool"}'
+
+
+def test_extract_ai_response_content_prefers_responses_function_call_when_present():
+    response = {
+        "output_text": '{"source":"output_text"}',
+        "output": [
+            {"type": "function_call", "arguments": '{"source":"tool"}'}
+        ],
+    }
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"source":"tool"}'
+
+
+def test_extract_ai_response_content_keeps_chat_text_behavior_without_tool_call():
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"source":"content"}',
+                    "reasoning_content": None,
+                }
+            }
+        ]
+    }
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"source":"content"}'
+
+
+def test_extract_ai_response_content_keeps_output_text_behavior_without_function_call():
+    response = {"output_text": '{"source":"output_text"}', "output": []}
+
+    result = extract_ai_response_content(response)
+
+    assert result == '{"source":"output_text"}'

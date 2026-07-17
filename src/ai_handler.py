@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import shutil
-import traceback
 from datetime import datetime, timedelta
 from time import monotonic
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
@@ -37,12 +36,17 @@ from src.services.ai_response_parser import (
     parse_ai_response_json,
 )
 from src.services.ai_request_compat import (
+    AI_ANALYSIS_SCHEMA,
+    FUNCTION_TOOL_OUTPUT_MODE,
+    JSON_OBJECT_OUTPUT_MODE,
+    JSON_SCHEMA_OUTPUT_MODE,
+    TEXT_OUTPUT_MODE,
     CHAT_COMPLETIONS_API_MODE,
     RESPONSES_API_MODE,
     build_ai_request_params,
     create_ai_response_async,
     is_chat_completions_api_unsupported_error,
-    is_json_output_unsupported_error,
+    is_output_mode_unsupported_error,
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
     remove_temperature_param,
@@ -239,48 +243,166 @@ def encode_image_to_base64(image_path):
         return None
 
 
+def _json_shape_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
+def _validate_schema_value(
+    value: object,
+    schema: dict,
+    path: str,
+) -> list[str]:
+    expected_type = schema.get("type")
+    if expected_type == "object":
+        if not isinstance(value, dict):
+            return [path]
+        errors: list[str] = []
+        properties = schema.get("properties") or {}
+        for field in schema.get("required") or []:
+            field_path = f"{path}.{field}" if path else field
+            if field not in value:
+                errors.append(field_path)
+                continue
+            field_schema = properties.get(field)
+            if isinstance(field_schema, dict):
+                errors.extend(
+                    _validate_schema_value(value[field], field_schema, field_path)
+                )
+        return errors
+    if expected_type == "array":
+        if not isinstance(value, list):
+            return [path]
+        errors = []
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(
+                    _validate_schema_value(item, item_schema, f"{path}[{index}]")
+                )
+        return errors
+    if expected_type == "string":
+        if not isinstance(value, str):
+            return [path]
+        if schema.get("minLength") and not value.strip():
+            return [path]
+        return []
+    if expected_type == "boolean":
+        return [] if isinstance(value, bool) else [path]
+    return []
+
+
+def summarize_ai_response_shape(parsed_response: object) -> dict:
+    """Describe response keys and JSON types without retaining any values."""
+    if not isinstance(parsed_response, dict):
+        return {
+            "top_level_type": _json_shape_type(parsed_response),
+            "top_level": {},
+            "nested": {},
+            "boolean_candidates": [],
+            "recommendation_fields": [],
+        }
+
+    top_level = {
+        str(key): _json_shape_type(value)
+        for key, value in parsed_response.items()
+    }
+    nested: dict[str, dict[str, str]] = {}
+    candidate_items = list(parsed_response.items())
+    if len(candidate_items) == 1 and isinstance(candidate_items[0][1], dict):
+        wrapper_name = str(candidate_items[0][0])
+        wrapper_value = candidate_items[0][1]
+        nested[wrapper_name] = {
+            str(key): _json_shape_type(value)
+            for key, value in wrapper_value.items()
+        }
+        candidate_items.extend(
+            (f"{wrapper_name}.{key}", value)
+            for key, value in wrapper_value.items()
+        )
+
+    boolean_candidates = sorted(
+        str(key) for key, value in candidate_items if isinstance(value, bool)
+    )
+    recommendation_fields = sorted(
+        str(key)
+        for key, _value in candidate_items
+        if "recommend" in str(key).lower()
+    )
+    return {
+        "top_level_type": "object",
+        "top_level": top_level,
+        "nested": nested,
+        "boolean_candidates": boolean_candidates,
+        "recommendation_fields": recommendation_fields,
+    }
+
+
+def _normalize_legacy_analysis_shape(parsed_response: object) -> object:
+    if not isinstance(parsed_response, dict):
+        return parsed_response
+
+    normalized = dict(parsed_response)
+    if set(normalized) == {"analysis"} and isinstance(normalized["analysis"], dict):
+        normalized = dict(normalized["analysis"])
+
+    if "is_recommended" not in normalized:
+        recommended = normalized.get("recommended")
+        recommendation = normalized.get("recommendation")
+        if isinstance(recommended, bool):
+            normalized["is_recommended"] = recommended
+        elif recommendation == "recommended":
+            normalized["is_recommended"] = True
+        elif recommendation == "not_recommended":
+            normalized["is_recommended"] = False
+    normalized.pop("recommended", None)
+    normalized.pop("recommendation", None)
+    return normalized
+
+
+def _is_transient_ai_error(error: Exception) -> bool:
+    if isinstance(error, (EmptyAIResponseError, TimeoutError, ConnectionError)):
+        return True
+    status_code = getattr(error, "status_code", None)
+    return status_code in {408, 409, 425, 429} or (
+        isinstance(status_code, int) and status_code >= 500
+    )
+
+
+def _client_without_sdk_retries(ai_client):
+    with_options = getattr(ai_client, "with_options", None)
+    if callable(with_options):
+        return with_options(max_retries=0)
+    return ai_client
+
+
+def get_ai_response_validation_errors(parsed_response: object) -> list[str]:
+    """Return model-owned semantic field names that violate the contract."""
+    if not isinstance(parsed_response, dict):
+        return ["top_level"]
+    return _validate_schema_value(parsed_response, AI_ANALYSIS_SCHEMA, "")
+
+
 def validate_ai_response_format(parsed_response):
     """Validate model-owned analysis semantics before app metadata is added."""
-    if not isinstance(parsed_response, dict):
-        safe_print("   [AI分析] 警告：响应顶层必须是对象")
-        return False
-
-    required_fields = [
-        "is_recommended",
-        "reason",
-        "risk_tags",
-        "criteria_analysis"
-    ]
-
-    # 检查顶层字段
-    for field in required_fields:
-        if field not in parsed_response:
-            safe_print(f"   [AI分析] 警告：响应缺少必需字段 '{field}'")
-            return False
-
-    # 检查criteria_analysis是否为字典且不为空
-    criteria_analysis = parsed_response.get("criteria_analysis", {})
-    if not isinstance(criteria_analysis, dict) or not criteria_analysis:
-        safe_print("   [AI分析] 警告：criteria_analysis必须是非空字典")
-        return False
-
-    # 检查seller_type字段（所有商品都需要）
-    if "seller_type" not in criteria_analysis:
-        safe_print("   [AI分析] 警告：criteria_analysis缺少必需字段 'seller_type'")
-        return False
-
-    # 检查数据类型
-    if not isinstance(parsed_response.get("is_recommended"), bool):
-        safe_print("   [AI分析] 警告：is_recommended字段不是布尔类型")
-        return False
-
-    reason = parsed_response.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        safe_print("   [AI分析] 警告：reason字段必须是非空字符串")
-        return False
-
-    if not isinstance(parsed_response.get("risk_tags"), list):
-        safe_print("   [AI分析] 警告：risk_tags字段不是列表类型")
+    errors = get_ai_response_validation_errors(parsed_response)
+    if errors:
+        safe_print(
+            "   [AI分析] 警告：响应语义字段无效: " + ", ".join(errors)
+        )
         return False
 
     return True
@@ -289,16 +411,23 @@ def validate_ai_response_format(parsed_response):
 def normalize_ai_response(
     parsed_response: object,
     canonical_prompt_version: str,
+    *,
+    allow_legacy_compatibility: bool = True,
 ) -> dict | None:
     """Validate model semantics and attach application-owned prompt metadata."""
-    if not validate_ai_response_format(parsed_response):
+    candidate = (
+        _normalize_legacy_analysis_shape(parsed_response)
+        if allow_legacy_compatibility
+        else parsed_response
+    )
+    if not validate_ai_response_format(candidate):
         return None
 
     canonical_version = resolve_canonical_prompt_version(
         "",
         explicit_version=canonical_prompt_version,
     )
-    normalized = dict(parsed_response)
+    normalized = dict(candidate)
     model_version = normalized.pop("prompt_version", None)
     normalized.pop("model_prompt_version_mismatch", None)
     normalized["prompt_version"] = canonical_version
@@ -331,6 +460,7 @@ async def get_ai_analysis(
     image_paths=None,
     prompt_text="",
     prompt_version=None,
+    diagnostics=None,
 ):
     """将完整的商品JSON数据和所有图片发送给 AI 进行分析（异步）。"""
     if not client:
@@ -357,10 +487,16 @@ async def get_ai_analysis(
 
     if AI_DEBUG_MODE:
         safe_print("\n--- [AI DEBUG] ---")
-        safe_print("--- PRODUCT DATA (JSON) ---")
-        safe_print(product_details_json)
-        safe_print("--- PROMPT TEXT (完整内容) ---")
-        safe_print(prompt_text)
+        safe_print(
+            json.dumps(
+                {
+                    "product_payload_chars": len(product_details_json),
+                    "prompt_chars": len(prompt_text),
+                    "image_count": len(image_paths or []),
+                },
+                ensure_ascii=True,
+            )
+        )
         safe_print("-------------------\n")
 
     image_data_urls = []
@@ -409,31 +545,56 @@ async def get_ai_analysis(
     except Exception as e:
         safe_print(f"   [日志] 保存AI分析日志时出错: {e}")
 
-    # 增强的AI调用，包含更严格的结构化输出控制和重试机制
-    max_retries = 4
-    api_mode = CHAT_COMPLETIONS_API_MODE
-    use_response_format = ENABLE_RESPONSE_FORMAT
-    use_temperature = True
-    request_started_at = monotonic()
-    for attempt in range(max_retries):
-        try:
-            # 根据重试次数调整参数
-            current_temperature = 0.1 if attempt == 0 else 0.05  # 重试时使用更低的温度
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "status": "pending",
+                "request_count": 0,
+                "attempts": [],
+                "last_response_shape": None,
+                "final_failure_fields": [],
+            }
+        )
 
+    # One primary request plus one reasoned compatibility request at most.
+    max_attempts = 2
+    api_mode = CHAT_COMPLETIONS_API_MODE
+    output_mode = (
+        JSON_SCHEMA_OUTPUT_MODE
+        if ENABLE_RESPONSE_FORMAT
+        else TEXT_OUTPUT_MODE
+    )
+    use_temperature = True
+    request_client = _client_without_sdk_retries(client)
+    request_started_at = monotonic()
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
             from src.config import get_ai_request_params
 
             request_params = build_ai_request_params(
                 api_mode,
                 model=MODEL_NAME,
                 messages=messages,
-                temperature=current_temperature,
+                temperature=0.1,
                 max_output_tokens=4000,
-                enable_json_output=use_response_format,
+                output_mode=output_mode,
             )
             if not use_temperature:
                 request_params = remove_temperature_param(request_params)
 
             request_params = get_ai_request_params(**request_params)
+
+            if diagnostics is not None:
+                diagnostics["request_count"] += 1
+                diagnostics["attempts"].append(
+                    {
+                        "api_mode": api_mode,
+                        "output_mode": output_mode,
+                        "temperature_enabled": use_temperature,
+                    }
+                )
 
             if AI_DEBUG_MODE:
                 safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 REQUEST ---")
@@ -447,24 +608,24 @@ async def get_ai_analysis(
                 safe_print("-----------------------------------\n")
 
             response = await create_ai_response_async(
-                client,
+                request_client,
                 api_mode,
                 request_params,
             )
             ai_response_content = extract_ai_response_content(response)
-
-            if AI_DEBUG_MODE:
-                safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 ---")
-                safe_print("--- RAW AI RESPONSE ---")
-                safe_print(ai_response_content)
-                safe_print("---------------------\n")
-
             try:
                 parsed_response = parse_ai_response_json(ai_response_content)
-
+                response_shape = summarize_ai_response_shape(parsed_response)
+                if diagnostics is not None:
+                    diagnostics["last_response_shape"] = response_shape
+                allow_legacy_compatibility = output_mode in {
+                    JSON_OBJECT_OUTPUT_MODE,
+                    TEXT_OUTPUT_MODE,
+                }
                 normalized_response = normalize_ai_response(
                     parsed_response,
                     canonical_prompt_version,
+                    allow_legacy_compatibility=allow_legacy_compatibility,
                 )
                 if normalized_response is not None:
                     request_duration = round(
@@ -475,57 +636,104 @@ async def get_ai_analysis(
                         f"   [AI分析] 第{attempt + 1}次尝试成功，响应格式验证通过，"
                         f"请求耗时 {request_duration:.3f} 秒"
                     )
+                    if diagnostics is not None:
+                        diagnostics["status"] = "success"
+                        diagnostics["final_api_mode"] = api_mode
+                        diagnostics["final_output_mode"] = output_mode
                     return normalized_response
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试格式验证失败")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
+
+                validation_candidate = (
+                    _normalize_legacy_analysis_shape(parsed_response)
+                    if allow_legacy_compatibility
+                    else parsed_response
+                )
+                failure_fields = get_ai_response_validation_errors(
+                    validation_candidate
+                )
+                if diagnostics is not None:
+                    diagnostics["final_failure_fields"] = failure_fields
+                safe_print(
+                    f"   [AI分析] 第{attempt + 1}次尝试未满足语义契约；"
+                    f"字段: {', '.join(failure_fields)}；"
+                    f"安全形状: {json.dumps(response_shape, ensure_ascii=False)}"
+                )
+                last_error = ValueError(
+                    "AI响应格式缺少必需字段或字段类型不正确。"
+                )
+                if (
+                    attempt < max_attempts - 1
+                    and output_mode == JSON_SCHEMA_OUTPUT_MODE
+                ):
+                    output_mode = FUNCTION_TOOL_OUTPUT_MODE
+                    safe_print(
+                        "   [AI分析] 网关未执行严格 Schema 契约，改用强制函数工具进行一次兼容请求。"
+                    )
                     continue
-                raise ValueError("AI响应格式缺少必需字段或字段类型不正确。")
+                raise last_error
             except json.JSONDecodeError as e:
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试JSON解析失败: {e}")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
+                last_error = e
+                safe_print(f"   [AI分析] 第{attempt + 1}次尝试返回了无效 JSON。")
+                if (
+                    attempt < max_attempts - 1
+                    and output_mode == JSON_SCHEMA_OUTPUT_MODE
+                ):
+                    output_mode = FUNCTION_TOOL_OUTPUT_MODE
+                    safe_print(
+                        "   [AI分析] 严格 Schema 响应不可解析，改用强制函数工具进行一次兼容请求。"
+                    )
                     continue
-                raise e
-            except EmptyAIResponseError as e:
-                safe_print(f"   [AI分析] 第{attempt + 1}次尝试返回空响应: {e}")
-                if attempt < max_retries - 1:
-                    safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
-                    continue
-                raise e
+                raise
 
         except Exception as e:
+            last_error = e
+            transition = None
             if (
                 api_mode == CHAT_COMPLETIONS_API_MODE
                 and is_chat_completions_api_unsupported_error(e)
             ):
                 api_mode = RESPONSES_API_MODE
-                safe_print(
-                    "   [AI分析] 当前服务未实现 Chat Completions API，后续重试将自动回退到 Responses API。"
-                )
-            elif api_mode == RESPONSES_API_MODE and is_responses_api_unsupported_error(e):
+                transition = "当前服务未实现 Chat Completions API，改用 Responses API。"
+            elif (
+                api_mode == RESPONSES_API_MODE
+                and is_responses_api_unsupported_error(e)
+            ):
                 api_mode = CHAT_COMPLETIONS_API_MODE
-                safe_print(
-                    "   [AI分析] 当前服务未实现 Responses API，后续重试将自动回退到 Chat Completions API。"
-                )
-            if use_response_format and is_json_output_unsupported_error(e):
-                use_response_format = False
-                safe_print(
-                    "   [AI分析] 当前模型不支持结构化 JSON 输出，后续重试将自动禁用该参数。"
-                )
-            if use_temperature and is_temperature_unsupported_error(e):
+                transition = "当前服务未实现 Responses API，改用 Chat Completions API。"
+            elif is_output_mode_unsupported_error(e, output_mode):
+                if output_mode == JSON_SCHEMA_OUTPUT_MODE:
+                    output_mode = FUNCTION_TOOL_OUTPUT_MODE
+                    transition = "当前服务明确拒绝 JSON Schema，改用强制函数工具。"
+                elif output_mode == FUNCTION_TOOL_OUTPUT_MODE:
+                    output_mode = JSON_OBJECT_OUTPUT_MODE
+                    transition = "当前服务明确拒绝函数工具，改用 Legacy JSON Object。"
+                elif output_mode == JSON_OBJECT_OUTPUT_MODE:
+                    output_mode = TEXT_OUTPUT_MODE
+                    transition = "当前服务明确拒绝 JSON Object，移除输出格式参数。"
+            elif use_temperature and is_temperature_unsupported_error(e):
                 use_temperature = False
-                safe_print(
-                    "   [AI分析] 当前模型不支持 temperature 参数，后续重试将自动禁用该参数。"
-                )
+                transition = "当前模型明确拒绝 temperature，移除该参数。"
+            elif attempt < max_attempts - 1 and _is_transient_ai_error(e):
+                transition = "AI 请求出现临时故障，执行最后一次重试。"
+
             if AI_DEBUG_MODE:
                 safe_print(f"\n--- [AI DEBUG] 第{attempt + 1}次尝试 EXCEPTION ---")
-                safe_print(repr(e))
-                safe_print(traceback.format_exc())
+                safe_print(f"exception_type={type(e).__name__}")
                 safe_print("-------------------------------------\n")
-            safe_print(f"   [AI分析] 第{attempt + 1}次尝试AI调用失败: {e}")
-            if attempt < max_retries - 1:
-                safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")
+            safe_print(
+                f"   [AI分析] 第{attempt + 1}次尝试失败 "
+                f"({type(e).__name__})。"
+            )
+            if transition and attempt < max_attempts - 1:
+                safe_print(f"   [AI分析] {transition}")
                 continue
-            else:
-                raise e
+            if diagnostics is not None:
+                diagnostics["status"] = "failed"
+                diagnostics["failure_type"] = type(e).__name__
+            raise
+
+    if diagnostics is not None:
+        diagnostics["status"] = "failed"
+        diagnostics["failure_type"] = type(last_error).__name__
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("AI调用未返回结果。")

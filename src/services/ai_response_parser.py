@@ -21,22 +21,30 @@ def extract_ai_response_content(response: Any) -> str:
     if isinstance(response, str):
         return _normalize_text_content(response)
 
-    output_text = getattr(response, "output_text", None)
+    function_arguments = _extract_responses_function_arguments(response)
+    if function_arguments is not None:
+        return _normalize_text_content(function_arguments)
+
+    output_text = _get_field(response, "output_text")
     if isinstance(output_text, str):
         return _normalize_text_content(output_text)
 
-    choices = getattr(response, "choices", None)
+    choices = _get_field(response, "choices")
     if choices:
-        message = getattr(choices[0], "message", None)
+        message = _get_field(choices[0], "message")
         if message is None:
             raise EmptyAIResponseError("AI响应缺少 message。")
-        content = getattr(message, "content", None)
-        
+        function_arguments = _extract_chat_function_arguments(message)
+        if function_arguments is not None:
+            return _normalize_text_content(function_arguments)
+
+        content = _get_field(message, "content")
+
         # 智谱等 OpenAI 兼容网关在某些模式下会把输出放在 reasoning_content 而非 content
         try:
             return _normalize_text_content(_coerce_content_parts(content))
         except EmptyAIResponseError:
-            reasoning_content = getattr(message, "reasoning_content", None)
+            reasoning_content = _get_field(message, "reasoning_content")
             if reasoning_content:
                 return _normalize_text_content(_coerce_content_parts(reasoning_content))
             raise
@@ -51,6 +59,44 @@ def parse_ai_response_json(content: str) -> dict:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
         return _extract_first_json_value(cleaned, exc)
+
+
+def _get_field(value: Any, field_name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field_name)
+    return getattr(value, field_name, None)
+
+
+def _extract_chat_function_arguments(message: Any) -> str | None:
+    tool_calls = _get_field(message, "tool_calls")
+    if not isinstance(tool_calls, (list, tuple)) or not tool_calls:
+        return None
+
+    function = _get_field(tool_calls[0], "function")
+    return _coerce_function_arguments(_get_field(function, "arguments"))
+
+
+def _extract_responses_function_arguments(response: Any) -> str | None:
+    output = _get_field(response, "output")
+    if not isinstance(output, (list, tuple)):
+        return None
+
+    for item in output:
+        if _get_field(item, "type") != "function_call":
+            continue
+        arguments = _coerce_function_arguments(_get_field(item, "arguments"))
+        if arguments is not None:
+            return arguments
+    return None
+
+
+def _coerce_function_arguments(arguments: Any) -> str | None:
+    if isinstance(arguments, str):
+        return arguments if arguments.strip() else None
+    if isinstance(arguments, (bytes, bytearray)):
+        decoded = arguments.decode("utf-8", errors="replace")
+        return decoded if decoded.strip() else None
+    return None
 
 
 def _coerce_content_parts(content: Any) -> str:

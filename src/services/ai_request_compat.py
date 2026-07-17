@@ -10,6 +10,12 @@ INPUT_TEXT_TYPE = "input_text"
 INPUT_IMAGE_TYPE = "input_image"
 IMAGE_DETAIL_AUTO = "auto"
 JSON_OUTPUT_TYPE = "json_object"
+JSON_SCHEMA_OUTPUT_MODE = "json_schema"
+FUNCTION_TOOL_OUTPUT_MODE = "function_tool"
+JSON_OBJECT_OUTPUT_MODE = JSON_OUTPUT_TYPE
+TEXT_OUTPUT_MODE = "text"
+AI_ANALYSIS_SCHEMA_NAME = "goofish_product_analysis"
+AI_ANALYSIS_TOOL_NAME = "submit_goofish_analysis"
 UNSUPPORTED_JSON_OUTPUT_MARKERS = (
     "not supported by this model",
     "json_object",
@@ -33,6 +39,107 @@ UNSUPPORTED_TEMPERATURE_MARKERS = (
     "temperature",
     "sampling temperature",
 )
+
+
+def _nonempty_string_schema() -> Dict[str, Any]:
+    return {"type": "string", "minLength": 1}
+
+
+def _criterion_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": _nonempty_string_schema(),
+            "comment": _nonempty_string_schema(),
+            "evidence": _nonempty_string_schema(),
+        },
+        "required": ["status", "comment", "evidence"],
+    }
+
+
+def _seller_analysis_detail_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "comment": _nonempty_string_schema(),
+            "evidence": _nonempty_string_schema(),
+        },
+        "required": ["comment", "evidence"],
+    }
+
+
+AI_ANALYSIS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "is_recommended": {"type": "boolean"},
+        "reason": _nonempty_string_schema(),
+        "risk_tags": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "criteria_analysis": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "model_chip": _criterion_schema(),
+                "battery_health": _criterion_schema(),
+                "condition": _criterion_schema(),
+                "history": _criterion_schema(),
+                "seller_type": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "status": _nonempty_string_schema(),
+                        "persona": _nonempty_string_schema(),
+                        "comment": _nonempty_string_schema(),
+                        "analysis_details": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "temporal_analysis": _seller_analysis_detail_schema(),
+                                "selling_behavior": _seller_analysis_detail_schema(),
+                                "buying_behavior": _seller_analysis_detail_schema(),
+                                "behavioral_summary": _seller_analysis_detail_schema(),
+                            },
+                            "required": [
+                                "temporal_analysis",
+                                "selling_behavior",
+                                "buying_behavior",
+                                "behavioral_summary",
+                            ],
+                        },
+                    },
+                    "required": [
+                        "status",
+                        "persona",
+                        "comment",
+                        "analysis_details",
+                    ],
+                },
+                "shipping": _criterion_schema(),
+                "seller_credit": _criterion_schema(),
+            },
+            "required": [
+                "model_chip",
+                "battery_health",
+                "condition",
+                "history",
+                "seller_type",
+                "shipping",
+                "seller_credit",
+            ],
+        },
+    },
+    "required": [
+        "is_recommended",
+        "reason",
+        "risk_tags",
+        "criteria_analysis",
+    ],
+}
 
 
 def build_responses_input(messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -75,6 +182,79 @@ def add_json_response_format(
     return next_params
 
 
+def add_output_contract(
+    request_params: Dict[str, Any],
+    api_mode: str,
+    output_mode: str,
+    analysis_schema: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Attach one explicit, side-effect-free analysis output contract."""
+    next_params = dict(request_params)
+    schema = copy.deepcopy(analysis_schema)
+
+    if output_mode == TEXT_OUTPUT_MODE:
+        return next_params
+    if output_mode == JSON_OBJECT_OUTPUT_MODE:
+        if api_mode == RESPONSES_API_MODE:
+            return add_json_text_format(next_params, True)
+        return add_json_response_format(next_params, True)
+    if output_mode == JSON_SCHEMA_OUTPUT_MODE:
+        if api_mode == RESPONSES_API_MODE:
+            next_params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": AI_ANALYSIS_SCHEMA_NAME,
+                    "strict": True,
+                    "schema": schema,
+                }
+            }
+        else:
+            next_params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": AI_ANALYSIS_SCHEMA_NAME,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        return next_params
+    if output_mode == FUNCTION_TOOL_OUTPUT_MODE:
+        if api_mode == RESPONSES_API_MODE:
+            next_params["tools"] = [
+                {
+                    "type": "function",
+                    "name": AI_ANALYSIS_TOOL_NAME,
+                    "description": "Return the structured product analysis.",
+                    "parameters": schema,
+                    "strict": True,
+                }
+            ]
+            next_params["tool_choice"] = {
+                "type": "function",
+                "name": AI_ANALYSIS_TOOL_NAME,
+            }
+        else:
+            next_params["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": AI_ANALYSIS_TOOL_NAME,
+                        "description": "Return the structured product analysis.",
+                        "parameters": schema,
+                        "strict": True,
+                    },
+                }
+            ]
+            next_params["tool_choice"] = {
+                "type": "function",
+                "function": {"name": AI_ANALYSIS_TOOL_NAME},
+            }
+        next_params["parallel_tool_calls"] = False
+        return next_params
+
+    raise ValueError(f"不支持的 AI 输出模式: {output_mode}")
+
+
 def is_json_output_unsupported_error(error: Exception) -> bool:
     """识别模型或网关不支持结构化 JSON 输出参数的错误。"""
     body = getattr(error, "body", None)
@@ -89,6 +269,60 @@ def is_json_output_unsupported_error(error: Exception) -> bool:
         "not supported" in message.lower()
         and any(marker in message for marker in UNSUPPORTED_JSON_OUTPUT_MARKERS)
     )
+
+
+def is_output_mode_unsupported_error(error: Exception, output_mode: str) -> bool:
+    """Identify an explicit gateway rejection of the selected output mode."""
+    body = getattr(error, "body", None)
+    error_body = body.get("error") if isinstance(body, dict) else None
+    body_params = {
+        candidate.get("param")
+        for candidate in (body, error_body)
+        if isinstance(candidate, dict)
+    }
+    message_parts = [str(error)]
+    for candidate in (body, error_body):
+        if isinstance(candidate, dict):
+            message_parts.append(str(candidate.get("message") or ""))
+    message = " ".join(message_parts).lower()
+    unsupported = any(
+        marker in message
+        for marker in ("not supported", "unsupported", "not implemented", "invalid")
+    )
+
+    if output_mode == JSON_SCHEMA_OUTPUT_MODE:
+        schema_params = {
+            "response_format",
+            "response_format.type",
+            "response_format.json_schema",
+            "text",
+            "text.format",
+            "text.format.type",
+        }
+        return bool(body_params & schema_params) or (
+            unsupported
+            and any(
+                marker in message
+                for marker in ("json_schema", "response_format", "text.format")
+            )
+        )
+    if output_mode == FUNCTION_TOOL_OUTPUT_MODE:
+        tool_params = {"tools", "tool_choice", "parallel_tool_calls"}
+        return bool(body_params & tool_params) or (
+            unsupported
+            and any(
+                marker in message
+                for marker in (
+                    "tool_choice",
+                    "tools",
+                    "function calling",
+                    "function_call",
+                )
+            )
+        )
+    if output_mode == JSON_OBJECT_OUTPUT_MODE:
+        return is_json_output_unsupported_error(error)
+    return False
 
 
 def is_responses_api_unsupported_error(error: Exception) -> bool:
@@ -109,6 +343,8 @@ def build_ai_request_params(
     temperature: float | None = None,
     max_output_tokens: int | None = None,
     enable_json_output: bool = False,
+    output_mode: str | None = None,
+    analysis_schema: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """根据 API 模式构建请求参数。"""
     request_params = {"model": model}
@@ -118,7 +354,15 @@ def build_ai_request_params(
             request_params["max_output_tokens"] = max_output_tokens
         if temperature is not None:
             request_params["temperature"] = temperature
-        return add_json_text_format(request_params, enable_json_output)
+        selected_mode = output_mode or (
+            JSON_OBJECT_OUTPUT_MODE if enable_json_output else TEXT_OUTPUT_MODE
+        )
+        return add_output_contract(
+            request_params,
+            api_mode,
+            selected_mode,
+            analysis_schema or AI_ANALYSIS_SCHEMA,
+        )
 
     if api_mode == CHAT_COMPLETIONS_API_MODE:
         request_params["messages"] = copy.deepcopy(list(messages))
@@ -126,7 +370,15 @@ def build_ai_request_params(
             request_params["max_tokens"] = max_output_tokens
         if temperature is not None:
             request_params["temperature"] = temperature
-        return add_json_response_format(request_params, enable_json_output)
+        selected_mode = output_mode or (
+            JSON_OBJECT_OUTPUT_MODE if enable_json_output else TEXT_OUTPUT_MODE
+        )
+        return add_output_contract(
+            request_params,
+            api_mode,
+            selected_mode,
+            analysis_schema or AI_ANALYSIS_SCHEMA,
+        )
 
     raise ValueError(f"不支持的 AI API 模式: {api_mode}")
 
