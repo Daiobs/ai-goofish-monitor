@@ -48,6 +48,7 @@ from src.services.ai_request_compat import (
     remove_temperature_param,
 )
 from src.services.notification_service import build_notification_service
+from src.services.prompt_version import resolve_canonical_prompt_version
 from src.utils import convert_goofish_link, retry_on_failure
 
 
@@ -239,9 +240,12 @@ def encode_image_to_base64(image_path):
 
 
 def validate_ai_response_format(parsed_response):
-    """验证AI响应的格式是否符合预期结构"""
+    """Validate model-owned analysis semantics before app metadata is added."""
+    if not isinstance(parsed_response, dict):
+        safe_print("   [AI分析] 警告：响应顶层必须是对象")
+        return False
+
     required_fields = [
-        "prompt_version",
         "is_recommended",
         "reason",
         "risk_tags",
@@ -270,11 +274,37 @@ def validate_ai_response_format(parsed_response):
         safe_print("   [AI分析] 警告：is_recommended字段不是布尔类型")
         return False
 
+    reason = parsed_response.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        safe_print("   [AI分析] 警告：reason字段必须是非空字符串")
+        return False
+
     if not isinstance(parsed_response.get("risk_tags"), list):
         safe_print("   [AI分析] 警告：risk_tags字段不是列表类型")
         return False
 
     return True
+
+
+def normalize_ai_response(
+    parsed_response: object,
+    canonical_prompt_version: str,
+) -> dict | None:
+    """Validate model semantics and attach application-owned prompt metadata."""
+    if not validate_ai_response_format(parsed_response):
+        return None
+
+    canonical_version = resolve_canonical_prompt_version(
+        "",
+        explicit_version=canonical_prompt_version,
+    )
+    normalized = dict(parsed_response)
+    model_version = normalized.pop("prompt_version", None)
+    normalized.pop("model_prompt_version_mismatch", None)
+    normalized["prompt_version"] = canonical_version
+    if model_version is not None and model_version != canonical_version:
+        normalized["model_prompt_version_mismatch"] = True
+    return normalized
 
 
 @retry_on_failure(retries=3, delay=5)
@@ -296,7 +326,12 @@ async def send_ntfy_notification(product_data, reason):
     return results
 
 
-async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
+async def get_ai_analysis(
+    product_data,
+    image_paths=None,
+    prompt_text="",
+    prompt_version=None,
+):
     """将完整的商品JSON数据和所有图片发送给 AI 进行分析（异步）。"""
     if not client:
         safe_print("   [AI分析] 错误：AI客户端未初始化，跳过分析。")
@@ -311,6 +346,11 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
     if not prompt_text:
         safe_print("   [AI分析] 错误：未提供AI分析所需的prompt文本。")
         return None
+
+    canonical_prompt_version = resolve_canonical_prompt_version(
+        prompt_text,
+        explicit_version=prompt_version,
+    )
 
     product_details_json = json.dumps(product_data, ensure_ascii=False, indent=2)
     system_prompt = prompt_text
@@ -422,17 +462,20 @@ async def get_ai_analysis(product_data, image_paths=None, prompt_text=""):
             try:
                 parsed_response = parse_ai_response_json(ai_response_content)
 
-                # 验证响应格式
-                if validate_ai_response_format(parsed_response):
+                normalized_response = normalize_ai_response(
+                    parsed_response,
+                    canonical_prompt_version,
+                )
+                if normalized_response is not None:
                     request_duration = round(
                         max(0.0, monotonic() - request_started_at), 3
                     )
-                    parsed_response["request_duration_seconds"] = request_duration
+                    normalized_response["request_duration_seconds"] = request_duration
                     safe_print(
                         f"   [AI分析] 第{attempt + 1}次尝试成功，响应格式验证通过，"
                         f"请求耗时 {request_duration:.3f} 秒"
                     )
-                    return parsed_response
+                    return normalized_response
                 safe_print(f"   [AI分析] 第{attempt + 1}次尝试格式验证失败")
                 if attempt < max_retries - 1:
                     safe_print(f"   [AI分析] 准备第{attempt + 2}次重试...")

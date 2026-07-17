@@ -35,10 +35,10 @@ export interface SellerInfo {
 }
 
 export interface AiAnalysis {
-  is_recommended: boolean;
+  is_recommended: boolean | null;
   reason: string;
   analysis_source?: 'ai' | 'keyword';
-  analysis_status?: 'completed' | 'failed' | 'skipped';
+  analysis_status?: 'pending' | 'completed' | 'failed' | 'skipped';
   keyword_hit_count?: number;
   value_score?: number;
   value_summary?: string;

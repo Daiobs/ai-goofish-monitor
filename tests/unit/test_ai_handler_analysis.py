@@ -49,7 +49,7 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
         call_count["value"] += 1
         return SimpleNamespace(
             output_text=(
-                '{"prompt_version":"v1","is_recommended":true,'
+                '{"is_recommended":true,'
                 '"reason":"ok","risk_tags":[],"criteria_analysis":{"seller_type":"个人"}}'
             )
         )
@@ -66,12 +66,128 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
             {"商品信息": {"商品ID": "2", "商品标题": "测试商品2"}},
             image_paths=[],
             prompt_text="请输出 JSON",
+            prompt_version="EagleEye-V6.4",
         )
     )
 
     assert result["is_recommended"] is True
+    assert result["prompt_version"] == "EagleEye-V6.4"
+    assert "model_prompt_version_mismatch" not in result
     assert result["request_duration_seconds"] == 2.346
     assert call_count["value"] == 1
+
+
+def test_get_ai_analysis_keeps_canonical_version_when_model_returns_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    call_count = {"value": 0}
+
+    async def fake_create(**_kwargs):
+        call_count["value"] += 1
+        return SimpleNamespace(
+            output_text=(
+                '{"prompt_version":"model-controlled-secret-version",'
+                '"is_recommended":false,"reason":"not suitable",'
+                '"risk_tags":["price"],'
+                '"criteria_analysis":{"seller_type":"个人"}}'
+            )
+        )
+
+    monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
+    monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+    monkeypatch.setattr(ai_handler, "ENABLE_RESPONSE_FORMAT", True)
+    monkeypatch.setattr(app_config, "ENABLE_RESPONSE_FORMAT", True)
+
+    result = asyncio.run(
+        ai_handler.get_ai_analysis(
+            {"商品信息": {"商品ID": "mismatch", "商品标题": "测试商品"}},
+            image_paths=[],
+            prompt_text='"prompt_version": "EagleEye-V6.4"',
+        )
+    )
+
+    assert result["prompt_version"] == "EagleEye-V6.4"
+    assert result["model_prompt_version_mismatch"] is True
+    assert result["is_recommended"] is False
+    assert result["reason"] == "not suitable"
+    assert result["risk_tags"] == ["price"]
+    assert "model-controlled-secret-version" not in str(result)
+    assert call_count["value"] == 1
+
+
+def test_get_ai_analysis_accepts_hash_prompt_version_without_model_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+
+    async def fake_create(**_kwargs):
+        return SimpleNamespace(
+            output_text=(
+                '{"is_recommended":true,"reason":"ok","risk_tags":[],'
+                '"criteria_analysis":{"seller_type":"个人"}}'
+            )
+        )
+
+    monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
+    monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+    monkeypatch.setattr(ai_handler, "ENABLE_RESPONSE_FORMAT", True)
+    monkeypatch.setattr(app_config, "ENABLE_RESPONSE_FORMAT", True)
+
+    result = asyncio.run(
+        ai_handler.get_ai_analysis(
+            {"商品信息": {"商品ID": "hash", "商品标题": "测试商品"}},
+            image_paths=[],
+            prompt_text="prompt without metadata",
+        )
+    )
+
+    assert result["prompt_version"].startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "invalid_response",
+    (
+        {
+            "reason": "missing recommendation",
+            "risk_tags": [],
+            "criteria_analysis": {"seller_type": "个人"},
+        },
+        {
+            "is_recommended": True,
+            "reason": "",
+            "risk_tags": [],
+            "criteria_analysis": {"seller_type": "个人"},
+        },
+        {
+            "is_recommended": True,
+            "reason": "ok",
+            "risk_tags": "invalid",
+            "criteria_analysis": {"seller_type": "个人"},
+        },
+        {
+            "is_recommended": True,
+            "reason": "ok",
+            "risk_tags": [],
+            "criteria_analysis": {},
+        },
+        {
+            "is_recommended": True,
+            "reason": "ok",
+            "risk_tags": [],
+            "criteria_analysis": {"value": "missing seller type"},
+        },
+    ),
+)
+def test_normalize_ai_response_rejects_missing_or_invalid_semantics(
+    invalid_response,
+):
+    assert (
+        ai_handler.normalize_ai_response(invalid_response, "EagleEye-V6.4")
+        is None
+    )
 
 
 def test_get_ai_analysis_retries_without_structured_output_when_model_rejects_it(

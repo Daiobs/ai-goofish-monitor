@@ -71,7 +71,12 @@ def test_cli_runs_single_task_with_prompt(tmp_path, load_json_fixture, monkeypat
     spider_v2 = _load_spider(monkeypatch)
     config_data = load_json_fixture("config.sample.json")
 
-    base_prompt = "Base prompt. " + ("x" * 120) + " {{CRITERIA_SECTION}}"
+    base_prompt = (
+        '"prompt_version": "EagleEye-V6.4",\n'
+        + "Base prompt. "
+        + ("x" * 120)
+        + " {{CRITERIA_SECTION}}"
+    )
     criteria_prompt = "Criteria text for A7M4."
 
     base_path = tmp_path / "base_prompt.txt"
@@ -100,6 +105,7 @@ def test_cli_runs_single_task_with_prompt(tmp_path, load_json_fixture, monkeypat
         assert task_config["_result_ownership"] == "legacy"
         assert "{{CRITERIA_SECTION}}" not in task_config["ai_prompt_text"]
         assert "Criteria text for A7M4." in task_config["ai_prompt_text"]
+        assert task_config["ai_prompt_version"] == "EagleEye-V6.4"
         return 1
 
     monkeypatch.setattr(spider_v2, "scrape_xianyu", fake_scrape_xianyu)

@@ -22,6 +22,7 @@ from src.services.result_storage_service import (
     save_result_record,
     save_task_result_blacklist_keywords,
     save_task_result_record,
+    upsert_task_result_record,
     update_task_result_item_status,
 )
 
@@ -172,3 +173,40 @@ def test_task_identity_survives_task_display_field_changes(tmp_path, monkeypatch
     records = _load_task_records(44)
     assert len(records) == 1
     assert records[0]["商品信息"]["商品ID"] == "stable"
+
+
+def test_task_result_final_update_persists_canonical_prompt_version(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    pending = _record(item_id="ai-item", task_name="AI Task")
+    pending["ai_analysis"] = {
+        "analysis_source": "ai",
+        "analysis_status": "pending",
+        "is_recommended": None,
+        "reason": "",
+        "keyword_hit_count": 0,
+    }
+    assert asyncio.run(save_task_result_record(pending, "camera", 45)) is True
+
+    completed = _record(item_id="ai-item", task_name="AI Task")
+    completed["ai_analysis"] = {
+        "analysis_source": "ai",
+        "analysis_status": "completed",
+        "prompt_version": "EagleEye-V6.4",
+        "is_recommended": True,
+        "reason": "meets the fictional criteria",
+        "risk_tags": [],
+        "criteria_analysis": {"seller_type": "个人"},
+        "request_duration_seconds": 1.234,
+        "keyword_hit_count": 0,
+    }
+
+    assert asyncio.run(
+        upsert_task_result_record(completed, "camera", 45)
+    ) is True
+    records = _load_task_records(45)
+
+    assert len(records) == 1
+    assert records[0]["ai_analysis"] == completed["ai_analysis"]

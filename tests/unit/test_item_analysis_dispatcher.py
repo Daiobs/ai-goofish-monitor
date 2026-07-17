@@ -9,6 +9,7 @@ from src.services.item_analysis_dispatcher import (
 def test_item_analysis_dispatcher_uses_bounded_concurrency():
     active_ai_calls = 0
     max_active_ai_calls = 0
+    pending_records = []
     saved_records = []
     notifications = []
 
@@ -36,6 +37,10 @@ def test_item_analysis_dispatcher_uses_bounded_concurrency():
         notifications.append((item_data["商品ID"], reason))
 
     async def saver(record: dict, keyword: str):
+        pending_records.append((keyword, record))
+        return True
+
+    async def final_saver(record: dict, keyword: str):
         saved_records.append((keyword, record))
         return True
 
@@ -48,6 +53,7 @@ def test_item_analysis_dispatcher_uses_bounded_concurrency():
             ai_analyzer=ai_analyzer,
             notifier=notifier,
             saver=saver,
+            final_saver=final_saver,
         )
         for index in range(3):
             dispatcher.submit(
@@ -72,12 +78,20 @@ def test_item_analysis_dispatcher_uses_bounded_concurrency():
 
     dispatcher = asyncio.run(run())
     assert dispatcher.completed_count == 3
+    assert len(pending_records) == 3
     assert len(saved_records) == 3
     assert len(notifications) == 3
     assert max_active_ai_calls == 2
-    assert saved_records[0][1]["卖家信息"]["卖家ID"].startswith("seller-")
+    assert all(
+        record["ai_analysis"]["analysis_status"] == "pending"
+        for _, record in pending_records
+    )
     assert all(
         record["ai_analysis"]["analysis_status"] == "completed"
+        for _, record in saved_records
+    )
+    assert all(
+        record["卖家信息"]["卖家ID"].startswith("seller-")
         for _, record in saved_records
     )
 
@@ -149,13 +163,18 @@ def test_item_analysis_failure_is_saved_and_does_not_stop_other_items():
     assert dispatcher.completed_count == 2
     assert [record["商品信息"]["商品ID"] for record in saved_records] == [
         "failed-item",
+        "failed-item",
+        "successful-item",
         "successful-item",
     ]
-    failed_analysis = saved_records[0]["ai_analysis"]
+    assert saved_records[0]["ai_analysis"]["analysis_status"] == "pending"
+    failed_analysis = saved_records[1]["ai_analysis"]
     assert failed_analysis["analysis_status"] == "failed"
     assert failed_analysis["is_recommended"] is False
-    assert failed_analysis["reason"].startswith("AI分析异常:")
-    assert saved_records[1]["ai_analysis"]["analysis_status"] == "completed"
+    assert failed_analysis["reason"] == "AI分析异常: RuntimeError"
+    assert "fictional AI outage" not in str(failed_analysis)
+    assert saved_records[2]["ai_analysis"]["analysis_status"] == "pending"
+    assert saved_records[3]["ai_analysis"]["analysis_status"] == "completed"
     assert notifications == [("successful-item", "通过验收规则")]
 
 

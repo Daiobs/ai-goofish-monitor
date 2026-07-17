@@ -63,6 +63,8 @@ from src.services.result_storage_service import (
     load_processed_link_keys,
     load_task_processed_link_keys,
     save_task_result_record,
+    upsert_result_record,
+    upsert_task_result_record,
 )
 from src.services.seller_profile_cache import SellerProfileCache
 from src.services.search_pagination import (
@@ -702,6 +704,7 @@ async def _scrape_xianyu_core(
     min_price = task_config.get("min_price")
     max_price = task_config.get("max_price")
     ai_prompt_text = task_config.get("ai_prompt_text", "")
+    ai_prompt_version = task_config.get("ai_prompt_version")
     analyze_images = _should_analyze_images(task_config)
     decision_mode = str(task_config.get("decision_mode", "ai")).strip().lower()
     if decision_mode not in {"ai", "keyword"}:
@@ -722,6 +725,7 @@ async def _scrape_xianyu_core(
         result_filename = build_legacy_result_filename(keyword)
         processed_links = load_processed_link_keys(keyword)
         result_saver = save_to_jsonl
+        final_result_saver = upsert_result_record
     else:
         historical_snapshots = load_task_price_snapshots(result_task_id)
         result_filename = build_task_result_filename(result_task_id)
@@ -729,6 +733,13 @@ async def _scrape_xianyu_core(
 
         async def result_saver(record: dict, record_keyword: str) -> bool:
             return await save_task_result_record(
+                record,
+                record_keyword,
+                result_task_id,
+            )
+
+        async def final_result_saver(record: dict, record_keyword: str) -> bool:
+            return await upsert_task_result_record(
                 record,
                 record_keyword,
                 result_task_id,
@@ -881,6 +892,19 @@ async def _scrape_xianyu_core(
                 seller_profile_cache = SellerProfileCache(
                     ttl_seconds=_get_seller_profile_cache_ttl(task_config)
                 )
+
+                async def analyze_with_task_prompt_version(
+                    record: dict,
+                    image_paths: list[str],
+                    prompt_text: str,
+                ):
+                    return await get_ai_analysis(
+                        record,
+                        image_paths,
+                        prompt_text,
+                        prompt_version=ai_prompt_version,
+                    )
+
                 analysis_dispatcher = ItemAnalysisDispatcher(
                     concurrency=_get_ai_analysis_concurrency(task_config),
                     skip_ai_analysis=SKIP_AI_ANALYSIS,
@@ -889,9 +913,10 @@ async def _scrape_xianyu_core(
                         lambda seller_key: scrape_user_profile(context, seller_key),
                     ),
                     image_downloader=download_all_images,
-                    ai_analyzer=get_ai_analysis,
+                    ai_analyzer=analyze_with_task_prompt_version,
                     notifier=send_ntfy_notification,
                     saver=result_saver,
+                    final_saver=final_result_saver,
                 )
 
                 await context.add_init_script(browser_init_script())

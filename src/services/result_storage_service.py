@@ -262,6 +262,8 @@ def _save_result_record_sync(
     record: dict,
     keyword: str,
     task_id: int | None,
+    *,
+    update_existing: bool = False,
 ) -> bool:
     bootstrap_sqlite_storage()
     payload = copy.deepcopy(record)
@@ -284,6 +286,29 @@ def _save_result_record_sync(
         keyword_hit_count = 0
     search_text = normalize_text(build_search_text(payload))
 
+    insert_values = (
+        task_id,
+        result_filename,
+        payload.get("搜索关键字", keyword),
+        payload.get("任务名称", ""),
+        payload.get("爬取时间", ""),
+        item.get("发布时间"),
+        parse_price_value(item.get("当前售价")),
+        item.get("当前售价"),
+        item.get("商品ID"),
+        item.get("商品标题"),
+        link,
+        link_unique_key,
+        (payload.get("卖家信息", {}) or {}).get("卖家昵称")
+        or item.get("卖家昵称"),
+        1 if analysis.get("is_recommended") else 0,
+        analysis.get("analysis_source"),
+        keyword_hit_count,
+        "active",
+        search_text,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
     with sqlite_connection() as conn:
         cursor = conn.execute(
             """
@@ -294,31 +319,57 @@ def _save_result_record_sync(
                 analysis_source, keyword_hit_count, status, search_text, raw_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                task_id,
-                result_filename,
-                payload.get("搜索关键字", keyword),
-                payload.get("任务名称", ""),
-                payload.get("爬取时间", ""),
-                item.get("发布时间"),
-                parse_price_value(item.get("当前售价")),
-                item.get("当前售价"),
-                item.get("商品ID"),
-                item.get("商品标题"),
-                link,
-                link_unique_key,
-                (payload.get("卖家信息", {}) or {}).get("卖家昵称")
-                or item.get("卖家昵称"),
-                1 if analysis.get("is_recommended") else 0,
-                analysis.get("analysis_source"),
-                keyword_hit_count,
-                "active",
-                search_text,
-                json.dumps(payload, ensure_ascii=False),
-            ),
+            insert_values,
         )
+        persisted = int(cursor.rowcount or 0) > 0
+        if not persisted and update_existing:
+            update_values = (
+                insert_values[2],
+                insert_values[3],
+                insert_values[4],
+                insert_values[5],
+                insert_values[6],
+                insert_values[7],
+                insert_values[8],
+                insert_values[9],
+                insert_values[10],
+                insert_values[12],
+                insert_values[13],
+                insert_values[14],
+                insert_values[15],
+                insert_values[17],
+                insert_values[18],
+            )
+            if task_id is None:
+                cursor = conn.execute(
+                    """
+                    UPDATE result_items
+                    SET keyword = ?, task_name = ?, crawl_time = ?,
+                        publish_time = ?, price = ?, price_display = ?, item_id = ?,
+                        title = ?, link = ?, seller_nickname = ?, is_recommended = ?,
+                        analysis_source = ?, keyword_hit_count = ?, search_text = ?,
+                        raw_json = ?
+                    WHERE task_id IS NULL AND result_filename = ?
+                      AND link_unique_key = ?
+                    """,
+                    (*update_values, result_filename, link_unique_key),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE result_items
+                    SET keyword = ?, task_name = ?, crawl_time = ?,
+                        publish_time = ?, price = ?, price_display = ?, item_id = ?,
+                        title = ?, link = ?, seller_nickname = ?, is_recommended = ?,
+                        analysis_source = ?, keyword_hit_count = ?, search_text = ?,
+                        raw_json = ?
+                    WHERE task_id = ? AND link_unique_key = ?
+                    """,
+                    (*update_values, task_id, link_unique_key),
+                )
+            persisted = int(cursor.rowcount or 0) > 0
         conn.commit()
-    return int(cursor.rowcount or 0) > 0
+    return persisted
 
 
 async def save_result_record(record: dict, keyword: str) -> bool:
@@ -332,6 +383,32 @@ async def save_task_result_record(record: dict, keyword: str, task_id: int) -> b
         record,
         keyword,
         _normalize_task_id(task_id),
+    )
+
+
+async def upsert_result_record(record: dict, keyword: str) -> bool:
+    """Insert or update a legacy row after its initial pending write."""
+    return await asyncio.to_thread(
+        _save_result_record_sync,
+        record,
+        keyword,
+        None,
+        update_existing=True,
+    )
+
+
+async def upsert_task_result_record(
+    record: dict,
+    keyword: str,
+    task_id: int,
+) -> bool:
+    """Insert or update a task-owned row after its initial pending write."""
+    return await asyncio.to_thread(
+        _save_result_record_sync,
+        record,
+        keyword,
+        _normalize_task_id(task_id),
+        update_existing=True,
     )
 
 
