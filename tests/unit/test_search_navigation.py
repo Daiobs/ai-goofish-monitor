@@ -152,30 +152,52 @@ def test_navigation_accepts_existing_exact_search_endpoint() -> None:
     assert page.response_listeners == []
 
 
-def test_navigation_accepts_alternative_goofish_json_with_nested_result_list() -> None:
-    items = [
-        _search_item("alternative-1"),
-        _search_item("alternative-2"),
-    ]
-    response = FakeResponse(
+def test_navigation_ignores_search_setup_responses_before_search_result() -> None:
+    activation = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.item.search.activate/1.0/",
+        {
+            "ret": ["SUCCESS::fixture detail"],
+            "data": {"cardList": []},
+        },
+    )
+    shade = FakeResponse(
         "https://h5api.m.goofish.com/h5/"
         "mtop.taobao.idlemtopsearch.pc.search.shade/1.0/?trace=fixture",
-        {"code": 0, "data": {"sections": [{"resultList": items}]}},
+        {
+            "ret": ["SUCCESS::fixture detail"],
+            "data": {"singleShadeWords": []},
+        },
         method="GET",
         resource_type="fetch",
     )
-    page = FakePage(responses=(response,))
+    search_payload = {
+        "ret": ["SUCCESS::fixture detail"],
+        "data": {"resultList": [_search_item("search-1")]},
+    }
+    search = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        search_payload,
+    )
+    page = FakePage(responses=(activation, shade, search))
 
     result = _navigate(page)
 
     assert result.success is True
+    assert result.result_count == 1
     assert result.response is not None
-    assert asyncio.run(result.response.json()) == {"data": {"resultList": items}}
-    assert result.source == (
-        "GET https://h5api.m.goofish.com/h5/"
-        "mtop.taobao.idlemtopsearch.pc.search.shade/1.0/ status=200"
-    )
-    assert "trace" not in result.source
+    assert asyncio.run(result.response.json()) == search_payload
+    assert [diagnostic.is_search_response for diagnostic in result.diagnostics] == [
+        False,
+        False,
+        True,
+    ]
+    assert [diagnostic.has_result_list for diagnostic in result.diagnostics] == [
+        False,
+        False,
+        True,
+    ]
     assert page.response_listeners == []
 
 

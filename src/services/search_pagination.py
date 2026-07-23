@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -13,9 +12,6 @@ NEXT_PAGE_SELECTOR = (
     ":not([disabled])"
 )
 SEARCH_RESULTS_API_FRAGMENT = "/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
-ALTERNATIVE_SEARCH_RESULTS_API_FRAGMENTS = (
-    "/h5/mtop.taobao.idlemtopsearch.pc.search.shade/1.0/",
-)
 PAGE_REQUEST_TIMEOUT_MS = 20_000
 PAGE_CLICK_TIMEOUT_MS = 10_000
 PAGE_RETRY_DELAY_SECONDS = 5
@@ -38,24 +34,7 @@ def is_search_results_response(
     request = getattr(response, "request", None)
     request_method = str(getattr(request, "method", "") or "").upper()
     response_url = str(getattr(response, "url", "") or "")
-    if api_url_fragment in response_url and request_method == "POST":
-        return True
-    try:
-        parsed = urlsplit(response_url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").rstrip(".").lower()
-    is_goofish = hostname == "goofish.com" or hostname.endswith(".goofish.com")
-    resource_type = str(getattr(request, "resource_type", "") or "").lower()
-    return (
-        is_goofish
-        and request_method in {"GET", "POST"}
-        and resource_type in {"xhr", "fetch"}
-        and any(
-            fragment in parsed.path.lower()
-            for fragment in ALTERNATIVE_SEARCH_RESULTS_API_FRAGMENTS
-        )
-    )
+    return api_url_fragment in response_url and request_method == "POST"
 
 
 async def advance_search_page(
