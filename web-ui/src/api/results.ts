@@ -1,6 +1,42 @@
 import type { ResultInsights, ResultItem } from '@/types/result.d.ts'
 import { http } from '@/lib/http'
 
+export const DECISION_VIEW_KEYS = [
+  'worth_viewing',
+  'comparable_targets',
+  'bundles',
+  'excluded',
+  'ai_issues',
+] as const
+
+export type DecisionView = typeof DECISION_VIEW_KEYS[number]
+
+export interface DecisionSummary {
+  all_count: number;
+  target_only_count: number;
+  target_bundle_count: number;
+  not_target_count: number;
+  uncertain_count: number;
+  comparable_count: number;
+  excluded_count: number;
+  ai_recommended_count: number;
+  ai_not_recommended_count: number;
+  ai_issue_count: number;
+}
+
+export interface ResultContentResponse {
+  total_items: number;
+  page: number;
+  limit: number;
+  items: ResultItem[];
+}
+
+export interface TaskDecisionResultResponse extends ResultContentResponse {
+  decision_view: DecisionView;
+  current_view_count: number;
+  decision_summary: DecisionSummary;
+}
+
 export interface GetResultContentParams {
   recommended_only?: boolean;
   ai_recommended_only?: boolean;
@@ -24,8 +60,21 @@ export async function deleteResultFile(filename: string): Promise<{ message: str
 export async function getResultContent(
   filename: string,
   params: GetResultContentParams = {}
-): Promise<{ total_items: number; items: ResultItem[] }> {
+): Promise<ResultContentResponse> {
   return await http(`/api/results/${filename}`, { params: params as Record<string, any> })
+}
+
+export async function getTaskResultContent(
+  taskId: number,
+  decisionView: DecisionView,
+  params: Pick<GetResultContentParams, 'include_hidden' | 'page' | 'limit'> = {}
+): Promise<TaskDecisionResultResponse> {
+  return await http(`/api/results/tasks/${taskId}`, {
+    params: {
+      decision_view: decisionView,
+      ...params,
+    },
+  })
 }
 
 export async function getResultInsights(filename: string): Promise<ResultInsights> {

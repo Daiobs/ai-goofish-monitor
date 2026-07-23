@@ -29,6 +29,7 @@ interface Props {
   sortOrder: 'asc' | 'desc'
   isLoading: boolean
   isReady: boolean
+  decisionQueueActive?: boolean
 }
 
 const props = defineProps<Props>()
@@ -93,7 +94,10 @@ function handleToggleKeywordRecommended(value: boolean) {
 
 <template>
   <div class="app-surface mb-6 p-4 sm:p-5">
-    <div class="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)]">
+    <div
+      class="grid gap-4"
+      :class="props.decisionQueueActive ? 'grid-cols-1' : 'lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)]'"
+    >
       <div class="space-y-2">
         <Label class="text-xs font-semibold text-slate-500">{{ t('results.title') }}</Label>
         <Select
@@ -113,7 +117,7 @@ function handleToggleKeywordRecommended(value: boolean) {
         </Select>
       </div>
 
-      <div class="space-y-2">
+      <div v-if="!props.decisionQueueActive" class="space-y-2">
         <Label class="text-xs font-semibold text-slate-500">{{ t('results.filters.sortByCrawlTime') }}</Label>
         <Select
           :model-value="props.sortBy"
@@ -131,7 +135,7 @@ function handleToggleKeywordRecommended(value: boolean) {
         </Select>
       </div>
 
-      <div class="space-y-2">
+      <div v-if="!props.decisionQueueActive" class="space-y-2">
         <Label class="text-xs font-semibold text-slate-500">{{ t('results.filters.asc') }} / {{ t('results.filters.desc') }}</Label>
         <Select
           :model-value="props.sortOrder"
@@ -150,7 +154,7 @@ function handleToggleKeywordRecommended(value: boolean) {
 
     <div class="mt-4 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
       <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
-        <div class="flex items-center space-x-2">
+        <div v-if="!props.decisionQueueActive" class="flex items-center space-x-2">
           <Checkbox
             id="ai-recommended-only"
             :model-value="props.aiRecommendedOnly"
@@ -159,7 +163,7 @@ function handleToggleKeywordRecommended(value: boolean) {
           <Label for="ai-recommended-only" class="cursor-pointer">{{ t('results.filters.aiOnly') }}</Label>
         </div>
 
-        <div class="flex items-center space-x-2">
+        <div v-if="!props.decisionQueueActive" class="flex items-center space-x-2">
           <Checkbox
             id="keyword-recommended-only"
             :model-value="props.keywordRecommendedOnly"

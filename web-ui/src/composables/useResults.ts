@@ -3,7 +3,11 @@ import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import type { ResultInsights, ResultItem } from '@/types/result.d.ts'
 import * as resultsApi from '@/api/results'
-import type { GetResultContentParams } from '@/api/results'
+import type {
+  DecisionSummary,
+  DecisionView,
+  GetResultContentParams,
+} from '@/api/results'
 import { useWebSocket } from '@/composables/useWebSocket'
 import * as tasksApi from '@/api/tasks'
 
@@ -18,6 +22,9 @@ export function useResults() {
   const results = ref<ResultItem[]>([])
   const insights = ref<ResultInsights | null>(null)
   const totalItems = ref(0)
+  const currentViewCount = ref(0)
+  const decisionSummary = ref<DecisionSummary | null>(null)
+  const decisionView = ref<DecisionView>('worth_viewing')
   const page = ref(1)
   const limit = ref(100)
   const blacklistKeywords = ref<string[]>([])
@@ -29,6 +36,7 @@ export function useResults() {
   const isSavingBlacklist = ref(false)
   const readyDelayMs = 200
   let readyTimer: ReturnType<typeof setTimeout> | null = null
+  let resultsRequestSequence = 0
   
   const STORAGE_KEY_FILTERS = 'resultFilters'
 
@@ -88,6 +96,11 @@ export function useResults() {
     return match ? Number(match[1]) : null
   }
 
+  const selectedTaskId = computed(() => (
+    selectedFile.value ? getTaskIdFromFilename(selectedFile.value) : null
+  ))
+  const isTaskOwnedResult = computed(() => selectedTaskId.value !== null)
+
   // Methods
   async function fetchFiles() {
     try {
@@ -115,28 +128,54 @@ export function useResults() {
   }
 
   async function fetchResults() {
+    const requestSequence = ++resultsRequestSequence
     if (!selectedFile.value) {
       results.value = []
       totalItems.value = 0
+      currentViewCount.value = 0
+      decisionSummary.value = null
+      isLoading.value = false
       return
     }
 
     isLoading.value = true
     error.value = null
     try {
-      const data = await resultsApi.getResultContent(selectedFile.value, {
-        ...filters,
-        page: page.value,
-        limit: limit.value,
-      })
-      results.value = data.items
-      totalItems.value = data.total_items
+      const taskId = selectedTaskId.value
+      if (taskId !== null) {
+        const data = await resultsApi.getTaskResultContent(taskId, decisionView.value, {
+          include_hidden: filters.include_hidden,
+          page: page.value,
+          limit: limit.value,
+        })
+        if (requestSequence !== resultsRequestSequence) return
+        results.value = data.items
+        totalItems.value = data.total_items
+        currentViewCount.value = data.current_view_count
+        decisionSummary.value = data.decision_summary
+      } else {
+        const data = await resultsApi.getResultContent(selectedFile.value, {
+          ...filters,
+          page: page.value,
+          limit: limit.value,
+        })
+        if (requestSequence !== resultsRequestSequence) return
+        results.value = data.items
+        totalItems.value = data.total_items
+        currentViewCount.value = data.total_items
+        decisionSummary.value = null
+      }
     } catch (e) {
+      if (requestSequence !== resultsRequestSequence) return
       if (e instanceof Error) error.value = e
       results.value = []
       totalItems.value = 0
+      currentViewCount.value = 0
+      decisionSummary.value = null
     } finally {
-      isLoading.value = false
+      if (requestSequence === resultsRequestSequence) {
+        isLoading.value = false
+      }
     }
   }
 
@@ -288,8 +327,9 @@ export function useResults() {
   watch(filters, (val) => {
     localStorage.setItem(STORAGE_KEY_FILTERS, JSON.stringify(val))
   }, { deep: true })
-  watch([selectedFile, filters], fetchResults, { deep: true })
+  watch([selectedFile, filters, decisionView], fetchResults, { deep: true })
   watch(selectedFile, () => {
+    decisionView.value = 'worth_viewing'
     fetchInsights()
     fetchBlacklistRules()
   })
@@ -340,6 +380,10 @@ export function useResults() {
     results,
     insights,
     totalItems,
+    currentViewCount,
+    decisionSummary,
+    decisionView,
+    isTaskOwnedResult,
     filters,
     isLoading,
     error,

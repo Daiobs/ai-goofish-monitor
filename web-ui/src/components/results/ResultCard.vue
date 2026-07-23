@@ -29,30 +29,78 @@ const ai = props.item.ai_analysis
 const priceInsight = props.item.price_insight
 const usesAiMarketScope = computed(() => priceInsight?.market_scope === 'ai_classified')
 
-const isAiFailure = computed(() => (
-  ai?.analysis_source === 'ai'
-  && (ai?.analysis_status === 'failed' || Boolean(ai?.error))
+const analysisStatus = computed(() => {
+  if (ai?.analysis_status) return ai.analysis_status
+  if (ai?.error) return 'failed'
+  if (typeof ai?.is_recommended === 'boolean') return 'completed'
+  return 'pending'
+})
+const isAiFailure = computed(() => analysisStatus.value === 'failed')
+const isRecommended = computed(() => (
+  analysisStatus.value === 'completed' && ai?.is_recommended === true
 ))
-const isRecommended = computed(() => ai?.is_recommended === true && !isAiFailure.value)
 const recommendationStatus = computed(() => {
   if (isAiFailure.value) return { label: t('results.card.aiFailed'), color: 'bg-rose-500', icon: AlertCircle, text: 'text-rose-600', bg: 'bg-rose-50' }
+  if (analysisStatus.value === 'skipped') return { label: t('results.card.aiSkipped'), color: 'bg-slate-400', icon: AlertCircle, text: 'text-slate-600', bg: 'bg-slate-50' }
+  if (analysisStatus.value === 'pending') return { label: t('results.card.aiPending'), color: 'bg-amber-500', icon: AlertCircle, text: 'text-amber-600', bg: 'bg-amber-50' }
   if (ai?.is_recommended === true) return { label: t('results.card.strongRecommend'), color: 'bg-emerald-500', icon: CheckCircle2, text: 'text-emerald-600', bg: 'bg-emerald-50' }
   if (ai?.is_recommended === false) return { label: t('results.card.notRecommended'), color: 'bg-rose-500', icon: XCircle, text: 'text-rose-600', bg: 'bg-rose-50' }
   return { label: t('results.card.pending'), color: 'bg-amber-500', icon: AlertCircle, text: 'text-amber-600', bg: 'bg-amber-50' }
+})
+const analysisStatusLabel = computed(() => {
+  if (analysisStatus.value === 'completed') return t('results.card.aiCompleted')
+  if (analysisStatus.value === 'failed') return t('results.card.aiFailed')
+  if (analysisStatus.value === 'skipped') return t('results.card.aiSkipped')
+  return t('results.card.aiPending')
 })
 const targetCategoryLabel = computed(() => {
   if (ai?.target_category === 'target_only') return t('results.card.targetOnly')
   if (ai?.target_category === 'target_bundle') return t('results.card.targetBundle')
   if (ai?.target_category === 'not_target') return t('results.card.notTarget')
   if (ai?.target_category === 'uncertain') return t('results.card.targetUncertain')
+  return t('results.card.targetUnclassified')
+})
+const exclusionReason = computed(() => {
+  if (analysisStatus.value !== 'completed') return t('results.card.aiIssueExclusion')
+  if (ai?.target_category === 'target_bundle') return t('results.card.bundleExclusion')
+  if (ai?.target_category === 'not_target') return t('results.card.nonTargetExclusion')
+  if (ai?.target_category === 'uncertain') return t('results.card.uncertainExclusion')
+  if (ai?.market_comparable === false) return t('results.card.nonComparableExclusion')
   return null
+})
+const marketPositionLabel = computed(() => {
+  if (
+    ai?.target_category !== 'target_only'
+    || ai?.market_comparable !== true
+    || priceInsight?.market_comparable === false
+  ) {
+    return t('results.card.excludedMarketPosition')
+  }
+
+  const currentPrice = priceInsight?.current_price
+  const medianPrice = priceInsight?.market_median_price
+  if (
+    typeof currentPrice !== 'number'
+    || typeof medianPrice !== 'number'
+    || medianPrice <= 0
+  ) {
+    return t('results.card.marketPositionUnavailable')
+  }
+
+  const percent = Math.round(Math.abs((currentPrice - medianPrice) / medianPrice) * 100)
+  if (percent === 0) return t('results.card.atMedian')
+  return currentPrice < medianPrice
+    ? t('results.card.belowMedian', { percent })
+    : t('results.card.aboveMedian', { percent })
 })
 
 const imageUrl = info.商品图片列表?.[0] || info.商品主图链接 || ''
 const crawlTime = props.item.爬取时间
   ? formatDateTime(props.item.爬取时间, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
   : t('common.unknown')
-const matchScore = ai?.value_score ?? 0
+const matchScore = computed(() => (
+  typeof ai?.value_score === 'number' ? ai.value_score : null
+))
 const isHidden = computed(() => props.item._effective_hidden === true || props.item._status === 'hidden')
 const isRuleHidden = computed(() => props.item._hidden_reason === 'rule')
 const canToggleBlock = computed(() => props.item._hidden_reason !== 'rule' && props.item._hidden_reason !== 'expired')
@@ -115,14 +163,14 @@ const expanded = ref(false)
 
     <CardHeader class="p-4 pb-2">
       <div class="flex justify-between items-start gap-3">
-        <CardTitle class="text-base font-semibold text-slate-800 line-clamp-2 leading-snug flex-grow h-10">
+        <CardTitle class="h-10 min-w-0 flex-grow break-words text-base font-semibold leading-snug text-slate-800 line-clamp-2">
           <a :href="info.商品链接" target="_blank" rel="noopener noreferrer" class="hover:text-primary transition-colors">
             {{ info.商品标题 }}
           </a>
         </CardTitle>
       </div>
       <div class="flex items-baseline gap-1 mt-2">
-        <span class="text-2xl font-bold text-rose-600 tracking-tight">{{ info.当前售价 }}</span>
+        <span class="break-all text-2xl font-bold text-rose-600 tracking-tight">{{ info.当前售价 }}</span>
         <span v-if="info['商品原价']" class="text-xs text-slate-400 line-through mb-1">{{ info['商品原价'] }}</span>
       </div>
     </CardHeader>
@@ -135,17 +183,19 @@ const expanded = ref(false)
             <component :is="recommendationStatus.icon" class="w-4 h-4" :class="recommendationStatus.text" />
             <span class="text-sm font-bold" :class="recommendationStatus.text">{{ recommendationStatus.label }}</span>
           </div>
-          <div v-if="!isAiFailure" class="flex items-center gap-1">
-             <span class="text-[10px] font-medium uppercase tracking-wider text-slate-400">{{ ai?.analysis_status === 'completed' ? t('results.card.aiCompleted') : 'AI Match' }}</span>
-             <span class="text-sm font-black" :class="recommendationStatus.text">{{ matchScore }}%</span>
+          <div class="flex min-w-0 items-center gap-1">
+             <span class="truncate text-[10px] font-medium text-slate-400">
+               {{ t('results.card.aiStatus') }}: {{ analysisStatusLabel }}
+             </span>
+             <span v-if="matchScore !== null" class="shrink-0 text-sm font-black" :class="recommendationStatus.text">{{ matchScore }}%</span>
           </div>
         </div>
-        <p v-if="targetCategoryLabel" class="mb-2 text-[11px] font-semibold text-slate-500">
+        <p class="mb-2 text-[11px] font-semibold text-slate-500">
           {{ targetCategoryLabel }}
-          <span v-if="ai?.market_comparable === true"> · {{ t('results.card.comparable') }}</span>
+          <span> · {{ ai?.market_comparable === true ? t('results.card.comparable') : t('results.card.notComparable') }}</span>
         </p>
         
-        <div v-if="!isAiFailure" class="w-full h-1.5 bg-white/50 rounded-full overflow-hidden mb-3">
+        <div v-if="matchScore !== null && !isAiFailure" class="w-full h-1.5 bg-white/50 rounded-full overflow-hidden mb-3">
           <div 
             class="h-full transition-all duration-1000 ease-out rounded-full" 
             :class="recommendationStatus.color"
@@ -153,6 +203,9 @@ const expanded = ref(false)
           ></div>
         </div>
 
+        <p class="mb-1 text-[10px] font-semibold text-slate-400">
+          {{ t('results.card.analysisReason') }}
+        </p>
         <p class="text-xs leading-relaxed text-slate-600" :class="{ 'line-clamp-2': !expanded }">
            {{ ai?.reason || t('results.card.analyzing') }}
         </p>
@@ -166,6 +219,24 @@ const expanded = ref(false)
           {{ expanded ? t('results.card.collapse') : t('results.card.expand') }}
           <Info class="w-3 h-3" />
         </button>
+      </div>
+
+      <div v-if="exclusionReason" class="mt-3 border-l-2 border-amber-300 bg-amber-50/70 px-3 py-2">
+        <p class="text-[10px] font-semibold text-amber-700">
+          {{ t('results.card.exclusionReason') }}
+        </p>
+        <p class="mt-0.5 text-xs leading-5 text-amber-900">
+          {{ exclusionReason }}
+        </p>
+      </div>
+
+      <div class="mt-3 border-t border-slate-100 pt-3">
+        <p class="text-[10px] font-semibold text-slate-400">
+          {{ t('results.card.marketPosition') }}
+        </p>
+        <p class="mt-0.5 text-xs font-medium leading-5 text-slate-700">
+          {{ marketPositionLabel }}
+        </p>
       </div>
 
       <!-- Price Stats Grid -->
