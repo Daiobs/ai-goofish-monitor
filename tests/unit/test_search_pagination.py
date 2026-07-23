@@ -218,6 +218,18 @@ def test_is_search_results_response_accepts_search_shade_api() -> None:
     assert is_search_results_response(response) is True
 
 
+def test_is_search_results_response_rejects_search_activation_api() -> None:
+    response = FakeResponse(
+        url=(
+            "https://h5api.m.goofish.com/h5/"
+            "mtop.taobao.idlemtopsearch.pc.item.search.activate/1.0/"
+        ),
+        method="POST",
+    )
+
+    assert is_search_results_response(response) is False
+
+
 def test_is_search_results_response_rejects_unsupported_method() -> None:
     response = FakeResponse(
         url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?foo=bar",

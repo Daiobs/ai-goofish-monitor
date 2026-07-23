@@ -215,6 +215,35 @@ def test_navigation_ignores_unrelated_non_success_xhr_before_search_result() -> 
     assert "fixture detail" not in serialized
 
 
+def test_navigation_ignores_search_activation_before_search_result() -> None:
+    activation = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.item.search.activate/1.0/",
+        {
+            "ret": ["SUCCESS::fixture detail"],
+            "data": {"activated": True},
+        },
+    )
+    search_payload = {
+        "ret": ["SUCCESS::fixture detail"],
+        "data": {"resultList": [_search_item("search-1")]},
+    }
+    search = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        search_payload,
+    )
+
+    result = _navigate(FakePage(responses=(activation, search)))
+
+    assert result.success is True
+    assert result.result_count == 1
+    assert len(result.diagnostics) == 2
+    assert result.diagnostics[0].is_search_response is False
+    assert result.diagnostics[0].has_result_list is False
+    assert result.diagnostics[1].is_search_response is True
+
+
 def test_navigation_rejects_unknown_non_success_search_with_results() -> None:
     response = FakeResponse(
         "https://h5api.m.goofish.com/h5/"

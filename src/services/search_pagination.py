@@ -13,6 +13,9 @@ NEXT_PAGE_SELECTOR = (
     ":not([disabled])"
 )
 SEARCH_RESULTS_API_FRAGMENT = "/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
+ALTERNATIVE_SEARCH_RESULTS_API_FRAGMENTS = (
+    "/h5/mtop.taobao.idlemtopsearch.pc.search.shade/1.0/",
+)
 PAGE_REQUEST_TIMEOUT_MS = 20_000
 PAGE_CLICK_TIMEOUT_MS = 10_000
 PAGE_RETRY_DELAY_SECONDS = 5
@@ -48,7 +51,10 @@ def is_search_results_response(
         is_goofish
         and request_method in {"GET", "POST"}
         and resource_type in {"xhr", "fetch"}
-        and "search" in parsed.path.lower()
+        and any(
+            fragment in parsed.path.lower()
+            for fragment in ALTERNATIVE_SEARCH_RESULTS_API_FRAGMENTS
+        )
     )
 
 
