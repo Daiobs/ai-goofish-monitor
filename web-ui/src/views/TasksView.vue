@@ -12,6 +12,7 @@ import { listAccounts, type AccountItem } from '@/api/accounts'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { toast } from '@/components/ui/toast'
+import { CheckCircle2, CircleX, LoaderCircle, Network, ShieldCheck } from 'lucide-vue-next'
 import {
   Dialog,
   DialogContent,
@@ -29,9 +30,12 @@ const {
   fetchTasks,
   removeTask,
   updateTask,
+  preflightTask,
   startTask,
   stopTask,
   stoppingTaskIds,
+  preflightingTaskIds,
+  preflightReports,
 } = useTasks()
 const route = useRoute()
 
@@ -52,6 +56,11 @@ const taskToDelete = computed(() => {
   return tasks.value.find((task) => task.id === taskToDeleteId.value) || null
 })
 const editDefaults = computed(() => parseTaskFormDefaults(route.query))
+const activePreflightTaskId = computed(() => Array.from(preflightingTaskIds.value)[0] ?? null)
+const latestPreflight = computed(() => {
+  const reports = Object.values(preflightReports.value)
+  return reports.sort((left, right) => right.checked_at.localeCompare(left.checked_at))[0] || null
+})
 
 function handleDeleteTask(taskId: number) {
   taskToDeleteId.value = taskId
@@ -151,9 +160,23 @@ async function handleRefreshCriteria() {
 async function handleStartTask(taskId: number) {
   try {
     await startTask(taskId)
+    toast({ title: t('tasks.preflight.passed') })
   } catch (e) {
     toast({
       title: t('tasks.toasts.startFailed'),
+      description: (e as Error).message,
+      variant: 'destructive',
+    })
+  }
+}
+
+async function handlePreflightTask(taskId: number) {
+  try {
+    await preflightTask(taskId)
+    toast({ title: t('tasks.preflight.passedOnly') })
+  } catch (e) {
+    toast({
+      title: t('tasks.preflight.failed'),
       description: (e as Error).message,
       variant: 'destructive',
     })
@@ -266,10 +289,61 @@ onMounted(fetchAccountOptions)
       <span class="block sm:inline">{{ error.message }}</span>
     </div>
 
+    <section
+      v-if="activePreflightTaskId !== null || latestPreflight"
+      class="mb-4 border-y border-slate-200 bg-white/70 px-4 py-3"
+      aria-live="polite"
+    >
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex min-w-0 items-center gap-2">
+          <LoaderCircle
+            v-if="activePreflightTaskId !== null"
+            class="h-4 w-4 animate-spin text-primary"
+          />
+          <CheckCircle2
+            v-else-if="latestPreflight?.success"
+            class="h-4 w-4 text-emerald-600"
+          />
+          <CircleX v-else class="h-4 w-4 text-rose-600" />
+          <div class="min-w-0">
+            <p class="text-sm font-bold text-slate-800">
+              {{ activePreflightTaskId !== null ? t('tasks.preflight.running') : latestPreflight?.reason }}
+            </p>
+            <p v-if="latestPreflight" class="truncate text-xs text-slate-500">
+              {{ latestPreflight.task_name }} · {{ latestPreflight.suggestion }}
+            </p>
+          </div>
+        </div>
+        <div v-if="latestPreflight" class="flex items-center gap-2 text-xs font-medium text-slate-500">
+          <Network class="h-3.5 w-3.5" />
+          <span>{{ latestPreflight.network_mode === 'explicit_proxy' ? latestPreflight.proxy_endpoint : t('tasks.preflight.direct') }}</span>
+          <ShieldCheck class="ml-1 h-3.5 w-3.5" />
+          <span>{{ latestPreflight.snapshot_kind || t('common.unknown') }}</span>
+        </div>
+      </div>
+      <div v-if="latestPreflight" class="mt-3 grid gap-x-4 gap-y-2 sm:grid-cols-2 xl:grid-cols-3">
+        <div
+          v-for="stage in latestPreflight.stages"
+          :key="stage.key"
+          class="flex min-w-0 items-start gap-2 border-t border-slate-100 pt-2"
+        >
+          <CheckCircle2 v-if="stage.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+          <CircleX v-else-if="stage.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600" />
+          <div v-else class="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-slate-300" />
+          <div class="min-w-0">
+            <p class="text-xs font-bold text-slate-700">{{ stage.label }}</p>
+            <p class="text-xs text-slate-500">{{ stage.message }}</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <TasksTable
       :tasks="tasks"
       :is-loading="isLoading"
       :stopping-ids="stoppingTaskIds"
+      :preflighting-ids="preflightingTaskIds"
+      @preflight-task="handlePreflightTask"
       @delete-task="handleDeleteTask"
       @edit-task="handleEditTask"
       @run-task="handleStartTask"

@@ -14,8 +14,8 @@ from src.services.price_history_service import (
 )
 from src.services.result_storage_service import (
     load_legacy_result_keyword,
+    load_task_market_comparison_scope,
     load_visible_result_item_ids,
-    load_visible_task_result_item_ids,
 )
 
 
@@ -42,8 +42,13 @@ def enrich_records_with_price_insight(records: list[dict], filename: str) -> lis
 
     if task_id is None:
         visible_item_ids = load_visible_result_item_ids(filename)
+        comparable_item_ids = visible_item_ids
+        market_scope = "legacy_keyword"
     else:
-        visible_item_ids = load_visible_task_result_item_ids(task_id)
+        comparison_scope = load_task_market_comparison_scope(task_id)
+        visible_item_ids = comparison_scope["effective_item_ids"]
+        comparable_item_ids = comparison_scope["comparable_item_ids"]
+        market_scope = comparison_scope["scope_mode"]
     visible_snapshots = [
         snapshot
         for snapshot in snapshots
@@ -55,9 +60,15 @@ def enrich_records_with_price_insight(records: list[dict], filename: str) -> lis
         clone = dict(record)
         clone["price_insight"] = build_item_price_context(
             snapshots,
-            item_id=str(info.get("商品ID") or ""),
+            item_id=(item_id := str(info.get("商品ID") or "")),
             current_price=parse_price_value(info.get("当前售价")),
             market_snapshots=visible_snapshots,
+            market_comparable=(
+                True
+                if task_id is None
+                else item_id in comparable_item_ids
+            ),
+            market_scope=market_scope,
         )
         enriched.append(clone)
     return enriched

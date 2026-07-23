@@ -1,9 +1,11 @@
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from src.api import dependencies as deps
 from src.api.routes import tasks as tasks_route
 from src.services.price_history_service import (
     load_price_snapshots,
@@ -191,6 +193,90 @@ def test_start_stop_task_updates_status(api_client, api_context, sample_task_pay
     process_service = api_context["process_service"]
     assert process_service.started == [(task_id, sample_task_payload["task_name"])]
     assert process_service.stopped == [task_id]
+
+
+def test_task_preflight_endpoint_returns_structured_report(
+    api_client,
+    api_context,
+    sample_task_payload,
+):
+    created = api_client.post("/api/tasks/", json=sample_task_payload)
+    task_id = created.json()["task"]["id"]
+    report = SimpleNamespace(
+        to_dict=lambda: {
+            "task_id": task_id,
+            "task_name": sample_task_payload["task_name"],
+            "success": True,
+            "failure_kind": "success",
+            "failed_stage": None,
+            "reason": "运行环境预检通过",
+            "suggestion": "可以开始正式监控",
+            "stages": [
+                {
+                    "key": "search_source",
+                    "label": "搜索数据源识别",
+                    "status": "success",
+                    "message": "已捕获可解析的闲鱼商品数据",
+                }
+            ],
+        }
+    )
+
+    class FakePreflightService:
+        async def run(self, task):
+            assert task.id == task_id
+            return report
+
+    api_context["app"].dependency_overrides[
+        deps.get_monitoring_preflight_service
+    ] = lambda: FakePreflightService()
+
+    response = api_client.post(f"/api/tasks/preflight/{task_id}")
+
+    assert response.status_code == 200
+    payload = response.json()["preflight"]
+    assert payload["success"] is True
+    assert payload["stages"][0]["key"] == "search_source"
+
+
+def test_task_start_returns_preflight_failure_without_spawning(
+    api_client,
+    api_context,
+    sample_task_payload,
+    monkeypatch,
+):
+    created = api_client.post("/api/tasks/", json=sample_task_payload)
+    task_id = created.json()["task"]["id"]
+    process_service = api_context["process_service"]
+    report = {
+        "task_id": task_id,
+        "success": False,
+        "failure_kind": "proxy_unreachable",
+        "failed_stage": "proxy_connect",
+        "reason": "代理端点不可连接",
+        "suggestion": "确认本机代理正在运行",
+        "stages": [],
+    }
+
+    async def blocked_start(received_task_id, _task_name):
+        assert received_task_id == task_id
+        return False
+
+    monkeypatch.setattr(process_service, "start_task", blocked_start)
+    monkeypatch.setattr(
+        process_service,
+        "get_last_preflight_report",
+        lambda received_task_id: report if received_task_id == task_id else None,
+        raising=False,
+    )
+
+    response = api_client.post(f"/api/tasks/start/{task_id}")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "preflight_failed"
+    assert detail["preflight"]["failed_stage"] == "proxy_connect"
+    assert process_service.started == []
 
 
 def test_generate_keyword_mode_task_without_ai_criteria(api_client):

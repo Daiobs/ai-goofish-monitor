@@ -50,7 +50,10 @@ def _record(*, item_id: str, title: str, task_name: str) -> dict:
         },
         "ai_analysis": {
             "analysis_source": "ai",
+            "analysis_status": "completed",
             "is_recommended": True,
+            "target_category": "target_only",
+            "market_comparable": True,
             "reason": "fictional recommendation",
         },
     }
@@ -231,6 +234,68 @@ def test_task_scoped_blacklist_and_status_updates_do_not_cross_tasks(
     assert hidden.status_code == 200
     assert client.get("/api/results/tasks/102").json()["total_items"] == 0
     assert _load_task_records(101)[0]["_status"] == "active"
+
+
+def test_task_insights_use_only_ai_confirmed_comparable_products(
+    task_results_client,
+):
+    client, _ = task_results_client
+    charger = _record(
+        item_id="charger",
+        title="970 charger",
+        task_name="Same",
+    )
+    charger["ai_analysis"].update(
+        {
+            "analysis_status": "completed",
+            "target_category": "target_only",
+            "market_comparable": True,
+        }
+    )
+    battery = _record(
+        item_id="battery",
+        title="F970 battery",
+        task_name="Same",
+    )
+    battery["ai_analysis"].update(
+        {
+            "analysis_status": "completed",
+            "target_category": "not_target",
+            "market_comparable": False,
+        }
+    )
+    assert asyncio.run(save_task_result_record(charger, "camera", 101))
+    assert asyncio.run(save_task_result_record(battery, "camera", 101))
+    record_market_snapshots(
+        task_id=101,
+        keyword="camera",
+        task_name="Same",
+        items=[
+            {"商品ID": "charger", "商品标题": "970 charger", "当前售价": "20"},
+            {"商品ID": "battery", "商品标题": "F970 battery", "当前售价": "200"},
+        ],
+        run_id="classified-run",
+        snapshot_time="2026-07-24T10:00:00",
+    )
+
+    response = client.get("/api/results/tasks/101/insights")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["market_summary"]["sample_count"] == 1
+    assert payload["market_summary"]["avg_price"] == 20.0
+    assert payload["comparison_scope"] == {
+        "mode": "ai_classified",
+        "visible_count": 2,
+        "classified_count": 2,
+        "comparable_count": 1,
+        "excluded_count": 1,
+        "target_only_count": 1,
+        "target_bundle_count": 0,
+        "not_target_count": 1,
+        "uncertain_count": 0,
+        "unclassified_count": 0,
+    }
 
 
 def test_delete_task_results_preserves_sibling_and_legacy_data(task_results_client):

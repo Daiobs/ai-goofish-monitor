@@ -36,8 +36,8 @@ from src.services.result_storage_service import (
     load_legacy_result_keyword,
     load_result_blacklist_keywords,
     load_task_result_blacklist_keywords,
+    load_task_market_comparison_scope,
     load_visible_result_item_ids,
-    load_visible_task_result_item_ids,
     query_result_records,
     query_task_result_records,
     result_file_exists,
@@ -73,6 +73,27 @@ async def _require_task(task_id: int, service: TaskService):
     if task is None:
         raise HTTPException(status_code=404, detail="任务未找到")
     return task
+
+
+def _build_task_insights(task_id: int) -> dict:
+    scope = load_task_market_comparison_scope(task_id)
+    insights = build_task_price_history_insights(
+        task_id,
+        visible_item_ids=scope["effective_item_ids"],
+    )
+    insights["comparison_scope"] = {
+        "mode": scope["scope_mode"],
+        "visible_count": scope["visible_count"],
+        "classified_count": scope["classified_count"],
+        "comparable_count": scope["comparable_count"],
+        "excluded_count": scope["excluded_count"],
+        "target_only_count": scope["target_only_count"],
+        "target_bundle_count": scope["target_bundle_count"],
+        "not_target_count": scope["not_target_count"],
+        "uncertain_count": scope["uncertain_count"],
+        "unclassified_count": scope["unclassified_count"],
+    }
+    return insights
 
 
 def _build_download_headers(export_name: str) -> dict[str, str]:
@@ -169,11 +190,7 @@ async def get_task_result_insights(
     service: TaskService = Depends(get_task_service),
 ):
     await _require_task(task_id, service)
-    visible_item_ids = load_visible_task_result_item_ids(task_id)
-    return build_task_price_history_insights(
-        task_id,
-        visible_item_ids=visible_item_ids,
-    )
+    return _build_task_insights(task_id)
 
 
 @router.get("/tasks/{task_id}/export")
@@ -327,11 +344,7 @@ async def get_result_file_insights(filename: str):
         validate_result_filename(filename)
         task_id = try_parse_task_result_filename(filename)
         if task_id is not None:
-            visible_item_ids = load_visible_task_result_item_ids(task_id)
-            return build_task_price_history_insights(
-                task_id,
-                visible_item_ids=visible_item_ids,
-            )
+            return _build_task_insights(task_id)
         keyword = load_legacy_result_keyword(filename)
         if keyword is None:
             raise HTTPException(status_code=404, detail="结果文件未找到")

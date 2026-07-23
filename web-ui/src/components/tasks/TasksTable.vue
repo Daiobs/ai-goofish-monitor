@@ -25,7 +25,8 @@ import {
   Layers,
   MapPin,
   RefreshCcw,
-  Search
+  Search,
+  ShieldCheck
 } from 'lucide-vue-next'
 import { formatCountdown, formatNextRunAbsolute } from '@/lib/taskSchedule'
 
@@ -33,11 +34,13 @@ interface Props {
   tasks: Task[]
   isLoading: boolean
   stoppingIds?: Set<number>
+  preflightingIds?: Set<number>
 }
 
 const props = defineProps<Props>()
 const { t } = useI18n()
 const isStopping = (id: number) => props.stoppingIds?.has(id) ?? false
+const isPreflighting = (id: number) => props.preflightingIds?.has(id) ?? false
 const isKeywordMode = (task: Task) => task.decision_mode === 'keyword'
 const nowMs = ref(Date.now())
 let timer: number | null = null
@@ -86,6 +89,7 @@ const resolveNextRunLabel = (task: Task) => {
 
 const emit = defineEmits<{
   (e: 'delete-task', taskId: number): void
+  (e: 'preflight-task', taskId: number): void
   (e: 'run-task', taskId: number): void
   (e: 'stop-task', taskId: number): void
   (e: 'edit-task', task: Task): void
@@ -239,14 +243,29 @@ const emit = defineEmits<{
           <div class="mt-4 flex flex-wrap gap-2">
             <Button
               v-if="!task.is_running"
+              size="icon"
+              variant="outline"
+              class="size-10"
+              :disabled="isPreflighting(task.id)"
+              :aria-label="`${t('tasks.preflight.action')} ${task.task_name}`"
+              :title="`${t('tasks.preflight.action')} ${task.task_name}`"
+              @click="emit('preflight-task', task.id)"
+            >
+              <RefreshCcw v-if="isPreflighting(task.id)" class="h-4 w-4 animate-spin" />
+              <ShieldCheck v-else class="h-4 w-4" />
+            </Button>
+            <Button
+              v-if="!task.is_running"
               size="sm"
               class="flex-1 min-w-[120px]"
-              :class="task.enabled ? '' : 'pointer-events-none opacity-50'"
-              :aria-label="`${t('tasks.table.start')} ${task.task_name}`"
-              @click="emit('run-task', task.id)"
-            >
-              <Play class="mr-1 h-3.5 w-3.5 fill-current" />
-              {{ t('tasks.table.start') }}
+                  :class="task.enabled ? '' : 'pointer-events-none opacity-50'"
+                  :disabled="isPreflighting(task.id)"
+                  :aria-label="`${t('tasks.table.start')} ${task.task_name}`"
+                  @click="emit('run-task', task.id)"
+                >
+                  <RefreshCcw v-if="isPreflighting(task.id)" class="mr-1 h-3.5 w-3.5 animate-spin" />
+                  <Play v-else class="mr-1 h-3.5 w-3.5 fill-current" />
+                  {{ isPreflighting(task.id) ? t('tasks.preflight.runningShort') : t('tasks.table.start') }}
             </Button>
             <Button
               v-else
@@ -465,15 +484,30 @@ const emit = defineEmits<{
               <div class="flex justify-end items-center gap-2">
                   <Button
                     v-if="!task.is_running"
+                    size="icon"
+                    variant="ghost"
+                    class="h-8 w-8 rounded-lg text-slate-400 hover:bg-emerald-50 hover:text-emerald-600"
+                    :disabled="isPreflighting(task.id)"
+                    :aria-label="`${t('tasks.preflight.action')} ${task.task_name}`"
+                    :title="`${t('tasks.preflight.action')} ${task.task_name}`"
+                    @click="emit('preflight-task', task.id)"
+                  >
+                    <RefreshCcw v-if="isPreflighting(task.id)" class="h-3.5 w-3.5 animate-spin" />
+                    <ShieldCheck v-else class="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    v-if="!task.is_running"
                     size="sm" 
                     variant="default"
                     class="h-8 px-3 rounded-lg shadow-sm transition-all active:scale-95 text-white border-none"
                     :class="task.enabled ? 'bg-primary hover:bg-primary/90' : 'bg-slate-200 text-slate-400 pointer-events-none opacity-50'"
+                    :disabled="isPreflighting(task.id)"
                     :aria-label="`${t('tasks.table.start')} ${task.task_name}`"
                     @click="emit('run-task', task.id)"
                   >
-                  <Play class="w-3 h-3 mr-1.5 fill-current" />
-                  <span class="font-bold text-[11px]">{{ t('tasks.table.start') }}</span>
+                  <RefreshCcw v-if="isPreflighting(task.id)" class="w-3 h-3 mr-1.5 animate-spin" />
+                  <Play v-else class="w-3 h-3 mr-1.5 fill-current" />
+                  <span class="font-bold text-[11px]">{{ isPreflighting(task.id) ? t('tasks.preflight.runningShort') : t('tasks.table.start') }}</span>
                 </Button>
                   <Button
                     v-else

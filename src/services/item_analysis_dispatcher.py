@@ -45,6 +45,7 @@ class ItemAnalysisDispatcher:
         ai_analyzer: AIAnalyzer,
         notifier: Notifier,
         saver: Saver,
+        final_saver: Saver | None = None,
     ) -> None:
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._skip_ai_analysis = skip_ai_analysis
@@ -53,6 +54,7 @@ class ItemAnalysisDispatcher:
         self._ai_analyzer = ai_analyzer
         self._notifier = notifier
         self._saver = saver
+        self._final_saver = final_saver or saver
         self._tasks: set[asyncio.Task] = set()
         self.completed_count = 0
 
@@ -80,11 +82,17 @@ class ItemAnalysisDispatcher:
     async def _process_job(self, job: ItemAnalysisJob) -> None:
         record = copy.deepcopy(job.final_record)
         item_data = record.get("商品信息", {}) or {}
+        if job.decision_mode == "ai":
+            pending_record = copy.deepcopy(record)
+            pending_record["ai_analysis"] = self._build_pending_ai_result()
+            if not await self._saver(pending_record, job.keyword):
+                return
         record["卖家信息"] = await self._load_seller_info(job)
         record["ai_analysis"] = await self._build_analysis_result(job, record)
-        if await self._saver(record, job.keyword):
+        saver = self._final_saver if job.decision_mode == "ai" else self._saver
+        if await saver(record, job.keyword):
             self.completed_count += 1
-        await self._notify_if_recommended(item_data, record["ai_analysis"])
+            await self._notify_if_recommended(item_data, record["ai_analysis"])
 
     async def _load_seller_info(self, job: ItemAnalysisJob) -> dict:
         seller_info = {}
@@ -112,14 +120,27 @@ class ItemAnalysisDispatcher:
     def _build_skip_ai_result(self) -> dict:
         return {
             "analysis_source": "ai",
-            "is_recommended": True,
-            "reason": "商品已跳过AI分析，直接通知",
+            "analysis_status": "skipped",
+            "is_recommended": False,
+            "target_category": "uncertain",
+            "market_comparable": False,
+            "reason": "AI分析已禁用，商品未自动推荐。",
+            "keyword_hit_count": 0,
+        }
+
+    def _build_pending_ai_result(self) -> dict:
+        return {
+            "analysis_source": "ai",
+            "analysis_status": "pending",
+            "is_recommended": None,
+            "reason": "",
             "keyword_hit_count": 0,
         }
 
     def _build_ai_error_result(self, reason: str, *, error: str = "") -> dict:
         payload = {
             "analysis_source": "ai",
+            "analysis_status": "failed",
             "is_recommended": False,
             "reason": reason,
             "keyword_hit_count": 0,
@@ -142,11 +163,13 @@ class ItemAnalysisDispatcher:
                 )
             ai_result.setdefault("analysis_source", "ai")
             ai_result.setdefault("keyword_hit_count", 0)
+            ai_result["analysis_status"] = "completed"
             return ai_result
         except Exception as exc:
+            error_kind = type(exc).__name__
             return self._build_ai_error_result(
-                f"AI分析异常: {exc}",
-                error=str(exc),
+                f"AI分析异常: {error_kind}",
+                error=error_kind,
             )
         finally:
             self._cleanup_images(image_paths)

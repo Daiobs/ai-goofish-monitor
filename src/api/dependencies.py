@@ -9,6 +9,7 @@ from src.services.ai_service import AIAnalysisService
 from src.services.process_service import ProcessService
 from src.services.scheduler_service import SchedulerService
 from src.services.task_generation_service import TaskGenerationService
+from src.services.monitoring_preflight import MonitoringPreflightService
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.infrastructure.external.ai_client import AIClient
 
@@ -17,6 +18,7 @@ from src.infrastructure.external.ai_client import AIClient
 _process_service_instance = None
 _scheduler_service_instance = None
 _task_generation_service_instance = None
+_monitoring_preflight_service_instance = None
 
 
 def set_process_service(service: ProcessService):
@@ -35,6 +37,11 @@ def set_task_generation_service(service: TaskGenerationService):
     """设置全局 TaskGenerationService 实例"""
     global _task_generation_service_instance
     _task_generation_service_instance = service
+
+
+def set_monitoring_preflight_service(service: MonitoringPreflightService):
+    global _monitoring_preflight_service_instance
+    _monitoring_preflight_service_instance = service
 
 
 # 服务依赖注入
@@ -74,3 +81,9 @@ def get_task_generation_service() -> TaskGenerationService:
     if _task_generation_service_instance is None:
         raise RuntimeError("TaskGenerationService 未初始化")
     return _task_generation_service_instance
+
+
+def get_monitoring_preflight_service() -> MonitoringPreflightService:
+    if _monitoring_preflight_service_instance is None:
+        raise RuntimeError("MonitoringPreflightService 未初始化")
+    return _monitoring_preflight_service_instance

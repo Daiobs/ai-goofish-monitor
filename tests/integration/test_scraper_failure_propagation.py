@@ -186,6 +186,7 @@ class FakeBrowser:
         self.environment = environment
         self.context = None
         self.closed = False
+        self.version = "Chromium 149.0.0.0"
 
     async def new_context(self, **_kwargs):
         self.context = FakeContext(self.environment)
@@ -202,6 +203,7 @@ class FakeChromium:
 
     async def launch(self, **_kwargs):
         self.environment.launch_calls += 1
+        self.environment.launch_kwargs.append(dict(_kwargs))
         if self.environment.launch_errors:
             error = self.environment.launch_errors.pop(0)
             if error is not None:
@@ -263,6 +265,7 @@ class ScrapeEnvironment:
         self.saved_task_records = []
         self.saved_legacy_records = []
         self.launch_calls = 0
+        self.launch_kwargs = []
         self.cancel_started = asyncio.Event()
         self.cancel_blocker = asyncio.Event()
 
@@ -312,6 +315,46 @@ def _install_scraper_fakes(monkeypatch, environment, guard, *, retry_limit=1):
     monkeypatch.setattr(scraper, "FAILURE_GUARD", guard)
     monkeypatch.setattr(
         scraper,
+        "load_browser_session",
+        lambda _state_file: SimpleNamespace(
+            snapshot_kind="test",
+            storage_state={"cookies": [], "origins": []},
+            session_storage_by_origin={},
+            context_options={},
+            extra_headers={},
+            cookie_count=0,
+            local_storage_count=0,
+            session_storage_count=0,
+            snapshot_browser_major=None,
+        ),
+    )
+
+    async def navigate_search(page, search_url, *, timeout_ms):
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        if environment.login_url:
+            login_error = scraper._login_redirect_error(
+                environment.login_url, "search navigation"
+            )
+            return SimpleNamespace(
+                success=False,
+                failure_kind="login_required",
+                reason=str(login_error),
+                suggestion="重新导出已登录账号状态后再运行预检",
+                response=None,
+                source=None,
+            )
+        return SimpleNamespace(
+            success=True,
+            failure_kind="success",
+            reason="已识别闲鱼搜索数据源",
+            suggestion="可以开始正式监控",
+            response=environment.search_response,
+            source="test search response",
+        )
+
+    monkeypatch.setattr(scraper, "navigate_search_and_capture", navigate_search)
+    monkeypatch.setattr(
+        scraper,
         "load_price_snapshots",
         lambda keyword: environment.legacy_snapshot_loads.append(keyword) or [],
     )
@@ -347,7 +390,14 @@ def _install_scraper_fakes(monkeypatch, environment, guard, *, retry_limit=1):
     monkeypatch.setattr(scraper, "save_task_result_record", save_task_record)
     monkeypatch.setattr(scraper, "save_to_jsonl", save_legacy_record)
     monkeypatch.setattr(scraper, "build_market_reference", lambda **_kwargs: {})
-    monkeypatch.setattr(scraper, "load_state_files", lambda _directory: [])
+    rotation_accounts = (
+        ["state/account-a.json", "state/account-b.json"]
+        if retry_limit > 1
+        else []
+    )
+    monkeypatch.setattr(
+        scraper, "load_state_files", lambda _directory: rotation_accounts
+    )
     monkeypatch.setattr(scraper, "parse_proxy_pool", lambda _value: [])
     monkeypatch.setattr(
         scraper,
@@ -357,9 +407,9 @@ def _install_scraper_fakes(monkeypatch, environment, guard, *, retry_limit=1):
             "account_blacklist_ttl": 60,
             "proxy_pool": [],
             "proxy_blacklist_ttl": 60,
-            "account_enabled": False,
+            "account_enabled": retry_limit > 1,
             "proxy_enabled": False,
-            "account_mode": "per_task",
+            "account_mode": "on_failure" if retry_limit > 1 else "per_task",
             "proxy_mode": "per_task",
             "account_retry_limit": retry_limit,
             "proxy_retry_limit": retry_limit,
@@ -401,6 +451,10 @@ def _run_scrape(environment, guard, task_config, monkeypatch, *, retry_limit=1):
     _install_scraper_fakes(
         monkeypatch, environment, guard, retry_limit=retry_limit
     )
+    if retry_limit > 1:
+        task_config = dict(task_config)
+        task_config["account_strategy"] = "rotate"
+        task_config["account_state_file"] = None
     return asyncio.run(scraper.scrape_xianyu(task_config))
 
 
@@ -929,6 +983,40 @@ def test_sqlite_task_missing_id_fails_before_network_access(tmp_path, monkeypatc
     assert len(environment.notifications) == 1
 
 
+def test_static_proxy_takes_precedence_over_empty_rotation_pool(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment(items=[])
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+    base_settings = scraper._get_rotation_settings
+
+    def proxy_rotation_settings(task):
+        settings = dict(base_settings(task))
+        settings.update(proxy_enabled=True, proxy_mode="on_failure", proxy_pool=[])
+        return settings
+
+    monkeypatch.setattr(scraper, "_get_rotation_settings", proxy_rotation_settings)
+    monkeypatch.setenv(
+        "SCRAPER_PROXY_URL",
+        "http://host.docker.internal:7897",
+    )
+
+    result = asyncio.run(
+        scraper.scrape_xianyu(_task_config(state_path, max_pages=1))
+    )
+
+    assert result == 0
+    assert environment.launch_calls == 1
+    assert environment.launch_kwargs[0]["proxy"] == {
+        "server": "http://host.docker.internal:7897"
+    }
+    assert guard.failure_calls == []
+
+
 def test_debug_limit_preserves_success_and_stops_after_limit(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     state_path.write_text("{}", encoding="utf-8")
@@ -939,6 +1027,11 @@ def test_debug_limit_preserves_success_and_stops_after_limit(tmp_path, monkeypat
     guard = FakeFailureGuard()
     input_calls = []
     _install_scraper_fakes(monkeypatch, environment, guard)
+    monkeypatch.setattr(
+        scraper.sys,
+        "stdin",
+        SimpleNamespace(isatty=lambda: True),
+    )
     monkeypatch.setattr(
         "builtins.input", lambda prompt: input_calls.append(prompt) or ""
     )
@@ -955,6 +1048,39 @@ def test_debug_limit_preserves_success_and_stops_after_limit(tmp_path, monkeypat
     ]
     assert len(environment.dispatchers[0].jobs) == 1
     assert input_calls == ["按回车键关闭浏览器..."]
+
+
+def test_debug_limit_does_not_prompt_in_background_process(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    environment = ScrapeEnvironment(
+        items=[_item("first"), _item("second")],
+        detail_payloads=[_success_detail_payload()],
+    )
+    guard = FakeFailureGuard()
+    _install_scraper_fakes(monkeypatch, environment, guard)
+    monkeypatch.setattr(
+        scraper.sys,
+        "stdin",
+        SimpleNamespace(isatty=lambda: False),
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(
+            AssertionError("background task must not prompt")
+        ),
+    )
+
+    result = asyncio.run(
+        scraper.scrape_xianyu(
+            _task_config(state_path, max_pages=2), debug_limit=1
+        )
+    )
+
+    assert result == 1
+    assert environment.detail_goto_urls == [
+        "https://www.goofish.com/item?id=first"
+    ]
 
 
 def test_transient_runtime_error_still_retries(tmp_path, monkeypatch):

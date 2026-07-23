@@ -11,11 +11,13 @@ from src.api.dependencies import (
     get_scheduler_service,
     get_task_generation_service,
     get_task_service,
+    get_monitoring_preflight_service,
 )
 from src.services.task_service import TaskPromptIntegrityError, TaskService
 from src.services.process_service import ProcessService
 from src.services.scheduler_service import SchedulerService
 from src.services.task_generation_service import TaskGenerationService
+from src.services.monitoring_preflight import MonitoringPreflightService
 from src.services.task_generation_runner import (
     build_task_create,
     run_ai_generation_job,
@@ -31,6 +33,15 @@ from src.services.result_storage_service import (
     delete_task_result_records,
 )
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def _serialize_preflight(report) -> dict | None:
+    if report is None:
+        return None
+    if isinstance(report, dict):
+        return report
+    to_dict = getattr(report, "to_dict", None)
+    return to_dict() if callable(to_dict) else None
 
 
 def _log_delete_failure(task_id: int, resource: str, exc: BaseException) -> None:
@@ -318,6 +329,23 @@ async def delete_task(
         except Exception as exc:
             _log_delete_failure(task_id, resource, exc)
     return {"message": "任务删除成功"}
+
+
+@router.post("/preflight/{task_id}", response_model=dict)
+async def preflight_task(
+    task_id: int,
+    task_service: TaskService = Depends(get_task_service),
+    preflight_service: MonitoringPreflightService = Depends(
+        get_monitoring_preflight_service
+    ),
+):
+    task = await task_service.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务未找到")
+    report = await preflight_service.run(task)
+    return {"preflight": report.to_dict()}
+
+
 @router.post("/start/{task_id}", response_model=dict)
 async def start_task(
     task_id: int,
@@ -334,8 +362,27 @@ async def start_task(
         raise HTTPException(status_code=400, detail="任务已在运行中")
     success = await process_service.start_task(task_id, task.task_name)
     if not success:
+        get_report = getattr(process_service, "get_last_preflight_report", None)
+        report = get_report(task_id) if callable(get_report) else None
+        serialized_report = _serialize_preflight(report)
+        if serialized_report and not serialized_report.get("success"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "preflight_failed",
+                    "message": "运行环境预检未通过",
+                    "preflight": serialized_report,
+                },
+            )
         raise HTTPException(status_code=500, detail="启动任务失败")
-    return {"message": f"任务 '{task.task_name}' 已启动"}
+    get_report = getattr(process_service, "get_last_preflight_report", None)
+    report = get_report(task_id) if callable(get_report) else None
+    return {
+        "message": f"任务 '{task.task_name}' 已启动",
+        "preflight": _serialize_preflight(report),
+    }
+
+
 @router.post("/stop/{task_id}", response_model=dict)
 async def stop_task(
     task_id: int,

@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from src.services import result_storage_service as result_storage_module
 from src.infrastructure.persistence.sqlite_connection import sqlite_connection
 from src.infrastructure.persistence.storage_names import (
     build_task_result_filename,
@@ -17,11 +18,13 @@ from src.services.result_storage_service import (
     load_all_task_result_records,
     load_processed_link_keys,
     load_task_processed_link_keys,
+    load_task_market_comparison_scope,
     load_task_result_blacklist_keywords,
     save_result_blacklist_keywords,
     save_result_record,
     save_task_result_blacklist_keywords,
     save_task_result_record,
+    upsert_task_result_record,
     update_task_result_item_status,
 )
 
@@ -172,3 +175,141 @@ def test_task_identity_survives_task_display_field_changes(tmp_path, monkeypatch
     records = _load_task_records(44)
     assert len(records) == 1
     assert records[0]["商品信息"]["商品ID"] == "stable"
+
+
+def test_task_result_final_update_persists_canonical_prompt_version(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    pending = _record(item_id="ai-item", task_name="AI Task")
+    pending["ai_analysis"] = {
+        "analysis_source": "ai",
+        "analysis_status": "pending",
+        "is_recommended": None,
+        "reason": "",
+        "keyword_hit_count": 0,
+    }
+    assert asyncio.run(save_task_result_record(pending, "camera", 45)) is True
+
+    completed = _record(item_id="ai-item", task_name="AI Task")
+    completed["ai_analysis"] = {
+        "analysis_source": "ai",
+        "analysis_status": "completed",
+        "prompt_version": "EagleEye-V6.4",
+        "is_recommended": True,
+        "reason": "meets the fictional criteria",
+        "risk_tags": [],
+        "criteria_analysis": {"seller_type": "个人"},
+        "request_duration_seconds": 1.234,
+        "keyword_hit_count": 0,
+    }
+
+    assert asyncio.run(
+        upsert_task_result_record(completed, "camera", 45)
+    ) is True
+    records = _load_task_records(45)
+
+    assert len(records) == 1
+    assert records[0]["ai_analysis"] == completed["ai_analysis"]
+
+
+def test_task_market_scope_excludes_batteries_bundles_and_ambiguous_prices(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    cases = (
+        ("charger", "target_only", True),
+        ("ambiguous", "target_only", False),
+        ("bundle", "target_bundle", False),
+        ("battery", "not_target", False),
+        ("uncertain", "uncertain", False),
+    )
+    for item_id, category, comparable in cases:
+        record = _record(
+            item_id=item_id,
+            task_name="970 charger",
+            keyword="970电池充电器",
+        )
+        record["ai_analysis"] = {
+            "analysis_source": "ai",
+            "analysis_status": "completed",
+            "is_recommended": item_id == "charger",
+            "target_category": category,
+            "market_comparable": comparable,
+            "reason": "synthetic classification",
+        }
+        assert asyncio.run(
+            save_task_result_record(
+                record,
+                "970电池充电器",
+                970,
+            )
+        )
+
+    scope = load_task_market_comparison_scope(970)
+
+    assert scope["visible_count"] == 5
+    assert scope["classified_count"] == 5
+    assert scope["comparable_item_ids"] == {"charger"}
+    assert scope["effective_item_ids"] == {"charger"}
+    assert scope["comparable_count"] == 1
+    assert scope["excluded_count"] == 4
+    assert scope["target_only_count"] == 2
+    assert scope["target_bundle_count"] == 1
+    assert scope["not_target_count"] == 1
+    assert scope["uncertain_count"] == 1
+
+
+def test_task_market_scope_keeps_keyword_mode_compatibility_explicit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    assert asyncio.run(
+        save_task_result_record(
+            _record(item_id="legacy", task_name="Legacy AI"),
+            "camera",
+            971,
+        )
+    )
+
+    scope = load_task_market_comparison_scope(971)
+
+    assert scope["classification_available"] is False
+    assert scope["scope_mode"] == "keyword_all_visible"
+    assert scope["effective_item_ids"] == {"legacy"}
+    assert scope["excluded_count"] == 0
+
+
+def test_task_market_scope_excludes_old_ai_rows_until_classified(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    record = _record(item_id="old-ai", task_name="Old AI")
+    record["ai_analysis"] = {
+        "analysis_source": "ai",
+        "analysis_status": "completed",
+        "is_recommended": True,
+        "reason": "legacy response without target classification",
+    }
+    assert asyncio.run(save_task_result_record(record, "camera", 972))
+
+    def fail_if_raw_json_is_parsed(*_args, **_kwargs):
+        raise AssertionError("market scope must use SQLite JSON fields")
+
+    monkeypatch.setattr(
+        result_storage_module,
+        "_parse_raw_record",
+        fail_if_raw_json_is_parsed,
+    )
+    scope = load_task_market_comparison_scope(972)
+
+    assert scope["scope_mode"] == "ai_classified"
+    assert scope["classification_available"] is False
+    assert scope["effective_item_ids"] == set()
+    assert scope["comparable_item_ids"] == set()
+    assert scope["excluded_count"] == 1
+    assert scope["unclassified_count"] == 1

@@ -35,9 +35,12 @@ export interface SellerInfo {
 }
 
 export interface AiAnalysis {
-  is_recommended: boolean;
+  is_recommended: boolean | null;
+  target_category?: 'target_only' | 'target_bundle' | 'not_target' | 'uncertain';
+  market_comparable?: boolean;
   reason: string;
   analysis_source?: 'ai' | 'keyword';
+  analysis_status?: 'pending' | 'completed' | 'failed' | 'skipped';
   keyword_hit_count?: number;
   value_score?: number;
   value_summary?: string;
@@ -45,6 +48,7 @@ export interface AiAnalysis {
   risk_tags?: string[];
   criteria_analysis?: Record<string, any>;
   matched_keywords?: string[];
+  request_duration_seconds?: number;
   error?: string;
 }
 
@@ -57,6 +61,8 @@ export interface PriceInsight {
   max_price?: number | null;
   market_avg_price?: number | null;
   market_median_price?: number | null;
+  market_comparable?: boolean;
+  market_scope?: 'ai_classified' | 'keyword_all_visible' | 'legacy_keyword';
   price_change_amount?: number | null;
   price_change_percent?: number | null;
   deal_score?: number | null;
@@ -91,6 +97,18 @@ export interface ResultInsights {
     max_price: number | null;
   }>;
   latest_snapshot_at?: string | null;
+  comparison_scope?: {
+    mode: 'ai_classified' | 'keyword_all_visible';
+    visible_count: number;
+    classified_count: number;
+    comparable_count: number;
+    excluded_count: number;
+    target_only_count: number;
+    target_bundle_count: number;
+    not_target_count: number;
+    uncertain_count: number;
+    unclassified_count: number;
+  };
 }
 
 export interface ResultItem {

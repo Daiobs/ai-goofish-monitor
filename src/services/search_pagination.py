@@ -32,8 +32,8 @@ def is_search_results_response(
     api_url_fragment: str = SEARCH_RESULTS_API_FRAGMENT,
 ) -> bool:
     request = getattr(response, "request", None)
-    request_method = getattr(request, "method", None)
-    response_url = getattr(response, "url", "")
+    request_method = str(getattr(request, "method", "") or "").upper()
+    response_url = str(getattr(response, "url", "") or "")
     return api_url_fragment in response_url and request_method == "POST"
 
 

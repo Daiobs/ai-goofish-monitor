@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, TextIO
+from typing import Any, Awaitable, Callable, Dict, TextIO
 
 from src.ai_handler import send_ntfy_notification
 from src.config import STATE_FILE
@@ -20,6 +20,7 @@ from src.utils import build_task_log_path
 STOP_TIMEOUT_SECONDS = 20
 SPIDER_DEBUG_LIMIT_ENV = "SPIDER_DEBUG_LIMIT"
 LifecycleHook = Callable[[int], Awaitable[None] | None]
+PreflightRunner = Callable[[Any], Awaitable[Any]]
 
 
 class ProcessService:
@@ -35,6 +36,8 @@ class ProcessService:
         self.failure_guard = FailureGuard()
         self._on_started: LifecycleHook | None = None
         self._on_stopped: LifecycleHook | None = None
+        self._preflight_runner: PreflightRunner | None = None
+        self._preflight_reports: Dict[int, Any] = {}
 
     def set_lifecycle_hooks(
         self,
@@ -44,6 +47,12 @@ class ProcessService:
     ) -> None:
         self._on_started = on_started
         self._on_stopped = on_stopped
+
+    def set_preflight_runner(self, runner: PreflightRunner | None) -> None:
+        self._preflight_runner = runner
+
+    def get_last_preflight_report(self, task_id: int) -> Any | None:
+        return self._preflight_reports.get(task_id)
 
     async def _invoke_hook(self, hook: LifecycleHook | None, task_id: int) -> None:
         if hook is None:
@@ -179,6 +188,40 @@ class ProcessService:
         if decision.skip:
             await self._notify_skip(task_name, decision)
             return False
+
+        if self._preflight_runner is not None:
+            self._preflight_reports.pop(task_id, None)
+            try:
+                preflight_report = await self._preflight_runner(task)
+            except Exception as exc:
+                self._preflight_reports[task_id] = {
+                    "task_id": task_id,
+                    "success": False,
+                    "failure_kind": "preflight_error",
+                    "failed_stage": "preflight",
+                    "reason": f"运行环境预检异常 ({type(exc).__name__})",
+                    "suggestion": "检查浏览器运行环境后重新预检",
+                    "stages": [],
+                }
+                print(
+                    f"任务 ID {task_id} 运行环境预检异常 "
+                    f"({type(exc).__name__})"
+                )
+                return False
+            self._preflight_reports[task_id] = preflight_report
+            preflight_success = bool(
+                preflight_report.get("success")
+                if isinstance(preflight_report, dict)
+                else getattr(preflight_report, "success", False)
+            )
+            if not preflight_success:
+                failed_stage = (
+                    preflight_report.get("failed_stage")
+                    if isinstance(preflight_report, dict)
+                    else getattr(preflight_report, "failed_stage", "unknown")
+                )
+                print(f"任务 ID {task_id} 预检未通过 (stage={failed_stage or 'unknown'})")
+                return False
 
         log_file_path = ""
         log_file_handle = None

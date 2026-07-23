@@ -12,6 +12,7 @@ from src.failure_guard import FailureGuard
 from src.infrastructure.persistence.sqlite_bootstrap import migrate_task_prompts
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
 from src.scraper import ScrapeTaskFailed, sanitize_failure_reason, scrape_xianyu
+from src.services.prompt_version import resolve_canonical_prompt_version
 
 
 async def main() -> int:
@@ -199,6 +200,10 @@ async def main() -> int:
                 
                 # 动态组合成最终的Prompt
                 task['ai_prompt_text'] = base_prompt.replace("{{CRITERIA_SECTION}}", criteria_text)
+                task['ai_prompt_version'] = resolve_canonical_prompt_version(
+                    task['ai_prompt_text'],
+                    explicit_version=task.get('ai_prompt_version'),
+                )
                 
                 # 验证生成的prompt是否有效
                 if len(task['ai_prompt_text']) < 100:
@@ -224,6 +229,10 @@ async def main() -> int:
             try:
                 with open(task["ai_prompt_file"], 'r', encoding='utf-8') as f:
                     task['ai_prompt_text'] = f.read()
+                task['ai_prompt_version'] = resolve_canonical_prompt_version(
+                    task['ai_prompt_text'],
+                    explicit_version=task.get('ai_prompt_version'),
+                )
                 print(f"✅ 任务 '{task['task_name']}' 的prompt文件读取成功，长度: {len(task['ai_prompt_text'])} 字符")
             except FileNotFoundError:
                 print(f"警告: 任务 '{task['task_name']}' 的prompt文件 '{task['ai_prompt_file']}' 未找到，该任务的AI分析将被跳过。")

@@ -1,5 +1,6 @@
 from src.services.price_history_service import (
     build_item_price_context,
+    build_market_reference,
     build_price_history_insights,
     load_price_snapshots,
     record_market_snapshots,
@@ -97,3 +98,89 @@ def test_record_market_snapshots_and_build_price_history_insights(tmp_path, monk
     assert item_context["max_price"] == 10000.0
     assert item_context["price_change_amount"] == -500.0
     assert item_context["deal_label"] == "高性价比"
+
+
+def test_market_reference_uses_only_confirmed_comparable_items():
+    current_items = [
+        {"商品ID": "charger", "当前售价": "20"},
+        {"商品ID": "battery", "当前售价": "200"},
+        {"商品ID": "bundle", "当前售价": "300"},
+    ]
+    snapshots = [
+        {
+            "item_id": "charger",
+            "price": 20.0,
+            "run_id": "run-1",
+            "snapshot_time": "2026-07-24T10:00:00",
+        },
+        {
+            "item_id": "battery",
+            "price": 200.0,
+            "run_id": "run-1",
+            "snapshot_time": "2026-07-24T10:00:00",
+        },
+        {
+            "item_id": "bundle",
+            "price": 300.0,
+            "run_id": "run-1",
+            "snapshot_time": "2026-07-24T10:00:00",
+        },
+    ]
+
+    reference = build_market_reference(
+        keyword="970电池充电器",
+        item=current_items[0],
+        current_market_items=current_items,
+        historical_snapshots=snapshots,
+        comparable_item_ids={"charger"},
+    )
+    battery_reference = build_market_reference(
+        keyword="970电池充电器",
+        item=current_items[1],
+        current_market_items=current_items,
+        historical_snapshots=snapshots,
+        comparable_item_ids={"charger"},
+    )
+
+    assert reference["当前搜索样本"]["sample_count"] == 1
+    assert reference["当前搜索样本"]["avg_price"] == 20.0
+    assert reference["历史价格概览"]["avg_price"] == 20.0
+    assert reference["本商品价格位置"]["market_comparable"] is True
+    assert battery_reference["本商品价格位置"]["market_comparable"] is None
+    assert battery_reference["本商品价格位置"]["deal_score"] is None
+    assert battery_reference["本商品价格位置"]["deal_label"] == "待AI分类"
+
+
+def test_latest_run_without_comparable_items_does_not_reuse_old_market_summary(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    record_market_snapshots(
+        task_id=88,
+        keyword="970电池充电器",
+        task_name="970 charger",
+        items=[{"商品ID": "charger", "当前售价": "20"}],
+        run_id="run-1",
+        snapshot_time="2026-07-23T10:00:00",
+    )
+    record_market_snapshots(
+        task_id=88,
+        keyword="970电池充电器",
+        task_name="970 charger",
+        items=[{"商品ID": "battery", "当前售价": "200"}],
+        run_id="run-2",
+        snapshot_time="2026-07-24T10:00:00",
+    )
+
+    insights = build_price_history_insights(
+        task_id=88,
+        visible_item_ids={"charger"},
+    )
+
+    assert insights["market_summary"]["sample_count"] == 0
+    assert insights["market_summary"]["avg_price"] is None
+    assert insights["market_summary"]["snapshot_time"] == "2026-07-24T10:00:00"
+    assert insights["history_summary"]["sample_count"] == 1
+    assert insights["history_summary"]["avg_price"] == 20.0
+    assert insights["latest_snapshot_at"] == "2026-07-24T10:00:00"
