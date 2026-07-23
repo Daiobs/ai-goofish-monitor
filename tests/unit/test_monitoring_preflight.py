@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from src.services.monitoring_preflight import (
     MonitoringPreflightService,
     PreflightReport,
+    _safe_diagnostic_payload,
     _verify_storage,
 )
 from src.services.browser_runtime import BrowserSessionError
@@ -36,6 +37,30 @@ def test_monitoring_preflight_reuses_cached_success(monkeypatch):
     assert first is report
     assert second is first
     assert uncached_calls == [task]
+
+
+def test_preflight_diagnostic_serializes_only_search_structure():
+    report = PreflightReport(
+        task_id=17,
+        task_name="task-a",
+        success=True,
+        search_result_count=2,
+        search_diagnostics=(
+            {
+                "http_status": 200,
+                "api_path": "/h5/search/1.0/",
+                "ret_codes": ["SUCCESS"],
+                "has_result_list": True,
+                "result_count": 2,
+            },
+        ),
+    )
+
+    payload = _safe_diagnostic_payload(report)
+
+    assert payload["search_result_count"] == 2
+    assert payload["search_diagnostics"] == list(report.search_diagnostics)
+    assert "task_name" not in payload
 
 
 def test_monitoring_preflight_reports_malformed_snapshot_without_browser(

@@ -77,6 +77,8 @@ class PreflightReport:
     runtime_browser_major: int | None = None
     browser_version_note: str = ""
     search_source: str | None = None
+    search_result_count: int = 0
+    search_diagnostics: tuple[dict[str, Any], ...] = ()
     current_url: str = ""
     page_title: str = ""
     observed_requests: tuple[str, ...] = ()
@@ -242,6 +244,8 @@ def _safe_diagnostic_payload(report: PreflightReport) -> dict[str, Any]:
         "current_url": report.current_url,
         "page_title": report.page_title,
         "search_source": report.search_source,
+        "search_result_count": report.search_result_count,
+        "search_diagnostics": list(report.search_diagnostics),
         "observed_requests": list(report.observed_requests),
         "stages": [asdict(stage) for stage in report.stages],
     }
@@ -499,6 +503,11 @@ class MonitoringPreflightService:
                 report.current_url = search_result.current_url
                 report.page_title = search_result.page_title
                 report.observed_requests = search_result.observed_requests
+                report.search_result_count = search_result.result_count
+                report.search_diagnostics = tuple(
+                    diagnostic.to_dict()
+                    for diagnostic in search_result.diagnostics
+                )
                 if not search_result.success:
                     failed_stage = (
                         "search_page"
@@ -522,7 +531,14 @@ class MonitoringPreflightService:
                     return report
                 _complete_stage(report, "search_page", "搜索页面访问成功，未进入登录或验证页")
                 report.search_source = search_result.source
-                _complete_stage(report, "search_source", "已捕获可解析的闲鱼商品数据")
+                if search_result.result_count:
+                    source_message = (
+                        "已捕获可解析的闲鱼商品数据 "
+                        f"({search_result.result_count} 条)"
+                    )
+                else:
+                    source_message = "当前筛选条件没有商品，搜索响应正常"
+                _complete_stage(report, "search_source", source_message)
                 report.success = True
                 report.failure_kind = "success"
                 report.reason = "运行环境预检通过"

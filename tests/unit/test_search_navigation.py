@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -22,12 +23,14 @@ class FakeResponse:
         resource_type: str = "xhr",
         status: int = 200,
         ok: bool = True,
+        content_type: str = "application/json; charset=utf-8",
     ) -> None:
         self.url = url
         self.payload = payload
         self.request = FakeRequest(method, resource_type)
         self.status = status
         self.ok = ok
+        self.headers = {"content-type": content_type}
 
     async def json(self) -> Any:
         return self.payload
@@ -106,8 +109,27 @@ def _navigate(page: FakePage, *, timeout_ms: int = 200):
     )
 
 
+def _search_item(item_id: str = "fixture-1") -> dict[str, Any]:
+    return {
+        "data": {
+            "item": {
+                "main": {
+                    "exContent": {
+                        "itemId": item_id,
+                        "title": "redacted",
+                    },
+                    "targetUrl": f"fleamarket://item?id={item_id}",
+                }
+            }
+        }
+    }
+
+
 def test_navigation_accepts_existing_exact_search_endpoint() -> None:
-    payload = {"data": {"resultList": [{"itemId": "exact-1"}]}}
+    payload = {
+        "ret": ["SUCCESS::fixture detail"],
+        "data": {"resultList": [_search_item("exact-1")]},
+    }
     response = FakeResponse(
         "https://h5api.m.goofish.com/h5/"
         "mtop.taobao.idlemtopsearch.pc.search/1.0/?jsv=2.7.2&trace=fixture",
@@ -131,7 +153,10 @@ def test_navigation_accepts_existing_exact_search_endpoint() -> None:
 
 
 def test_navigation_accepts_alternative_goofish_json_with_nested_result_list() -> None:
-    items = [{"itemId": "alternative-1"}, {"itemId": "alternative-2"}]
+    items = [
+        _search_item("alternative-1"),
+        _search_item("alternative-2"),
+    ]
     response = FakeResponse(
         "https://h5api.m.goofish.com/h5/"
         "mtop.taobao.idlemtopsearch.pc.search.shade/1.0/?trace=fixture",
@@ -152,6 +177,168 @@ def test_navigation_accepts_alternative_goofish_json_with_nested_result_list() -
     )
     assert "trace" not in result.source
     assert page.response_listeners == []
+
+
+def test_navigation_ignores_unrelated_non_success_xhr_before_search_result() -> None:
+    unrelated = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/"
+        "?access_token=fixture-secret",
+        {
+            "ret": ["FAIL_SYS_TOKEN_EMPTY::fixture detail"],
+            "data": {"siteConfig": {"token": "fixture-secret"}},
+        },
+    )
+    search_payload = {
+        "ret": ["SUCCESS::fixture detail"],
+        "data": {"resultList": [_search_item("search-1")]},
+    }
+    search = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        search_payload,
+    )
+
+    result = _navigate(FakePage(responses=(unrelated, search)))
+
+    assert result.success is True
+    assert result.response is not None
+    assert asyncio.run(result.response.json()) == search_payload
+    assert len(result.diagnostics) == 2
+    assert result.diagnostics[0].is_search_response is False
+    assert result.diagnostics[0].ret_codes == ("FAIL_SYS_TOKEN_EMPTY",)
+    assert result.diagnostics[1].is_search_response is True
+    serialized = json.dumps(
+        [diagnostic.to_dict() for diagnostic in result.diagnostics]
+    )
+    assert "fixture-secret" not in serialized
+    assert "fixture detail" not in serialized
+
+
+def test_navigation_rejects_unknown_non_success_search_with_results() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": ["FAIL_BIZ_UNKNOWN::fixture sensitive detail"],
+            "data": {"resultList": [_search_item()]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_page_failed"
+    assert result.reason == "闲鱼搜索接口返回失败状态 (FAIL_BIZ_UNKNOWN)"
+    assert "fixture sensitive detail" not in result.reason
+
+
+def test_navigation_rejects_mixed_success_and_unknown_failure_status() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": [
+                "SUCCESS::fixture detail",
+                "FAIL_BIZ_UNKNOWN::fixture detail",
+            ],
+            "data": {"resultList": [_search_item()]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_page_failed"
+    assert result.reason == "闲鱼搜索接口返回失败状态 (FAIL_BIZ_UNKNOWN)"
+
+
+def test_navigation_rejects_non_success_search_without_result_list() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {"ret": ["FAIL_BIZ_BUSY::fixture detail"], "data": {}},
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_page_failed"
+    assert result.reason == "闲鱼搜索接口返回失败状态 (FAIL_BIZ_BUSY)"
+
+
+def test_navigation_accepts_successful_empty_search_result() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {"ret": ["SUCCESS::fixture detail"], "data": {"resultList": []}},
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is True
+    assert result.result_count == 0
+    assert result.response is not None
+    assert asyncio.run(result.response.json())["data"]["resultList"] == []
+
+
+def test_navigation_rejects_unparseable_search_item_structure() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": ["SUCCESS::fixture detail"],
+            "data": {"resultList": [{"item": "redacted"}]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_parse_failed"
+    assert result.reason == "闲鱼搜索商品数据结构无法解析"
+
+
+def test_navigation_rejects_non_json_search_response() -> None:
+    class NonJsonResponse(FakeResponse):
+        async def json(self) -> Any:
+            raise ValueError("fixture response body must not be logged")
+
+    response = NonJsonResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        None,
+        content_type="text/html; charset=utf-8",
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_parse_failed"
+    assert result.reason == "闲鱼搜索数据响应不是可解析的 JSON"
+    assert result.diagnostics[-1].json_parsed is False
+    assert result.diagnostics[-1].content_type == "text/html"
+
+
+def test_navigation_reports_http_error_before_non_json_error() -> None:
+    class NonJsonResponse(FakeResponse):
+        async def json(self) -> Any:
+            raise ValueError("fixture response body must not be logged")
+
+    response = NonJsonResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        None,
+        status=503,
+        ok=False,
+        content_type="text/html",
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "search_page_failed"
+    assert result.reason == "闲鱼搜索接口返回 HTTP 503"
 
 
 def test_navigation_identifies_login_before_the_navigation_timeout() -> None:
@@ -242,11 +429,71 @@ def test_navigation_stops_immediately_on_api_risk_marker() -> None:
     assert "FAIL_SYS_USER_VALIDATE" in result.reason
 
 
+def test_navigation_stops_on_risk_marker_even_with_usable_results() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": ["FAIL_SYS_USER_VALIDATE::fixture detail"],
+            "data": {"resultList": [_search_item()]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "risk_control"
+    assert result.diagnostics[-1].risk_marker is True
+
+
+def test_navigation_stops_on_login_marker_even_with_usable_results() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": ["FAIL_SYS_TOKEN_EXPIRED::fixture detail"],
+            "data": {"resultList": [_search_item()]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+
+    assert result.success is False
+    assert result.failure_kind == "login_required"
+    assert result.diagnostics[-1].login_marker is True
+
+
+def test_navigation_stops_on_expired_login_probe_before_search_result() -> None:
+    login_probe = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemessage.pc.loginuser.get/1.0/",
+        {"ret": ["FAIL_SYS_SESSION_EXPIRED::fixture detail"], "data": {}},
+    )
+    search = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        {
+            "ret": ["SUCCESS::fixture detail"],
+            "data": {"resultList": [_search_item()]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(login_probe, search)))
+
+    assert result.success is False
+    assert result.failure_kind == "login_required"
+    assert result.diagnostics[-1].api_path.endswith(
+        "idlemessage.pc.loginuser.get/1.0/"
+    )
+    assert result.diagnostics[-1].login_marker is True
+    assert len(result.diagnostics) == 1
+
+
 def test_navigation_rejects_non_success_http_search_response() -> None:
     response = FakeResponse(
         "https://h5api.m.goofish.com/h5/"
         "mtop.taobao.idlemtopsearch.pc.search/1.0/",
-        {"data": {"resultList": []}},
+        {"ret": ["SUCCESS::fixture detail"], "data": {"resultList": [_search_item()]}},
         status=503,
         ok=False,
     )
@@ -256,6 +503,31 @@ def test_navigation_rejects_non_success_http_search_response() -> None:
     assert result.success is False
     assert result.failure_kind == "search_page_failed"
     assert result.reason == "闲鱼搜索接口返回 HTTP 503"
+
+
+def test_navigation_diagnostic_contains_structure_without_values() -> None:
+    response = FakeResponse(
+        "https://h5api.m.goofish.com/h5/"
+        "mtop.taobao.idlemtopsearch.pc.search/1.0/"
+        "?token=fixture-query-secret#fixture-fragment",
+        {
+            "ret": ["SUCCESS::fixture-ret-secret"],
+            "data": {"resultList": [_search_item("fixture-product-secret")]},
+        },
+    )
+
+    result = _navigate(FakePage(responses=(response,)))
+    serialized = json.dumps(result.diagnostics[-1].to_dict())
+
+    assert result.success is True
+    assert result.diagnostics[-1].api_path.endswith("/1.0/")
+    assert result.diagnostics[-1].content_type == "application/json"
+    assert result.diagnostics[-1].result_count == 1
+    assert result.diagnostics[-1].first_result_is_object is True
+    assert "fixture-query-secret" not in serialized
+    assert "fixture-fragment" not in serialized
+    assert "fixture-ret-secret" not in serialized
+    assert "fixture-product-secret" not in serialized
 
 
 def test_navigation_cancellation_propagates_and_removes_listener() -> None:

@@ -51,6 +51,48 @@ class CapturedSearchResponse:
 
 
 @dataclass(frozen=True)
+class SearchResponseDiagnostic:
+    http_status: int | None
+    content_type: str
+    api_path: str
+    is_search_response: bool
+    json_parsed: bool
+    json_type: str
+    ret_codes: tuple[str, ...]
+    top_level_fields: tuple[tuple[str, str], ...]
+    data_fields: tuple[tuple[str, str], ...]
+    has_result_list: bool
+    result_count: int
+    first_result_is_object: bool
+    risk_marker: bool
+    login_marker: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "http_status": self.http_status,
+            "content_type": self.content_type,
+            "api_path": self.api_path,
+            "is_search_response": self.is_search_response,
+            "json_parsed": self.json_parsed,
+            "json_type": self.json_type,
+            "ret_codes": list(self.ret_codes),
+            "top_level_fields": [
+                {"name": name, "type": value_type}
+                for name, value_type in self.top_level_fields
+            ],
+            "data_fields": [
+                {"name": name, "type": value_type}
+                for name, value_type in self.data_fields
+            ],
+            "has_result_list": self.has_result_list,
+            "result_count": self.result_count,
+            "first_result_is_object": self.first_result_is_object,
+            "risk_marker": self.risk_marker,
+            "login_marker": self.login_marker,
+        }
+
+
+@dataclass(frozen=True)
 class SearchNavigationResult:
     success: bool
     failure_kind: str
@@ -61,6 +103,8 @@ class SearchNavigationResult:
     source: str | None = None
     response: CapturedSearchResponse | None = field(default=None, repr=False)
     observed_requests: tuple[str, ...] = ()
+    diagnostics: tuple[SearchResponseDiagnostic, ...] = ()
+    result_count: int = 0
 
 
 def _is_goofish_host(hostname: str | None) -> bool:
@@ -135,6 +179,157 @@ def normalize_search_payload(payload: Any) -> dict[str, Any] | None:
     return {"data": {"resultList": result_list}}
 
 
+def _value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    return type(value).__name__[:40]
+
+
+def _safe_field_name(value: Any) -> str:
+    cleaned = "".join(
+        character
+        for character in str(value or "")
+        if character.isascii()
+        and (character.isalnum() or character in {"_", "-", "."})
+    )
+    return cleaned[:80] or "UNKNOWN"
+
+
+def _field_types(value: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, dict):
+        return ()
+    return tuple(
+        (_safe_field_name(key), _value_type(child))
+        for key, child in list(value.items())[:30]
+    )
+
+
+def _ret_codes(payload: Any) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    ret = payload.get("ret")
+    values = [ret] if isinstance(ret, str) else ret
+    if not isinstance(values, list):
+        return ()
+    codes: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        code = _safe_field_name(value.split("::", 1)[0].strip().upper())
+        if code != "UNKNOWN":
+            codes.append(code)
+    return tuple(codes[:10])
+
+
+def _is_success_ret_code(code: str) -> bool:
+    return code == "SUCCESS" or code.startswith("SUCCESS_")
+
+
+def _has_success_ret(payload: Any) -> bool:
+    codes = _ret_codes(payload)
+    return bool(codes) and all(_is_success_ret_code(code) for code in codes)
+
+
+def _result_list(payload: dict[str, Any] | None) -> list[Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    result_list = data.get("resultList") if isinstance(data, dict) else None
+    return result_list if isinstance(result_list, list) else None
+
+
+def _is_parseable_search_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    data = item.get("data")
+    item_data = data.get("item") if isinstance(data, dict) else None
+    main = item_data.get("main") if isinstance(item_data, dict) else None
+    ex_content = main.get("exContent") if isinstance(main, dict) else None
+    target_url = main.get("targetUrl") if isinstance(main, dict) else None
+    if not isinstance(ex_content, dict) or not isinstance(target_url, str):
+        return False
+    return bool(target_url.strip()) and any(
+        isinstance(ex_content.get(key), (str, int))
+        and str(ex_content.get(key)).strip()
+        for key in ("itemId", "title")
+    )
+
+
+def _result_list_is_parseable(result_list: list[Any]) -> bool:
+    if not result_list:
+        return True
+    return all(isinstance(item, dict) for item in result_list) and any(
+        _is_parseable_search_item(item) for item in result_list
+    )
+
+
+def _safe_content_type(response: Any) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    if not isinstance(headers, dict):
+        return ""
+    value = str(headers.get("content-type", "") or "")
+    return value.split(";", 1)[0].strip().lower()[:80]
+
+
+def _safe_api_path(response: Any) -> str:
+    try:
+        parsed = urlsplit(str(getattr(response, "url", "") or ""))
+    except ValueError:
+        return "invalid-url"
+    if not _is_goofish_host(parsed.hostname):
+        return "external-url"
+    return parsed.path[:300] or "/"
+
+
+def build_search_response_diagnostic(
+    response: Any,
+    payload: Any,
+    *,
+    is_search_response: bool,
+    marker_classification: PageClassification | None = None,
+    json_parsed: bool = True,
+) -> SearchResponseDiagnostic:
+    normalized = normalize_search_payload(payload)
+    result_list = _result_list(normalized)
+    status = getattr(response, "status", None)
+    return SearchResponseDiagnostic(
+        http_status=status if isinstance(status, int) else None,
+        content_type=_safe_content_type(response),
+        api_path=_safe_api_path(response),
+        is_search_response=is_search_response,
+        json_parsed=json_parsed,
+        json_type=_value_type(payload),
+        ret_codes=_ret_codes(payload),
+        top_level_fields=_field_types(payload),
+        data_fields=_field_types(payload.get("data"))
+        if isinstance(payload, dict)
+        else (),
+        has_result_list=result_list is not None,
+        result_count=len(result_list) if result_list is not None else 0,
+        first_result_is_object=bool(
+            result_list and isinstance(result_list[0], dict)
+        ),
+        risk_marker=bool(
+            marker_classification
+            and marker_classification.failure_kind == "risk_control"
+        ),
+        login_marker=bool(
+            marker_classification
+            and marker_classification.failure_kind == "login_required"
+        ),
+    )
+
+
 def _payload_strings(value: Any, *, depth: int = 0):
     if depth > 5:
         return
@@ -183,18 +378,21 @@ def classify_search_response_status(
         )
     if not isinstance(payload, dict):
         return None
-    ret = payload.get("ret")
-    ret_values = [ret] if isinstance(ret, str) else ret
-    if isinstance(ret_values, list) and ret_values:
-        if not any(
-            isinstance(value, str) and value.upper().startswith("SUCCESS")
-            for value in ret_values
-        ):
-            return PageClassification(
-                failure_kind="search_page_failed",
-                reason="闲鱼搜索接口返回失败状态",
-                suggestion="检查登录状态、验证页面和当前搜索接口",
-            )
+    ret_codes = _ret_codes(payload)
+    if ret_codes and not _has_success_ret(payload):
+        failure_code = next(
+            (
+                code
+                for code in ret_codes
+                if not _is_success_ret_code(code)
+            ),
+            ret_codes[0],
+        )
+        return PageClassification(
+            failure_kind="search_page_failed",
+            reason=f"闲鱼搜索接口返回失败状态 ({failure_code})",
+            suggestion="检查登录状态、验证页面和当前搜索接口",
+        )
     return None
 
 
@@ -295,6 +493,7 @@ async def navigate_search_and_capture(
 ) -> SearchNavigationResult:
     queue: asyncio.Queue[Any] = asyncio.Queue()
     observed: list[str] = []
+    diagnostics: list[SearchResponseDiagnostic] = []
 
     def on_response(response: Any) -> None:
         if is_goofish_data_response(response):
@@ -307,7 +506,6 @@ async def navigate_search_and_capture(
     deadline = time.monotonic() + timeout_ms / 1000
     navigation_error: BaseException | None = None
     last_classification = PageClassification()
-    saw_search_parse_error = False
     try:
         while time.monotonic() < deadline:
             last_classification = await classify_page(page)
@@ -321,6 +519,7 @@ async def navigate_search_and_capture(
                     current_url=safe_goofish_url(str(getattr(page, "url", "") or "")),
                     page_title=await _safe_page_title(page),
                     observed_requests=tuple(observed),
+                    diagnostics=tuple(diagnostics),
                 )
 
             if navigation.done() and navigation_error is None:
@@ -337,13 +536,60 @@ async def navigate_search_and_capture(
             summary = describe_search_response(response)
             if summary not in observed and len(observed) < 20:
                 observed.append(summary)
+            is_search_response = is_search_results_response(response)
             try:
                 payload = await response.json()
             except Exception:
-                if is_search_results_response(response):
-                    saw_search_parse_error = True
+                diagnostic = build_search_response_diagnostic(
+                    response,
+                    None,
+                    is_search_response=is_search_response,
+                    json_parsed=False,
+                )
+                if len(diagnostics) < 20:
+                    diagnostics.append(diagnostic)
+                if is_search_response:
+                    status_classification = classify_search_response_status(
+                        response,
+                        None,
+                    )
+                    await _cancel_navigation(navigation)
+                    if status_classification is not None:
+                        return SearchNavigationResult(
+                            success=False,
+                            failure_kind=status_classification.failure_kind
+                            or "search_page_failed",
+                            reason=status_classification.reason,
+                            suggestion=status_classification.suggestion,
+                            current_url=safe_goofish_url(
+                                str(getattr(page, "url", "") or "")
+                            ),
+                            page_title=await _safe_page_title(page),
+                            observed_requests=tuple(observed),
+                            diagnostics=tuple(diagnostics),
+                        )
+                    return SearchNavigationResult(
+                        success=False,
+                        failure_kind="search_parse_failed",
+                        reason="闲鱼搜索数据响应不是可解析的 JSON",
+                        suggestion="检查当前搜索接口响应格式后再运行预检",
+                        current_url=safe_goofish_url(
+                            str(getattr(page, "url", "") or "")
+                        ),
+                        page_title=await _safe_page_title(page),
+                        observed_requests=tuple(observed),
+                        diagnostics=tuple(diagnostics),
+                    )
                 continue
             payload_classification = classify_search_payload(payload)
+            diagnostic = build_search_response_diagnostic(
+                response,
+                payload,
+                is_search_response=is_search_response,
+                marker_classification=payload_classification,
+            )
+            if len(diagnostics) < 20:
+                diagnostics.append(diagnostic)
             if payload_classification is not None:
                 await _cancel_navigation(navigation)
                 return SearchNavigationResult(
@@ -354,7 +600,10 @@ async def navigate_search_and_capture(
                     current_url=safe_goofish_url(str(getattr(page, "url", "") or "")),
                     page_title=await _safe_page_title(page),
                     observed_requests=tuple(observed),
+                    diagnostics=tuple(diagnostics),
                 )
+            if not is_search_response:
+                continue
             status_classification = classify_search_response_status(
                 response,
                 payload,
@@ -372,14 +621,38 @@ async def navigate_search_and_capture(
                     ),
                     page_title=await _safe_page_title(page),
                     observed_requests=tuple(observed),
+                    diagnostics=tuple(diagnostics),
                 )
             normalized = normalize_search_payload(payload)
             if normalized is None:
-                continue
-            if not is_search_results_response(response) and "search" not in str(
-                getattr(response, "url", "")
-            ).lower():
-                continue
+                await _cancel_navigation(navigation)
+                return SearchNavigationResult(
+                    success=False,
+                    failure_kind="search_parse_failed",
+                    reason="闲鱼搜索数据响应缺少 resultList",
+                    suggestion="检查当前搜索接口响应结构后再运行预检",
+                    current_url=safe_goofish_url(
+                        str(getattr(page, "url", "") or "")
+                    ),
+                    page_title=await _safe_page_title(page),
+                    observed_requests=tuple(observed),
+                    diagnostics=tuple(diagnostics),
+                )
+            result_list = _result_list(normalized)
+            if result_list is None or not _result_list_is_parseable(result_list):
+                await _cancel_navigation(navigation)
+                return SearchNavigationResult(
+                    success=False,
+                    failure_kind="search_parse_failed",
+                    reason="闲鱼搜索商品数据结构无法解析",
+                    suggestion="检查当前搜索商品结构后再运行预检",
+                    current_url=safe_goofish_url(
+                        str(getattr(page, "url", "") or "")
+                    ),
+                    page_title=await _safe_page_title(page),
+                    observed_requests=tuple(observed),
+                    diagnostics=tuple(diagnostics),
+                )
             if not navigation.done():
                 try:
                     await asyncio.wait_for(asyncio.shield(navigation), timeout=5)
@@ -397,6 +670,8 @@ async def navigate_search_and_capture(
                 source=summary,
                 response=CapturedSearchResponse(response, normalized, summary),
                 observed_requests=tuple(observed),
+                diagnostics=tuple(diagnostics),
+                result_count=len(result_list),
             )
 
         last_classification = await classify_page(page)
@@ -404,10 +679,6 @@ async def navigate_search_and_capture(
             failure_kind = last_classification.failure_kind
             reason = last_classification.reason
             suggestion = last_classification.suggestion
-        elif saw_search_parse_error:
-            failure_kind = "search_parse_failed"
-            reason = "闲鱼搜索数据响应不是可解析的 JSON"
-            suggestion = "检查当前搜索接口响应格式后再运行预检"
         elif last_classification.has_result_dom:
             failure_kind = "search_response_missing"
             reason = "搜索页面已显示商品，但未识别到可解析的搜索数据响应"
@@ -428,6 +699,7 @@ async def navigate_search_and_capture(
             current_url=safe_goofish_url(str(getattr(page, "url", "") or "")),
             page_title=await _safe_page_title(page),
             observed_requests=tuple(observed),
+            diagnostics=tuple(diagnostics),
         )
     finally:
         await _cancel_navigation(navigation)
