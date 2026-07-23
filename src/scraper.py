@@ -61,6 +61,7 @@ from src.services.price_history_service import (
 )
 from src.services.result_storage_service import (
     load_processed_link_keys,
+    load_task_market_comparison_scope,
     load_task_processed_link_keys,
     save_task_result_record,
     upsert_result_record,
@@ -722,12 +723,20 @@ async def _scrape_xianyu_core(
     history_seen_item_ids: set[str] = set()
     if result_task_id is None:
         historical_snapshots = load_price_snapshots(keyword)
+        comparable_item_ids = None
         result_filename = build_legacy_result_filename(keyword)
         processed_links = load_processed_link_keys(keyword)
         result_saver = save_to_jsonl
         final_result_saver = upsert_result_record
     else:
         historical_snapshots = load_task_price_snapshots(result_task_id)
+        comparable_item_ids = (
+            None
+            if decision_mode == "keyword"
+            else load_task_market_comparison_scope(result_task_id)[
+                "effective_item_ids"
+            ]
+        )
         result_filename = build_task_result_filename(result_task_id)
         processed_links = load_task_processed_link_keys(result_task_id)
 
@@ -1409,6 +1418,7 @@ async def _scrape_xianyu_core(
                                     item=item_data,
                                     current_market_items=basic_items,
                                     historical_snapshots=historical_snapshots,
+                                    comparable_item_ids=comparable_item_ids,
                                 )
                                 final_record["价格参考"] = price_reference
                                 final_record["price_insight"] = price_reference.get(

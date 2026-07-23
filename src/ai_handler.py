@@ -50,6 +50,7 @@ from src.services.ai_request_compat import (
     is_responses_api_unsupported_error,
     is_temperature_unsupported_error,
     remove_temperature_param,
+    TARGET_CATEGORY_TARGET_ONLY,
 )
 from src.services.notification_service import build_notification_service
 from src.services.prompt_version import resolve_canonical_prompt_version
@@ -393,7 +394,23 @@ def get_ai_response_validation_errors(parsed_response: object) -> list[str]:
     """Return model-owned semantic field names that violate the contract."""
     if not isinstance(parsed_response, dict):
         return ["top_level"]
-    return _validate_schema_value(parsed_response, AI_ANALYSIS_SCHEMA, "")
+    errors = _validate_schema_value(parsed_response, AI_ANALYSIS_SCHEMA, "")
+    if (
+        not errors
+        and parsed_response.get("market_comparable") is True
+        and parsed_response.get("target_category") != TARGET_CATEGORY_TARGET_ONLY
+    ):
+        errors.append("market_comparable")
+    if (
+        not errors
+        and parsed_response.get("is_recommended") is True
+        and (
+            parsed_response.get("target_category") != TARGET_CATEGORY_TARGET_ONLY
+            or parsed_response.get("market_comparable") is not True
+        )
+    ):
+        errors.append("is_recommended")
+    return errors
 
 
 def validate_ai_response_format(parsed_response):

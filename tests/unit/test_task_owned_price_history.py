@@ -97,17 +97,22 @@ def test_canonical_task_filename_enriches_from_only_its_task_snapshots(
 
     visible_calls = []
 
-    def load_visible_task_ids(task_id: int) -> set[str]:
+    def load_task_scope(task_id: int) -> dict:
         visible_calls.append(task_id)
-        return {"shared", "peer"}
+        return {
+            "effective_item_ids": {"shared", "peer"},
+            "comparable_item_ids": {"shared", "peer"},
+            "classification_available": True,
+            "scope_mode": "ai_classified",
+        }
 
     def fail_legacy_visibility(_filename: str) -> set[str]:
         raise AssertionError("canonical task filenames must not use legacy visibility")
 
     monkeypatch.setattr(
         result_file_service,
-        "load_visible_task_result_item_ids",
-        load_visible_task_ids,
+        "load_task_market_comparison_scope",
+        load_task_scope,
     )
     monkeypatch.setattr(
         result_file_service,
@@ -131,4 +136,3 @@ def test_canonical_task_filename_enriches_from_only_its_task_snapshots(
     assert task_b[0]["price_insight"]["observation_count"] == 2
     assert task_b[0]["price_insight"]["avg_price"] == 900.0
     assert task_b[0]["price_insight"]["market_avg_price"] == 1300.0
-

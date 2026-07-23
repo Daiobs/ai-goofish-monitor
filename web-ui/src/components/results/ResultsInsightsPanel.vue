@@ -10,6 +10,9 @@ const props = defineProps<{
   selectedTaskLabel?: string | null
 }>()
 const { t } = useI18n()
+const usesAiComparison = computed(() => (
+  props.insights?.comparison_scope?.mode === 'ai_classified'
+))
 
 const summaryCards = computed(() => {
   if (!props.insights) return []
@@ -17,17 +20,29 @@ const summaryCards = computed(() => {
   const history = props.insights.history_summary
   return [
     {
-      label: t('results.insights.currentAvg'),
+      label: t(
+        usesAiComparison.value
+          ? 'results.insights.currentAvg'
+          : 'results.insights.legacyCurrentAvg',
+      ),
       value: market.avg_price ? `¥${market.avg_price}` : '—',
       hint: t('results.insights.sampleCount', { count: market.sample_count || 0 }),
     },
     {
-      label: t('results.insights.historyAvg'),
+      label: t(
+        usesAiComparison.value
+          ? 'results.insights.historyAvg'
+          : 'results.insights.legacyHistoryAvg',
+      ),
       value: history.avg_price ? `¥${history.avg_price}` : '—',
       hint: t('results.insights.uniqueItems', { count: history.unique_items || 0 }),
     },
     {
-      label: t('results.insights.currentMin'),
+      label: t(
+        usesAiComparison.value
+          ? 'results.insights.currentMin'
+          : 'results.insights.legacyCurrentMin',
+      ),
       value: market.min_price ? `¥${market.min_price}` : '—',
       hint: market.max_price
         ? t('results.insights.highestPrice', { price: market.max_price })
@@ -45,6 +60,20 @@ const latestSnapshotText = computed(() => {
     }),
   })
 })
+
+const comparisonScopeText = computed(() => {
+  const scope = props.insights?.comparison_scope
+  if (!scope) return null
+  if (scope.mode === 'ai_classified') {
+    return t('results.insights.comparisonScope', {
+      comparable: scope.comparable_count,
+      excluded: scope.excluded_count,
+    })
+  }
+  return t('results.insights.keywordScope', {
+    count: scope.comparable_count,
+  })
+})
 </script>
 
 <template>
@@ -57,7 +86,13 @@ const latestSnapshotText = computed(() => {
             {{ selectedTaskLabel || t('results.insights.defaultTitle') }}
           </h2>
           <p class="max-w-2xl text-sm leading-6 text-slate-500">
-            {{ t('results.insights.subtitle') }}
+            {{
+              t(
+                usesAiComparison
+                  ? 'results.insights.subtitle'
+                  : 'results.insights.legacySubtitle',
+              )
+            }}
           </p>
         </div>
 
@@ -83,7 +118,16 @@ const latestSnapshotText = computed(() => {
             {{ t('results.insights.snapshotCount', { count: insights?.market_summary.sample_count || 0 }) }}
           </p>
           <p class="mt-2 text-sm leading-6 text-primary-foreground/80">
-            {{ t('results.insights.trendReading') }}
+            {{
+              t(
+                usesAiComparison
+                  ? 'results.insights.trendReading'
+                  : 'results.insights.legacyTrendReading',
+              )
+            }}
+          </p>
+          <p v-if="comparisonScopeText" class="mt-3 text-xs leading-5 text-primary-foreground/70">
+            {{ comparisonScopeText }}
           </p>
         </div>
 

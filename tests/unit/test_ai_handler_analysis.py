@@ -240,6 +240,8 @@ def _valid_analysis(**overrides):
     seller_detail = {"comment": "ok", "evidence": "synthetic"}
     analysis = {
         "is_recommended": True,
+        "target_category": "target_only",
+        "market_comparable": True,
         "reason": "clear decision",
         "risk_tags": [],
         "criteria_analysis": {
@@ -264,6 +266,49 @@ def _valid_analysis(**overrides):
     }
     analysis.update(overrides)
     return analysis
+
+
+@pytest.mark.parametrize(
+    "target_category",
+    ("target_bundle", "not_target", "uncertain"),
+)
+def test_ai_response_rejects_non_target_marked_market_comparable(
+    target_category,
+):
+    response = _valid_analysis(
+        target_category=target_category,
+        market_comparable=True,
+    )
+
+    assert ai_handler.get_ai_response_validation_errors(response) == [
+        "market_comparable"
+    ]
+    assert ai_handler.normalize_ai_response(response, "EagleEye-V6.4") is None
+
+
+@pytest.mark.parametrize(
+    ("target_category", "market_comparable"),
+    (
+        ("target_bundle", False),
+        ("not_target", False),
+        ("uncertain", False),
+        ("target_only", False),
+    ),
+)
+def test_ai_response_rejects_recommendation_outside_comparable_target(
+    target_category,
+    market_comparable,
+):
+    response = _valid_analysis(
+        is_recommended=True,
+        target_category=target_category,
+        market_comparable=market_comparable,
+    )
+
+    assert ai_handler.get_ai_response_validation_errors(response) == [
+        "is_recommended"
+    ]
+    assert ai_handler.normalize_ai_response(response, "EagleEye-V6.4") is None
 
 
 @pytest.mark.parametrize(

@@ -27,6 +27,7 @@ const info = props.item.商品信息
 const seller = props.item.卖家信息
 const ai = props.item.ai_analysis
 const priceInsight = props.item.price_insight
+const usesAiMarketScope = computed(() => priceInsight?.market_scope === 'ai_classified')
 
 const isAiFailure = computed(() => (
   ai?.analysis_source === 'ai'
@@ -38,6 +39,13 @@ const recommendationStatus = computed(() => {
   if (ai?.is_recommended === true) return { label: t('results.card.strongRecommend'), color: 'bg-emerald-500', icon: CheckCircle2, text: 'text-emerald-600', bg: 'bg-emerald-50' }
   if (ai?.is_recommended === false) return { label: t('results.card.notRecommended'), color: 'bg-rose-500', icon: XCircle, text: 'text-rose-600', bg: 'bg-rose-50' }
   return { label: t('results.card.pending'), color: 'bg-amber-500', icon: AlertCircle, text: 'text-amber-600', bg: 'bg-amber-50' }
+})
+const targetCategoryLabel = computed(() => {
+  if (ai?.target_category === 'target_only') return t('results.card.targetOnly')
+  if (ai?.target_category === 'target_bundle') return t('results.card.targetBundle')
+  if (ai?.target_category === 'not_target') return t('results.card.notTarget')
+  if (ai?.target_category === 'uncertain') return t('results.card.targetUncertain')
+  return null
 })
 
 const imageUrl = info.商品图片列表?.[0] || info.商品主图链接 || ''
@@ -132,6 +140,10 @@ const expanded = ref(false)
              <span class="text-sm font-black" :class="recommendationStatus.text">{{ matchScore }}%</span>
           </div>
         </div>
+        <p v-if="targetCategoryLabel" class="mb-2 text-[11px] font-semibold text-slate-500">
+          {{ targetCategoryLabel }}
+          <span v-if="ai?.market_comparable === true"> · {{ t('results.card.comparable') }}</span>
+        </p>
         
         <div v-if="!isAiFailure" class="w-full h-1.5 bg-white/50 rounded-full overflow-hidden mb-3">
           <div 
@@ -160,10 +172,21 @@ const expanded = ref(false)
       <div v-if="priceInsight?.observation_count" class="mt-4 grid grid-cols-2 gap-3">
         <div class="bg-slate-50/50 p-2.5 rounded-xl border border-slate-100/50 group/stat">
           <div class="flex items-center gap-1.5 text-[10px] font-medium text-slate-400 mb-1">
-            <TrendingUp class="w-3 h-3" /> {{ t('results.card.marketAvg') }}
+            <TrendingUp class="w-3 h-3" />
+            {{
+              t(
+                usesAiMarketScope
+                  ? 'results.card.marketAvg'
+                  : 'results.card.keywordMarketAvg',
+              )
+            }}
           </div>
           <div class="text-sm font-bold text-slate-700">
-            {{ priceInsight.market_avg_price ? `¥${priceInsight.market_avg_price}` : '—' }}
+            {{
+              priceInsight.market_comparable === false
+                ? t('results.card.excludedFromMarket')
+                : (priceInsight.market_avg_price ? `¥${priceInsight.market_avg_price}` : '—')
+            }}
           </div>
         </div>
         <div class="bg-slate-50/50 p-2.5 rounded-xl border border-slate-100/50">

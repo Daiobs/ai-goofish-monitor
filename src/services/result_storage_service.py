@@ -16,6 +16,12 @@ from src.infrastructure.persistence.storage_names import (
     try_parse_task_result_filename,
 )
 from src.services.price_history_service import parse_price_value
+from src.services.ai_request_compat import (
+    TARGET_CATEGORY_NOT_TARGET,
+    TARGET_CATEGORY_TARGET_BUNDLE,
+    TARGET_CATEGORY_TARGET_ONLY,
+    TARGET_CATEGORY_UNCERTAIN,
+)
 from src.services.result_blacklist_service import (
     is_valid_result_record_structure,
     match_blacklist_search_text,
@@ -943,3 +949,150 @@ def load_visible_result_item_ids(filename: str) -> set[str]:
 
 def load_visible_task_result_item_ids(task_id: int) -> set[str]:
     return _load_visible_item_ids_sync(task_id=task_id)
+
+
+def load_task_market_comparison_scope(task_id: int) -> dict:
+    """Return visible task items grouped by AI market-comparability semantics."""
+    bootstrap_sqlite_storage()
+    normalized_task_id = _normalize_task_id(task_id)
+    with sqlite_connection() as conn:
+        conn.execute("BEGIN")
+        where_clause, params, _, _ = _prepare_filtered_query(
+            conn,
+            filename=None,
+            task_id=normalized_task_id,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            include_hidden=False,
+        )
+        rows = conn.execute(
+            f"""
+            SELECT
+                item_id,
+                CASE
+                    WHEN json_valid(raw_json) = 1 THEN
+                        CASE
+                            WHEN json_type(raw_json, '$') = 'object'
+                             AND COALESCE(
+                                json_type(raw_json, '$."商品信息"'),
+                                'null'
+                             ) IN ('null', 'object')
+                             AND COALESCE(
+                                json_type(raw_json, '$."卖家信息"'),
+                                'null'
+                             ) IN ('null', 'object')
+                             AND COALESCE(
+                                json_type(raw_json, '$.ai_analysis'),
+                                'null'
+                             ) IN ('null', 'object')
+                            THEN 1
+                            ELSE 0
+                        END
+                    ELSE 0
+                END AS record_valid,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.target_category'
+                    )
+                END AS target_category,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.market_comparable'
+                    )
+                END AS market_comparable,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.analysis_status'
+                    )
+                END AS analysis_status,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.analysis_source'
+                    )
+                END AS analysis_source
+            FROM result_items
+            WHERE {where_clause}
+              AND item_id IS NOT NULL
+              AND TRIM(item_id) <> ''
+            """,
+            tuple(params),
+        ).fetchall()
+
+    visible_item_ids: set[str] = set()
+    comparable_item_ids: set[str] = set()
+    keyword_item_ids: set[str] = set()
+    counts = {
+        TARGET_CATEGORY_TARGET_ONLY: 0,
+        TARGET_CATEGORY_TARGET_BUNDLE: 0,
+        TARGET_CATEGORY_NOT_TARGET: 0,
+        TARGET_CATEGORY_UNCERTAIN: 0,
+        "unclassified": 0,
+    }
+
+    for row in rows:
+        item_id = str(row["item_id"]).strip()
+        visible_item_ids.add(item_id)
+        if int(row["record_valid"] or 0) != 1:
+            counts["unclassified"] += 1
+            continue
+
+        category = row["target_category"]
+        analysis_source = str(row["analysis_source"] or "")
+        if analysis_source == "keyword" and category is None:
+            keyword_item_ids.add(item_id)
+            continue
+        if not isinstance(category, str) or category not in counts:
+            counts["unclassified"] += 1
+            continue
+        counts[str(category)] += 1
+        if (
+            category == TARGET_CATEGORY_TARGET_ONLY
+            and row["market_comparable"] == 1
+            and row["analysis_status"] == "completed"
+        ):
+            comparable_item_ids.add(item_id)
+
+    classified_count = sum(
+        counts[category]
+        for category in (
+            TARGET_CATEGORY_TARGET_ONLY,
+            TARGET_CATEGORY_TARGET_BUNDLE,
+            TARGET_CATEGORY_NOT_TARGET,
+            TARGET_CATEGORY_UNCERTAIN,
+        )
+    )
+    classification_available = classified_count > 0
+    keyword_only = (
+        bool(visible_item_ids)
+        and keyword_item_ids == visible_item_ids
+        and classified_count == 0
+        and counts["unclassified"] == 0
+    )
+    scope_mode = "keyword_all_visible" if keyword_only else "ai_classified"
+    if keyword_only:
+        comparable_item_ids = set(visible_item_ids)
+    effective_item_ids = set(comparable_item_ids)
+    return {
+        "visible_item_ids": visible_item_ids,
+        "comparable_item_ids": comparable_item_ids,
+        "effective_item_ids": effective_item_ids,
+        "classification_available": classification_available,
+        "scope_mode": scope_mode,
+        "visible_count": len(visible_item_ids),
+        "classified_count": classified_count,
+        "comparable_count": len(comparable_item_ids),
+        "excluded_count": len(visible_item_ids) - len(comparable_item_ids),
+        "target_only_count": counts[TARGET_CATEGORY_TARGET_ONLY],
+        "target_bundle_count": counts[TARGET_CATEGORY_TARGET_BUNDLE],
+        "not_target_count": counts[TARGET_CATEGORY_NOT_TARGET],
+        "uncertain_count": counts[TARGET_CATEGORY_UNCERTAIN],
+        "unclassified_count": counts["unclassified"],
+    }

@@ -231,6 +231,74 @@ def test_item_analysis_dispatcher_supports_keyword_mode_without_ai():
     assert saved_records[0]["ai_analysis"]["is_recommended"] is True
 
 
+def test_skip_ai_analysis_never_recommends_or_notifies():
+    saved_records = []
+    notifications = []
+
+    async def seller_loader(_user_id: str):
+        return {}
+
+    async def image_downloader(*_args):
+        raise AssertionError("skipped AI must not download images")
+
+    async def ai_analyzer(*_args):
+        raise AssertionError("skipped AI must not call the model")
+
+    async def notifier(item_data: dict, reason: str):
+        notifications.append((item_data, reason))
+
+    async def saver(record: dict, _keyword: str):
+        saved_records.append(record)
+        return True
+
+    async def run():
+        dispatcher = ItemAnalysisDispatcher(
+            concurrency=1,
+            skip_ai_analysis=True,
+            seller_loader=seller_loader,
+            image_downloader=image_downloader,
+            ai_analyzer=ai_analyzer,
+            notifier=notifier,
+            saver=saver,
+        )
+        dispatcher.submit(
+            ItemAnalysisJob(
+                keyword="demo",
+                task_name="Demo",
+                decision_mode="ai",
+                analyze_images=True,
+                prompt_text="prompt",
+                keyword_rules=(),
+                final_record={
+                    "商品信息": {
+                        "商品ID": "skipped",
+                        "商品标题": "synthetic item",
+                        "商品图片列表": ["https://example.invalid/image.jpg"],
+                    },
+                    "卖家信息": {},
+                },
+                seller_id=None,
+                zhima_credit_text=None,
+                registration_duration_text="",
+            )
+        )
+        await dispatcher.join()
+
+    asyncio.run(run())
+
+    skipped = saved_records[-1]["ai_analysis"]
+    assert skipped == {
+        "analysis_source": "ai",
+        "analysis_status": "skipped",
+        "is_recommended": False,
+        "target_category": "uncertain",
+        "market_comparable": False,
+        "reason": "AI分析已禁用，商品未自动推荐。",
+        "keyword_hit_count": 0,
+    }
+    assert notifications == []
+
+
 def test_item_analysis_dispatcher_can_cancel_submitted_work():
     seller_started = asyncio.Event()
     seller_cancelled = asyncio.Event()

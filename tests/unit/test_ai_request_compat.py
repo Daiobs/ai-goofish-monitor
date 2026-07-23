@@ -32,6 +32,14 @@ def test_build_chat_request_with_strict_analysis_schema():
     assert "request_duration_seconds" not in AI_ANALYSIS_SCHEMA["properties"]
     assert "analysis_status" not in AI_ANALYSIS_SCHEMA["properties"]
     assert "analysis_source" not in AI_ANALYSIS_SCHEMA["properties"]
+    assert AI_ANALYSIS_SCHEMA["properties"]["target_category"]["enum"] == [
+        "target_only",
+        "target_bundle",
+        "not_target",
+        "uncertain",
+    ]
+    assert "target_category" in AI_ANALYSIS_SCHEMA["required"]
+    assert "market_comparable" in AI_ANALYSIS_SCHEMA["required"]
 
 
 def test_build_responses_request_with_strict_analysis_schema():

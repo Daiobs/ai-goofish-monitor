@@ -16,6 +16,16 @@ JSON_OBJECT_OUTPUT_MODE = JSON_OUTPUT_TYPE
 TEXT_OUTPUT_MODE = "text"
 AI_ANALYSIS_SCHEMA_NAME = "goofish_product_analysis"
 AI_ANALYSIS_TOOL_NAME = "submit_goofish_analysis"
+TARGET_CATEGORY_TARGET_ONLY = "target_only"
+TARGET_CATEGORY_TARGET_BUNDLE = "target_bundle"
+TARGET_CATEGORY_NOT_TARGET = "not_target"
+TARGET_CATEGORY_UNCERTAIN = "uncertain"
+TARGET_CATEGORY_VALUES = (
+    TARGET_CATEGORY_TARGET_ONLY,
+    TARGET_CATEGORY_TARGET_BUNDLE,
+    TARGET_CATEGORY_NOT_TARGET,
+    TARGET_CATEGORY_UNCERTAIN,
+)
 UNSUPPORTED_JSON_OUTPUT_MARKERS = (
     "not supported by this model",
     "json_object",
@@ -75,6 +85,11 @@ AI_ANALYSIS_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "is_recommended": {"type": "boolean"},
+        "target_category": {
+            "type": "string",
+            "enum": list(TARGET_CATEGORY_VALUES),
+        },
+        "market_comparable": {"type": "boolean"},
         "reason": _nonempty_string_schema(),
         "risk_tags": {
             "type": "array",
@@ -135,6 +150,8 @@ AI_ANALYSIS_SCHEMA: Dict[str, Any] = {
     },
     "required": [
         "is_recommended",
+        "target_category",
+        "market_comparable",
         "reason",
         "risk_tags",
         "criteria_analysis",

@@ -121,8 +121,10 @@ class ItemAnalysisDispatcher:
         return {
             "analysis_source": "ai",
             "analysis_status": "skipped",
-            "is_recommended": True,
-            "reason": "商品已跳过AI分析，直接通知",
+            "is_recommended": False,
+            "target_category": "uncertain",
+            "market_comparable": False,
+            "reason": "AI分析已禁用，商品未自动推荐。",
             "keyword_hit_count": 0,
         }
 
