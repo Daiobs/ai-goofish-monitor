@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -20,6 +22,7 @@ _SETTINGS_ENV_KEYS = [
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL_NAME",
+    "OPENAI_REASONING_EFFORT",
     "SKIP_AI_ANALYSIS",
     "PROXY_URL",
     "NTFY_TOPIC_URL",
@@ -328,6 +331,7 @@ def test_ai_settings_fall_back_to_runtime_environment_when_env_file_missing(tmp_
     monkeypatch.setenv("OPENAI_API_KEY", "runtime-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://runtime.example.com/v1")
     monkeypatch.setenv("OPENAI_MODEL_NAME", "runtime-model")
+    monkeypatch.setenv("OPENAI_REASONING_EFFORT", "high")
     monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:7890")
     client = _build_settings_client()
 
@@ -336,6 +340,7 @@ def test_ai_settings_fall_back_to_runtime_environment_when_env_file_missing(tmp_
     assert ai_response.json() == {
         "OPENAI_BASE_URL": "https://runtime.example.com/v1",
         "OPENAI_MODEL_NAME": "runtime-model",
+        "OPENAI_REASONING_EFFORT": "high",
         "SKIP_AI_ANALYSIS": False,
         "PROXY_URL": "http://127.0.0.1:7890",
     }
@@ -347,6 +352,47 @@ def test_ai_settings_fall_back_to_runtime_environment_when_env_file_missing(tmp_
     assert env_payload["openai_api_key_set"] is True
     assert env_payload["openai_base_url_set"] is True
     assert env_payload["openai_model_name_set"] is True
+
+
+def test_ai_settings_persist_model_variant_and_reasoning_effort(
+    tmp_path, monkeypatch
+):
+    _clear_settings_env(monkeypatch)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "OPENAI_BASE_URL=https://example.com/v1",
+                "OPENAI_MODEL_NAME=gpt-5.6-sol",
+                "OPENAI_REASONING_EFFORT=medium",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(env_manager, "env_file", env_file)
+    client = _build_settings_client()
+
+    response = client.put(
+        "/api/settings/ai",
+        json={
+            "OPENAI_MODEL_NAME": "gpt-5.6-terra",
+            "OPENAI_REASONING_EFFORT": "xhigh",
+        },
+    )
+
+    assert response.status_code == 200
+    persisted = env_file.read_text(encoding="utf-8")
+    assert "OPENAI_MODEL_NAME=gpt-5.6-terra" in persisted
+    assert "OPENAI_REASONING_EFFORT=xhigh" in persisted
+    assert os.environ["OPENAI_MODEL_NAME"] == "gpt-5.6-terra"
+    assert os.environ["OPENAI_REASONING_EFFORT"] == "xhigh"
+    assert client.get("/api/settings/ai").json()["OPENAI_REASONING_EFFORT"] == "xhigh"
+
+    invalid = client.put(
+        "/api/settings/ai",
+        json={"OPENAI_REASONING_EFFORT": "extreme"},
+    )
+    assert invalid.status_code == 422
 
 
 def test_notification_settings_fall_back_to_runtime_environment_when_env_file_missing(
@@ -426,6 +472,7 @@ def test_ai_test_endpoint_falls_back_to_responses_when_chat_completions_api_404(
             "OPENAI_API_KEY": "demo",
             "OPENAI_BASE_URL": "https://example.com/v1/",
             "OPENAI_MODEL_NAME": "demo-model",
+            "OPENAI_REASONING_EFFORT": "xhigh",
         },
     )
 
@@ -435,5 +482,7 @@ def test_ai_test_endpoint_falls_back_to_responses_when_chat_completions_api_404(
     assert payload["response"] == "OK"
     assert request_history[0][0] == "chat"
     assert request_history[0][1]["messages"][0]["content"] == settings.AI_TEST_PROMPT
+    assert request_history[0][1]["reasoning_effort"] == "xhigh"
     assert request_history[1][0] == "responses"
     assert request_history[1][1]["input"][0]["content"][0]["text"] == settings.AI_TEST_PROMPT
+    assert request_history[1][1]["reasoning"] == {"effort": "xhigh"}

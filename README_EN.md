@@ -45,6 +45,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | AI model API key | Yes |
 | `OPENAI_BASE_URL` | OpenAI-compatible API base URL | Yes |
 | `OPENAI_MODEL_NAME` | Model name with image input support | Yes |
+| `OPENAI_REASONING_EFFORT` | OpenAI reasoning effort; blank uses the provider default | No |
 | `WEB_USERNAME` / `WEB_PASSWORD` | Web UI login credentials, default `admin/admin123` | No |
 | `SESSION_SECRET` | Session signing secret; a strong random value is required in production | Production |
 
@@ -187,7 +188,8 @@ See [CI and required quality gates](docs/ci.md) for required checks, local repro
 
 ### AI and Runtime
 
-- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL_NAME`: required AI model settings.
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL_NAME`: required AI model settings. The settings page provides GPT-5.6 Sol, Terra, and Luna presets while retaining custom model IDs.
+- `OPENAI_REASONING_EFFORT`: OpenAI reasoning effort. Supported picker values are `none`, `low`, `medium`, `high`, `xhigh`, and `max`; leave it blank to use the provider default. Responses API requests use `reasoning.effort`, while Chat Completions requests use `reasoning_effort`.
 - `PROXY_URL`: dedicated HTTP/SOCKS5 proxy for AI requests.
 - `RUN_HEADLESS`: whether the scraper runs headless; keep it `true` in Docker.
 - `SERVER_PORT`: backend port, default `8000`.

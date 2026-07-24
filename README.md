@@ -68,6 +68,7 @@ docker compose down
 | `OPENAI_API_KEY` | AI 模型 API Key | 是 |
 | `OPENAI_BASE_URL` | OpenAI 兼容接口地址 | 是 |
 | `OPENAI_MODEL_NAME` | 支持图片输入的模型名称 | 是 |
+| `OPENAI_REASONING_EFFORT` | OpenAI 推理强度；留空使用服务商默认值 | 否 |
 | `WEB_USERNAME` / `WEB_PASSWORD` | Web UI 登录账号密码，默认 `admin/admin123` | 否 |
 | `SESSION_SECRET` | Session 签名密钥；生产环境必须设置高强度随机值 | 生产必填 |
 
@@ -190,7 +191,8 @@ npm run dev
 
 ### AI 与运行时
 
-- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL_NAME`：AI 模型接入必填项。
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL_NAME`：AI 模型接入必填项。设置页提供 GPT-5.6 Sol、Terra、Luna 预设，也保留自定义模型 ID。
+- `OPENAI_REASONING_EFFORT`：OpenAI 模型思考等级；可选 `none`、`low`、`medium`、`high`、`xhigh`、`max`，留空使用服务商默认值。Responses API 使用 `reasoning.effort`，Chat Completions 使用对应的 `reasoning_effort` 参数。
 - `PROXY_URL`：为 AI 请求单独指定 HTTP/SOCKS5 代理。
 - `RUN_HEADLESS`：是否以无头模式运行爬虫；Docker 中应保持 `true`。
 - `SERVER_PORT`：后端监听端口，默认 `8000`。

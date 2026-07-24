@@ -23,6 +23,7 @@ from src.config import (
     IMAGE_SAVE_DIR,
     TASK_IMAGE_DIR_PREFIX,
     MODEL_NAME,
+    REASONING_EFFORT,
     ENABLE_RESPONSE_FORMAT,
     client,
 )
@@ -94,6 +95,10 @@ def _build_debug_request_summary(api_mode: str, request_params: dict) -> dict:
         summary["max_output_tokens"] = request_params["max_output_tokens"]
     if "max_tokens" in request_params:
         summary["max_tokens"] = request_params["max_tokens"]
+    if "reasoning_effort" in request_params:
+        summary["reasoning_effort"] = request_params["reasoning_effort"]
+    if "reasoning" in request_params:
+        summary["reasoning"] = request_params["reasoning"]
     if "text" in request_params:
         summary["text"] = request_params["text"]
     if "response_format" in request_params:
@@ -596,6 +601,7 @@ async def get_ai_analysis(
                 messages=messages,
                 temperature=0.1,
                 max_output_tokens=4000,
+                reasoning_effort=REASONING_EFFORT,
                 output_mode=output_mode,
             )
             if not use_temperature:

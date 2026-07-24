@@ -24,6 +24,7 @@ DETAIL_API_URL_PATTERN = "h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail"
 API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("OPENAI_BASE_URL")
 MODEL_NAME = os.getenv("OPENAI_MODEL_NAME")
+REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip().lower() or None
 PROXY_URL = os.getenv("PROXY_URL")
 NTFY_TOPIC_URL = os.getenv("NTFY_TOPIC_URL")
 GOTIFY_URL = os.getenv("GOTIFY_URL")
