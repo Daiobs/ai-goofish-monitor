@@ -56,6 +56,7 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ai_handler, "client", _build_fake_client(fake_create))
     monkeypatch.setattr(ai_handler, "MODEL_NAME", "fake-model")
+    monkeypatch.setattr(ai_handler, "REASONING_EFFORT", "xhigh")
     monkeypatch.setattr(ai_handler, "ENABLE_RESPONSE_FORMAT", True)
     monkeypatch.setattr(app_config, "ENABLE_RESPONSE_FORMAT", True)
     monotonic_values = iter((10.0, 12.3456))
@@ -77,6 +78,7 @@ def test_get_ai_analysis_returns_parsed_json(monkeypatch, tmp_path):
     assert call_count["value"] == 1
     assert requests[0]["response_format"]["type"] == "json_schema"
     assert requests[0]["response_format"]["json_schema"]["strict"] is True
+    assert requests[0]["reasoning_effort"] == "xhigh"
 
 
 def test_get_ai_analysis_disables_sdk_level_retries(monkeypatch, tmp_path):

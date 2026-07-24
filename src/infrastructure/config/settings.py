@@ -43,6 +43,7 @@ class AISettings(_EnvSettings):
     api_key: Optional[str] = _env_field(None, "OPENAI_API_KEY")
     base_url: str = _env_field("", "OPENAI_BASE_URL")
     model_name: str = _env_field("", "OPENAI_MODEL_NAME")
+    reasoning_effort: str = _env_field("", "OPENAI_REASONING_EFFORT")
     proxy_url: Optional[str] = _env_field(None, "PROXY_URL")
     debug_mode: bool = _env_field(False, "AI_DEBUG_MODE")
     enable_response_format: bool = _env_field(True, "ENABLE_RESPONSE_FORMAT")

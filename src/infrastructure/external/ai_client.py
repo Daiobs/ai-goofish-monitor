@@ -203,6 +203,11 @@ class AIClient:
                 messages=messages,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
+                reasoning_effort=getattr(
+                    self.settings,
+                    "reasoning_effort",
+                    None,
+                ),
                 enable_json_output=use_response_format,
             )
             if not use_temperature:

@@ -2,7 +2,7 @@
 设置管理路由
 """
 import os
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
@@ -102,6 +102,9 @@ class AISettingsModel(BaseModel):
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: Optional[str] = None
     OPENAI_MODEL_NAME: Optional[str] = None
+    OPENAI_REASONING_EFFORT: Optional[
+        Literal["", "none", "low", "medium", "high", "xhigh", "max"]
+    ] = None
     SKIP_AI_ANALYSIS: Optional[bool] = None
     PROXY_URL: Optional[str] = None
 
@@ -257,6 +260,10 @@ async def get_ai_settings():
     return {
         "OPENAI_BASE_URL": env_manager.get_value("OPENAI_BASE_URL", ""),
         "OPENAI_MODEL_NAME": env_manager.get_value("OPENAI_MODEL_NAME", ""),
+        "OPENAI_REASONING_EFFORT": env_manager.get_value(
+            "OPENAI_REASONING_EFFORT",
+            "",
+        ),
         "SKIP_AI_ANALYSIS": env_manager.get_value("SKIP_AI_ANALYSIS", "false").lower() == "true",
         "PROXY_URL": env_manager.get_value("PROXY_URL", ""),
     }
@@ -271,6 +278,8 @@ async def update_ai_settings(settings: AISettingsModel):
         updates["OPENAI_BASE_URL"] = settings.OPENAI_BASE_URL
     if settings.OPENAI_MODEL_NAME is not None:
         updates["OPENAI_MODEL_NAME"] = settings.OPENAI_MODEL_NAME
+    if settings.OPENAI_REASONING_EFFORT is not None:
+        updates["OPENAI_REASONING_EFFORT"] = settings.OPENAI_REASONING_EFFORT
     if settings.SKIP_AI_ANALYSIS is not None:
         updates["SKIP_AI_ANALYSIS"] = str(settings.SKIP_AI_ANALYSIS).lower()
     if settings.PROXY_URL is not None:
@@ -284,27 +293,29 @@ async def update_ai_settings(settings: AISettingsModel):
 
 
 @router.post("/ai/test")
-async def test_ai_settings(settings: dict):
+async def test_ai_settings(settings: AISettingsModel):
     """测试AI模型设置是否有效"""
     try:
         from openai import OpenAI
         import httpx
 
+        payload = model_dump(settings, exclude_unset=True)
         stored_api_key = env_manager.get_value("OPENAI_API_KEY", "")
-        submitted_api_key = settings.get("OPENAI_API_KEY", "")
+        submitted_api_key = payload.get("OPENAI_API_KEY", "")
         api_key = submitted_api_key or stored_api_key
 
         client_params = {
             "api_key": api_key,
-            "base_url": settings.get("OPENAI_BASE_URL", ""),
+            "base_url": payload.get("OPENAI_BASE_URL", ""),
             "timeout": httpx.Timeout(30.0),
         }
 
-        proxy_url = settings.get("PROXY_URL", "")
+        proxy_url = payload.get("PROXY_URL", "")
         if proxy_url:
             client_params["http_client"] = httpx.Client(proxy=proxy_url)
 
-        model_name = settings.get("OPENAI_MODEL_NAME", "")
+        model_name = payload.get("OPENAI_MODEL_NAME", "")
+        reasoning_effort = payload.get("OPENAI_REASONING_EFFORT") or None
         client = OpenAI(**client_params)
         messages = [{"role": "user", "content": AI_TEST_PROMPT}]
         api_mode = CHAT_COMPLETIONS_API_MODE
@@ -318,6 +329,7 @@ async def test_ai_settings(settings: dict):
                     model=model_name,
                     messages=messages,
                     max_output_tokens=AI_TEST_MAX_OUTPUT_TOKENS,
+                    reasoning_effort=reasoning_effort,
                 ),
             )
         except Exception as exc:
@@ -332,6 +344,7 @@ async def test_ai_settings(settings: dict):
                     model=model_name,
                     messages=messages,
                     max_output_tokens=AI_TEST_MAX_OUTPUT_TOKENS,
+                    reasoning_effort=reasoning_effort,
                 ),
             )
 

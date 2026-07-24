@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useSettings } from '@/composables/useSettings'
@@ -16,6 +16,13 @@ import { getPromptContent, listPrompts, updatePrompt } from '@/api/prompts'
 import NotificationSettingsPanel from '@/components/settings/NotificationSettingsPanel.vue'
 import RotationSettingsPanel from '@/components/settings/RotationSettingsPanel.vue'
 const { t } = useI18n()
+
+const OPENAI_MODEL_PRESETS = [
+  { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
+  { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
+] as const
+const PROVIDER_DEFAULT_REASONING = '__provider_default__'
 
 const {
   notificationSettings,
@@ -44,6 +51,37 @@ const promptContent = ref('')
 const isPromptLoading = ref(false)
 const isPromptSaving = ref(false)
 const promptError = ref<string | null>(null)
+
+const hasCustomModel = computed(() => {
+  const current = aiSettings.value.OPENAI_MODEL_NAME || ''
+  return Boolean(
+    current
+    && !OPENAI_MODEL_PRESETS.some((preset) => preset.value === current)
+  )
+})
+
+const reasoningSelection = computed({
+  get: () => aiSettings.value.OPENAI_REASONING_EFFORT || PROVIDER_DEFAULT_REASONING,
+  set: (value: string) => {
+    aiSettings.value.OPENAI_REASONING_EFFORT = (
+      value === PROVIDER_DEFAULT_REASONING ? '' : value
+    ) as NonNullable<typeof aiSettings.value.OPENAI_REASONING_EFFORT>
+  },
+})
+
+const effectiveModelLabel = computed(() => {
+  const current = aiSettings.value.OPENAI_MODEL_NAME || ''
+  return OPENAI_MODEL_PRESETS.find((preset) => preset.value === current)?.label
+    || current
+    || t('settings.ai.notSelected')
+})
+
+const effectiveReasoningLabel = computed(() => {
+  const effort = aiSettings.value.OPENAI_REASONING_EFFORT || ''
+  return effort
+    ? t(`settings.ai.reasoningOptions.${effort}`)
+    : t('settings.ai.reasoningOptions.default')
+})
 
 function notifySuccess(title: string, description?: string) {
   toast({ title, description })
@@ -219,8 +257,59 @@ watch(selectedPrompt, async (value) => {
               </p>
             </div>
             <div class="grid gap-2">
+              <Label>{{ t('settings.ai.modelPreset') }}</Label>
+              <Select v-model="aiSettings.OPENAI_MODEL_NAME">
+                <SelectTrigger>
+                  <SelectValue :placeholder="t('settings.ai.modelPresetPlaceholder')" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem
+                    v-for="preset in OPENAI_MODEL_PRESETS"
+                    :key="preset.value"
+                    :value="preset.value"
+                  >
+                    {{ preset.label }}
+                  </SelectItem>
+                  <SelectItem
+                    v-if="hasCustomModel"
+                    :value="aiSettings.OPENAI_MODEL_NAME || ''"
+                  >
+                    {{ t('settings.ai.customModelCurrent', { model: aiSettings.OPENAI_MODEL_NAME }) }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-xs text-gray-500">{{ t('settings.ai.modelPresetHint') }}</p>
+            </div>
+            <div class="grid gap-2">
               <Label>{{ t('settings.ai.modelName') }}</Label>
-              <Input v-model="aiSettings.OPENAI_MODEL_NAME" placeholder="gpt-3.5-turbo" />
+              <Input v-model="aiSettings.OPENAI_MODEL_NAME" placeholder="gpt-5.6-terra" />
+              <p class="text-xs text-gray-500">{{ t('settings.ai.modelNameHint') }}</p>
+            </div>
+            <div class="grid gap-2">
+              <Label>{{ t('settings.ai.reasoningEffort') }}</Label>
+              <Select v-model="reasoningSelection">
+                <SelectTrigger>
+                  <SelectValue :placeholder="t('settings.ai.reasoningPlaceholder')" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem :value="PROVIDER_DEFAULT_REASONING">
+                    {{ t('settings.ai.reasoningOptions.default') }}
+                  </SelectItem>
+                  <SelectItem value="none">{{ t('settings.ai.reasoningOptions.none') }}</SelectItem>
+                  <SelectItem value="low">{{ t('settings.ai.reasoningOptions.low') }}</SelectItem>
+                  <SelectItem value="medium">{{ t('settings.ai.reasoningOptions.medium') }}</SelectItem>
+                  <SelectItem value="high">{{ t('settings.ai.reasoningOptions.high') }}</SelectItem>
+                  <SelectItem value="xhigh">{{ t('settings.ai.reasoningOptions.xhigh') }}</SelectItem>
+                  <SelectItem value="max">{{ t('settings.ai.reasoningOptions.max') }}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-xs text-gray-500">{{ t('settings.ai.reasoningHint') }}</p>
+            </div>
+            <div class="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+              {{ t('settings.ai.effectiveConfiguration') }}:
+              <strong>{{ effectiveModelLabel }}</strong>
+              <span class="mx-1">·</span>
+              <strong>{{ effectiveReasoningLabel }}</strong>
             </div>
             <div class="grid gap-2">
               <Label>{{ t('settings.ai.proxy') }}</Label>

@@ -79,6 +79,7 @@ def test_call_ai_retries_without_structured_output_when_model_rejects_it():
     client = AIClient.__new__(AIClient)
     client.settings = SimpleNamespace(
         model_name="fake-model",
+        reasoning_effort="xhigh",
         enable_response_format=True,
         enable_thinking=False,
     )
@@ -107,6 +108,7 @@ def test_call_ai_retries_without_structured_output_when_model_rejects_it():
 
     assert response == '{"ok":true}'
     assert request_history[0]["messages"][0]["content"] == "hi"
+    assert request_history[0]["reasoning_effort"] == "xhigh"
     assert request_history[0]["response_format"]["type"] == "json_object"
     assert "response_format" not in request_history[1]
 
