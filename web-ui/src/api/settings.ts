@@ -56,6 +56,7 @@ export interface AiSettings {
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
   OPENAI_MODEL_NAME?: string
+  OPENAI_REASONING_EFFORT?: '' | 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   PROXY_URL?: string
 }
 

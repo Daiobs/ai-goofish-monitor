@@ -16,6 +16,14 @@ JSON_OBJECT_OUTPUT_MODE = JSON_OUTPUT_TYPE
 TEXT_OUTPUT_MODE = "text"
 AI_ANALYSIS_SCHEMA_NAME = "goofish_product_analysis"
 AI_ANALYSIS_TOOL_NAME = "submit_goofish_analysis"
+REASONING_EFFORT_VALUES = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 TARGET_CATEGORY_TARGET_ONLY = "target_only"
 TARGET_CATEGORY_TARGET_BUNDLE = "target_bundle"
 TARGET_CATEGORY_NOT_TARGET = "not_target"
@@ -359,18 +367,24 @@ def build_ai_request_params(
     messages: Iterable[Dict[str, Any]],
     temperature: float | None = None,
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     enable_json_output: bool = False,
     output_mode: str | None = None,
     analysis_schema: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """根据 API 模式构建请求参数。"""
     request_params = {"model": model}
+    normalized_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if api_mode == RESPONSES_API_MODE:
         request_params["input"] = build_responses_input(messages)
         if max_output_tokens is not None:
             request_params["max_output_tokens"] = max_output_tokens
         if temperature is not None:
             request_params["temperature"] = temperature
+        if normalized_reasoning_effort is not None:
+            request_params["reasoning"] = {
+                "effort": normalized_reasoning_effort,
+            }
         selected_mode = output_mode or (
             JSON_OBJECT_OUTPUT_MODE if enable_json_output else TEXT_OUTPUT_MODE
         )
@@ -387,6 +401,8 @@ def build_ai_request_params(
             request_params["max_tokens"] = max_output_tokens
         if temperature is not None:
             request_params["temperature"] = temperature
+        if normalized_reasoning_effort is not None:
+            request_params["reasoning_effort"] = normalized_reasoning_effort
         selected_mode = output_mode or (
             JSON_OBJECT_OUTPUT_MODE if enable_json_output else TEXT_OUTPUT_MODE
         )
@@ -398,6 +414,16 @@ def build_ai_request_params(
         )
 
     raise ValueError(f"不支持的 AI API 模式: {api_mode}")
+
+
+def normalize_reasoning_effort(value: str | None) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in REASONING_EFFORT_VALUES:
+        supported = ", ".join(REASONING_EFFORT_VALUES)
+        raise ValueError(f"不支持的 reasoning effort；可选值: {supported}")
+    return normalized
 
 
 async def create_ai_response_async(

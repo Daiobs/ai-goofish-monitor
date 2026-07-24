@@ -1,3 +1,5 @@
+import pytest
+
 from src.services.ai_request_compat import (
     AI_ANALYSIS_SCHEMA,
     CHAT_COMPLETIONS_API_MODE,
@@ -54,6 +56,36 @@ def test_build_responses_request_with_strict_analysis_schema():
     assert output_format["type"] == "json_schema"
     assert output_format["strict"] is True
     assert output_format["schema"] == AI_ANALYSIS_SCHEMA
+
+
+def test_reasoning_effort_uses_api_specific_request_shape():
+    chat_params = build_ai_request_params(
+        CHAT_COMPLETIONS_API_MODE,
+        model="gpt-5.6-terra",
+        messages=MESSAGES,
+        reasoning_effort="xhigh",
+    )
+    responses_params = build_ai_request_params(
+        RESPONSES_API_MODE,
+        model="gpt-5.6-terra",
+        messages=MESSAGES,
+        reasoning_effort="xhigh",
+    )
+
+    assert chat_params["reasoning_effort"] == "xhigh"
+    assert "reasoning" not in chat_params
+    assert responses_params["reasoning"] == {"effort": "xhigh"}
+    assert "reasoning_effort" not in responses_params
+
+
+def test_invalid_reasoning_effort_is_rejected():
+    with pytest.raises(ValueError, match="reasoning effort"):
+        build_ai_request_params(
+            CHAT_COMPLETIONS_API_MODE,
+            model="test-model",
+            messages=MESSAGES,
+            reasoning_effort="extreme",
+        )
 
 
 def test_build_chat_request_with_forced_strict_function_tool():
