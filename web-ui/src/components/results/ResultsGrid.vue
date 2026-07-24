@@ -6,9 +6,10 @@ import ResultCard from './ResultCard.vue'
 interface Props {
   results: ResultItem[]
   isLoading: boolean
+  emptyMessage?: string
 }
 
-defineProps<Props>()
+const props = defineProps<Props>()
 const { t } = useI18n()
 
 const emit = defineEmits<{
@@ -43,7 +44,7 @@ const skeletonItems = Array.from({ length: 8 }, (_, index) => index)
       </div>
     </div>
     <div v-else-if="results.length === 0" class="app-surface text-center py-12 text-gray-500">
-      {{ t('results.grid.empty') }}
+      {{ props.emptyMessage || t('results.grid.empty') }}
     </div>
     <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
       <ResultCard v-for="item in results" :key="item.商品信息.商品ID" :item="item" @toggle-block="emit('toggle-block', $event)" />

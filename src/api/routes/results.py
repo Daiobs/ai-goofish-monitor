@@ -39,6 +39,7 @@ from src.services.result_storage_service import (
     load_task_market_comparison_scope,
     load_visible_result_item_ids,
     query_result_records,
+    query_task_decision_records,
     query_task_result_records,
     result_file_exists,
     save_result_blacklist_keywords,
@@ -58,6 +59,14 @@ class ItemStatus(str, Enum):
     ACTIVE = "active"
     HIDDEN = "hidden"
     EXPIRED = "expired"
+
+
+class DecisionView(str, Enum):
+    WORTH_VIEWING = "worth_viewing"
+    COMPARABLE_TARGETS = "comparable_targets"
+    BUNDLES = "bundles"
+    EXCLUDED = "excluded"
+    AI_ISSUES = "ai_issues"
 
 
 class UpdateStatusRequest(BaseModel):
@@ -155,6 +164,7 @@ async def get_task_result_content(
     include_hidden: bool = Query(False),
     sort_by: str = Query("crawl_time"),
     sort_order: str = Query("desc"),
+    decision_view: DecisionView | None = Query(None),
     service: TaskService = Depends(get_task_service),
 ):
     await _require_task(task_id, service)
@@ -162,6 +172,34 @@ async def get_task_result_content(
         raise HTTPException(status_code=400, detail="AI推荐筛选与关键词推荐筛选不能同时开启。")
     if recommended_only and not ai_recommended_only and not keyword_recommended_only:
         ai_recommended_only = True
+
+    if decision_view is not None:
+        if ai_recommended_only or keyword_recommended_only:
+            raise HTTPException(
+                status_code=400,
+                detail="决策视图不能与旧推荐筛选同时开启。",
+            )
+        total_items, items, decision_summary = (
+            await query_task_decision_records(
+                task_id,
+                decision_view=decision_view.value,
+                page=page,
+                limit=limit,
+                include_hidden=include_hidden,
+            )
+        )
+        filename = build_task_result_filename(task_id)
+        return {
+            "task_id": task_id,
+            "filename": filename,
+            "total_items": total_items,
+            "page": page,
+            "limit": limit,
+            "items": enrich_records_with_price_insight(items, filename),
+            "decision_view": decision_view.value,
+            "current_view_count": total_items,
+            "decision_summary": decision_summary,
+        }
 
     total_items, items = await query_task_result_records(
         task_id,

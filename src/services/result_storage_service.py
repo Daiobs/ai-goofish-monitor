@@ -36,6 +36,48 @@ SORT_COLUMN_MAP = {
     "keyword_hit_count": "keyword_hit_count",
 }
 VALID_ITEM_STATUSES = {"active", "hidden", "expired"}
+DECISION_VIEW_WORTH_VIEWING = "worth_viewing"
+DECISION_VIEW_COMPARABLE_TARGETS = "comparable_targets"
+DECISION_VIEW_BUNDLES = "bundles"
+DECISION_VIEW_EXCLUDED = "excluded"
+DECISION_VIEW_AI_ISSUES = "ai_issues"
+VALID_DECISION_VIEWS = frozenset(
+    {
+        DECISION_VIEW_WORTH_VIEWING,
+        DECISION_VIEW_COMPARABLE_TARGETS,
+        DECISION_VIEW_BUNDLES,
+        DECISION_VIEW_EXCLUDED,
+        DECISION_VIEW_AI_ISSUES,
+    }
+)
+
+_DECISION_COMPARABLE_CLAUSE = (
+    "record_valid = 1 "
+    f"AND target_category = '{TARGET_CATEGORY_TARGET_ONLY}' "
+    "AND market_comparable = 1 "
+    "AND analysis_status = 'completed'"
+)
+_DECISION_EXCLUDED_CLAUSE = (
+    "record_valid = 1 AND ("
+    f"target_category IN ('{TARGET_CATEGORY_NOT_TARGET}', "
+    f"'{TARGET_CATEGORY_UNCERTAIN}') "
+    "OR market_comparable = 0)"
+)
+_DECISION_VIEW_CLAUSES = {
+    DECISION_VIEW_WORTH_VIEWING: (
+        f"{_DECISION_COMPARABLE_CLAUSE} AND is_recommended = 1"
+    ),
+    DECISION_VIEW_COMPARABLE_TARGETS: _DECISION_COMPARABLE_CLAUSE,
+    DECISION_VIEW_BUNDLES: (
+        "record_valid = 1 "
+        f"AND target_category = '{TARGET_CATEGORY_TARGET_BUNDLE}'"
+    ),
+    DECISION_VIEW_EXCLUDED: _DECISION_EXCLUDED_CLAUSE,
+    DECISION_VIEW_AI_ISSUES: (
+        "record_valid = 1 "
+        "AND analysis_status IN ('failed', 'skipped', 'pending')"
+    ),
+}
 
 
 def _normalize_task_id(task_id: int) -> int:
@@ -182,6 +224,116 @@ def _prepare_filtered_query(
         )
         params.extend(("active", _encode_blacklist_rules(blacklist_keywords)))
     return where_clause, params, resolved_task_id, blacklist_keywords
+
+
+def _decision_rows_cte(where_clause: str) -> str:
+    return f"""
+        WITH decision_rows AS (
+            SELECT
+                id,
+                raw_json,
+                status,
+                search_text,
+                price,
+                crawl_time,
+                item_id,
+                CASE
+                    WHEN json_valid(raw_json) = 1 THEN
+                        CASE
+                            WHEN json_type(raw_json, '$') = 'object'
+                             AND COALESCE(
+                                json_type(raw_json, '$."商品信息"'),
+                                'null'
+                             ) IN ('null', 'object')
+                             AND COALESCE(
+                                json_type(raw_json, '$."卖家信息"'),
+                                'null'
+                             ) IN ('null', 'object')
+                             AND COALESCE(
+                                json_type(raw_json, '$.ai_analysis'),
+                                'null'
+                             ) IN ('null', 'object')
+                            THEN 1
+                            ELSE 0
+                        END
+                    ELSE 0
+                END AS record_valid,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.target_category'
+                    )
+                END AS target_category,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.market_comparable'
+                    )
+                END AS market_comparable,
+                CASE
+                    WHEN json_valid(raw_json) = 1
+                    THEN json_extract(
+                        raw_json,
+                        '$.ai_analysis.analysis_status'
+                    )
+                END AS analysis_status,
+                CASE
+                    WHEN json_valid(raw_json) = 1 THEN
+                        CASE
+                            WHEN json_type(
+                                raw_json,
+                                '$.ai_analysis.is_recommended'
+                            ) IN ('true', 'false')
+                            THEN json_extract(
+                                raw_json,
+                                '$.ai_analysis.is_recommended'
+                            )
+                        END
+                END AS is_recommended,
+                CASE
+                    WHEN json_valid(raw_json) = 1 THEN
+                        CASE
+                            WHEN json_type(
+                                raw_json,
+                                '$.ai_analysis.value_score'
+                            ) IN ('integer', 'real')
+                            THEN CAST(
+                                json_extract(
+                                    raw_json,
+                                    '$.ai_analysis.value_score'
+                                ) AS REAL
+                            )
+                        END
+                END AS value_score
+            FROM result_items
+            WHERE {where_clause}
+        )
+    """
+
+
+def _decision_view_clause(decision_view: str) -> str:
+    try:
+        return _DECISION_VIEW_CLAUSES[decision_view]
+    except KeyError as exc:
+        raise ValueError(f"unsupported decision view: {decision_view}") from exc
+
+
+def _decision_summary_from_row(row) -> dict[str, int]:
+    keys = (
+        "all_count",
+        "target_only_count",
+        "target_bundle_count",
+        "not_target_count",
+        "uncertain_count",
+        "comparable_count",
+        "excluded_count",
+        "ai_recommended_count",
+        "ai_not_recommended_count",
+        "ai_issue_count",
+    )
+    return {key: int(row[key] or 0) for key in keys}
 
 
 def _decorate_record_visibility(
@@ -598,6 +750,199 @@ async def query_task_result_records(task_id: int, **kwargs) -> tuple[int, list[d
         filename=None,
         task_id=_normalize_task_id(task_id),
         **kwargs,
+    )
+
+
+def _query_task_decision_records_sync(
+    *,
+    task_id: int,
+    decision_view: str,
+    page: int,
+    limit: int,
+    include_hidden: bool,
+) -> tuple[int, list[dict], dict[str, int]]:
+    bootstrap_sqlite_storage()
+    normalized_task_id = _normalize_task_id(task_id)
+    view_clause = _decision_view_clause(decision_view)
+    safe_limit = max(int(limit), 0)
+
+    with sqlite_connection() as conn:
+        conn.execute("BEGIN")
+        where_clause, params, _, blacklist_keywords = _prepare_filtered_query(
+            conn,
+            filename=None,
+            task_id=normalized_task_id,
+            ai_recommended_only=False,
+            keyword_recommended_only=False,
+            include_hidden=include_hidden,
+        )
+        cte = _decision_rows_cte(where_clause)
+        aggregate = conn.execute(
+            f"""
+            {cte}
+            SELECT
+                COUNT(*) AS all_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND target_category = ?
+                         THEN 1 ELSE 0 END
+                ), 0) AS target_only_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND target_category = ?
+                         THEN 1 ELSE 0 END
+                ), 0) AS target_bundle_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND target_category = ?
+                         THEN 1 ELSE 0 END
+                ), 0) AS not_target_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND target_category = ?
+                         THEN 1 ELSE 0 END
+                ), 0) AS uncertain_count,
+                COALESCE(SUM(
+                    CASE WHEN {_DECISION_COMPARABLE_CLAUSE}
+                         THEN 1 ELSE 0 END
+                ), 0) AS comparable_count,
+                COALESCE(SUM(
+                    CASE WHEN {_DECISION_EXCLUDED_CLAUSE}
+                         THEN 1 ELSE 0 END
+                ), 0) AS excluded_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND analysis_status = 'completed'
+                           AND is_recommended = 1
+                         THEN 1 ELSE 0 END
+                ), 0) AS ai_recommended_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND analysis_status = 'completed'
+                           AND is_recommended = 0
+                         THEN 1 ELSE 0 END
+                ), 0) AS ai_not_recommended_count,
+                COALESCE(SUM(
+                    CASE WHEN record_valid = 1
+                           AND analysis_status IN (
+                               'failed',
+                               'skipped',
+                               'pending'
+                           )
+                         THEN 1 ELSE 0 END
+                ), 0) AS ai_issue_count,
+                COALESCE(SUM(
+                    CASE WHEN {view_clause}
+                         THEN 1 ELSE 0 END
+                ), 0) AS current_view_count
+            FROM decision_rows
+            """,
+            (
+                *params,
+                TARGET_CATEGORY_TARGET_ONLY,
+                TARGET_CATEGORY_TARGET_BUNDLE,
+                TARGET_CATEGORY_NOT_TARGET,
+                TARGET_CATEGORY_UNCERTAIN,
+            ),
+        ).fetchone()
+        summary = _decision_summary_from_row(aggregate)
+        total = int(aggregate["current_view_count"] or 0)
+        if safe_limit <= 0 or total <= 0:
+            return total, [], summary
+
+        page_index = max(int(page) - 1, 0)
+        if page_index > (total - 1) // safe_limit:
+            return total, [], summary
+        offset = page_index * safe_limit
+        page_limit = min(safe_limit, total - offset)
+
+        median_row = conn.execute(
+            f"""
+            {cte},
+            comparable_prices AS (
+                SELECT
+                    price,
+                    ROW_NUMBER() OVER (ORDER BY price ASC) AS row_number,
+                    COUNT(*) OVER () AS price_count
+                FROM decision_rows
+                WHERE {_DECISION_COMPARABLE_CLAUSE}
+                  AND price IS NOT NULL
+                  AND price > 0
+            )
+            SELECT AVG(price) AS median_price
+            FROM comparable_prices
+            WHERE row_number IN (
+                (price_count + 1) / 2,
+                (price_count + 2) / 2
+            )
+            """,
+            tuple(params),
+        ).fetchone()
+        median_price = (
+            float(median_row["median_price"])
+            if median_row is not None and median_row["median_price"] is not None
+            else None
+        )
+        if median_price is None:
+            below_median_order = "0"
+            page_params = (*params, page_limit, offset)
+        else:
+            below_median_order = (
+                "CASE WHEN "
+                f"{_DECISION_COMPARABLE_CLAUSE} "
+                "AND price IS NOT NULL "
+                "AND price > 0 "
+                "AND price < ? "
+                "THEN 1 ELSE 0 END"
+            )
+            page_params = (*params, median_price, page_limit, offset)
+
+        rows = conn.execute(
+            f"""
+            {cte}
+            SELECT raw_json, status, search_text
+            FROM decision_rows
+            WHERE {view_clause}
+            ORDER BY
+                COALESCE(is_recommended, 0) DESC,
+                CASE WHEN {_DECISION_COMPARABLE_CLAUSE}
+                     THEN 1 ELSE 0 END DESC,
+                CASE WHEN value_score IS NOT NULL
+                     THEN 1 ELSE 0 END DESC,
+                value_score DESC,
+                {below_median_order} DESC,
+                COALESCE(crawl_time, '') DESC,
+                COALESCE(NULLIF(TRIM(item_id), ''), '') ASC,
+                id ASC
+            LIMIT ? OFFSET ?
+            """,
+            page_params,
+        ).fetchall()
+
+    records: list[dict] = []
+    for row in rows:
+        decorated = _parse_decorated_row(row, blacklist_keywords)
+        if decorated is not None:
+            records.append(decorated)
+    return total, records, summary
+
+
+async def query_task_decision_records(
+    task_id: int,
+    *,
+    decision_view: str,
+    page: int,
+    limit: int,
+    include_hidden: bool = False,
+) -> tuple[int, list[dict], dict[str, int]]:
+    """Query one task-wide decision view using SQL filtering and pagination."""
+    return await asyncio.to_thread(
+        _query_task_decision_records_sync,
+        task_id=_normalize_task_id(task_id),
+        decision_view=decision_view,
+        page=page,
+        limit=limit,
+        include_hidden=include_hidden,
     )
 
 

@@ -59,6 +59,33 @@ def _record(*, item_id: str, title: str, task_name: str) -> dict:
     }
 
 
+def _decision_record(
+    *,
+    item_id: str,
+    category: str,
+    comparable: bool,
+    status: str = "completed",
+    recommended: bool = False,
+    value_score: int | None = None,
+) -> dict:
+    record = _record(
+        item_id=item_id,
+        title=f"Decision {item_id}",
+        task_name="Same",
+    )
+    record["ai_analysis"].update(
+        {
+            "analysis_status": status,
+            "is_recommended": recommended,
+            "target_category": category,
+            "market_comparable": comparable,
+        }
+    )
+    if value_score is not None:
+        record["ai_analysis"]["value_score"] = value_score
+    return record
+
+
 def _load_task_records(task_id: int) -> list[dict]:
     return asyncio.run(
         load_all_task_result_records(
@@ -381,3 +408,118 @@ def test_task_result_api_returns_empty_page_for_huge_page_number(
         "limit": 20,
         "items": [],
     }
+
+
+def test_task_decision_api_shape_summary_pagination_and_ownership(
+    task_results_client,
+):
+    client, _ = task_results_client
+    task_a_records = [
+        _decision_record(
+            item_id="worth",
+            category="target_only",
+            comparable=True,
+            recommended=True,
+            value_score=80,
+        ),
+        _decision_record(
+            item_id="comparable-no",
+            category="target_only",
+            comparable=True,
+            value_score=90,
+        ),
+        _decision_record(
+            item_id="bundle",
+            category="target_bundle",
+            comparable=False,
+        ),
+        _decision_record(
+            item_id="not-target",
+            category="not_target",
+            comparable=False,
+        ),
+        _decision_record(
+            item_id="failed",
+            category="target_only",
+            comparable=False,
+            status="failed",
+        ),
+    ]
+    for record in task_a_records:
+        assert asyncio.run(save_task_result_record(record, "camera", 101))
+    assert asyncio.run(
+        save_task_result_record(
+            _decision_record(
+                item_id="task-b-worth",
+                category="target_only",
+                comparable=True,
+                recommended=True,
+            ),
+            "camera",
+            102,
+        )
+    )
+
+    response = client.get(
+        "/api/results/tasks/101",
+        params={"decision_view": "worth_viewing", "page": 1, "limit": 1},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["decision_view"] == "worth_viewing"
+    assert payload["total_items"] == payload["current_view_count"] == 1
+    assert payload["page"] == 1
+    assert payload["limit"] == 1
+    assert [
+        item["商品信息"]["商品ID"] for item in payload["items"]
+    ] == ["worth"]
+    assert payload["decision_summary"] == {
+        "all_count": 5,
+        "target_only_count": 3,
+        "target_bundle_count": 1,
+        "not_target_count": 1,
+        "uncertain_count": 0,
+        "comparable_count": 2,
+        "excluded_count": 3,
+        "ai_recommended_count": 1,
+        "ai_not_recommended_count": 3,
+        "ai_issue_count": 1,
+    }
+
+    comparable = client.get(
+        "/api/results/tasks/101",
+        params={"decision_view": "comparable_targets"},
+    ).json()
+    assert comparable["total_items"] == 2
+    assert [
+        item["商品信息"]["商品ID"] for item in comparable["items"]
+    ] == ["worth", "comparable-no"]
+
+    issues = client.get(
+        "/api/results/tasks/101",
+        params={"decision_view": "ai_issues"},
+    ).json()
+    assert issues["total_items"] == 1
+    assert issues["items"][0]["商品信息"]["商品ID"] == "failed"
+
+    task_b = client.get(
+        "/api/results/tasks/102",
+        params={"decision_view": "worth_viewing"},
+    ).json()
+    assert task_b["decision_summary"]["all_count"] == 1
+    assert task_b["items"][0]["商品信息"]["商品ID"] == "task-b-worth"
+
+    huge_page = client.get(
+        "/api/results/tasks/101",
+        params={"decision_view": "worth_viewing", "page": 10**19},
+    )
+    assert huge_page.status_code == 200
+    assert huge_page.json()["total_items"] == 1
+    assert huge_page.json()["current_view_count"] == 1
+    assert huge_page.json()["items"] == []
+
+    legacy_shape = client.get("/api/results/tasks/101").json()
+    assert legacy_shape["total_items"] == 5
+    assert "decision_view" not in legacy_shape
+    assert "decision_summary" not in legacy_shape

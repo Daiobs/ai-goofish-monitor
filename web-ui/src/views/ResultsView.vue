@@ -5,6 +5,7 @@ import { useResults } from '@/composables/useResults'
 import ResultsFilterBar from '@/components/results/ResultsFilterBar.vue'
 import ResultsGrid from '@/components/results/ResultsGrid.vue'
 import ResultsInsightsPanel from '@/components/results/ResultsInsightsPanel.vue'
+import ResultsDecisionQueue from '@/components/results/ResultsDecisionQueue.vue'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { toast } from '@/components/ui/toast'
@@ -24,6 +25,10 @@ const {
   selectedFile,
   results,
   insights,
+  currentViewCount,
+  decisionSummary,
+  decisionView,
+  isTaskOwnedResult,
   filters,
   isLoading,
   error,
@@ -54,6 +59,12 @@ const deleteConfirmText = computed(() => {
     ? t('results.filters.deleteDialogWithTask', { task: selectedTaskLabel.value })
     : t('results.filters.deleteDialogFallback')
 })
+
+const emptyMessage = computed(() => (
+  isTaskOwnedResult.value && decisionView.value === 'worth_viewing'
+    ? t('results.decisionQueue.emptyWorthViewing')
+    : t('results.grid.empty')
+))
 
 function openDeleteDialog() {
   if (!selectedFile.value) {
@@ -148,6 +159,7 @@ async function handleSaveBlacklistRules() {
       v-model:includeHidden="filters.include_hidden"
       v-model:sortBy="filters.sort_by"
       v-model:sortOrder="filters.sort_order"
+      :decision-queue-active="isTaskOwnedResult"
       :is-loading="isLoading"
       @refresh="refreshResults"
       @manage-blacklist="openBlacklistDialog"
@@ -155,9 +167,22 @@ async function handleSaveBlacklistRules() {
       @delete="openDeleteDialog"
     />
 
+    <ResultsDecisionQueue
+      v-if="isTaskOwnedResult"
+      v-model="decisionView"
+      :summary="decisionSummary"
+      :current-view-count="currentViewCount"
+      :is-loading="isLoading"
+    />
+
     <ResultsInsightsPanel :insights="insights" :selected-task-label="selectedTaskLabel" />
 
-    <ResultsGrid :results="results" :is-loading="isLoading" @toggle-block="toggleItemBlock" />
+    <ResultsGrid
+      :results="results"
+      :is-loading="isLoading"
+      :empty-message="emptyMessage"
+      @toggle-block="toggleItemBlock"
+    />
 
     <Dialog v-model:open="isDeleteDialogOpen">
       <DialogContent class="sm:max-w-[420px]">
